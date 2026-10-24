@@ -439,3 +439,146 @@ async fn expired_kv_rows_are_swept_by_the_periodic_pass() {
     node.shutdown().await;
 }
 }
+
+/// Publishes with no subscriber (and to one subscriber), appends to a topic and reads what a
+/// consumer and a subscriber got: the host buses and both engines are wired.
+const EVENTS_GUEST: &str = r#"
+import { publish } from "std:pubsub";
+import { append } from "std:stream";
+import { sql } from "std:sql";
+async function ensure() {
+  await sql.execute("CREATE TABLE IF NOT EXISTS got (kind TEXT, body TEXT)");
+}
+export default {
+  async fetch(req: Request): Promise<Response> {
+    await ensure();
+    const u = new URL(req.url);
+    if (u.pathname === "/go") {
+      const none = await publish("nobody.listens", { n: 1 });
+      const one = await publish("orders.created", { n: 2 });
+      const at = await append("orders", { n: 3 }, { key: "c1" });
+      return Response.json({ none, one, at });
+    }
+    const r = await sql.execute("SELECT kind, body FROM got ORDER BY kind");
+    return Response.json({ got: r.rows });
+  },
+  async pubsub(msg: any): Promise<void> {
+    await ensure();
+    await sql.execute("INSERT INTO got (kind, body) VALUES ('pubsub', ?)", [JSON.stringify(msg.body)]);
+  },
+  async stream(batch: any): Promise<void> {
+    await ensure();
+    for (const m of batch.messages) {
+      await sql.execute("INSERT INTO got (kind, body) VALUES ('stream', ?)", [JSON.stringify(m.body)]);
+    }
+  },
+};"#;
+
+node_test! {
+async fn events_bus_is_wired_for_deno_guests() {
+    let node = start_node().await;
+    let t = new_tenant(&node, "pro").await;
+    let r = post(&node, &t.key, "/v1/topics", json!({"name": "orders"})).await;
+    assert_eq!(r.s(), 201, "create topic: {}", r.text);
+    let slug = uniq("ev");
+    let svc = ship(&node, &t.key, &slug, EVENTS_GUEST).await;
+    let r = patch(
+        &node,
+        &t.key,
+        &format!("/v1/services/{svc}"),
+        json!({"events": {
+            "subscribe": [{"subject": "orders.*"}],
+            "consume": [{"topic": "orders", "start": "earliest"}]
+        }}),
+    )
+    .await;
+    assert_eq!(r.s(), 200, "set events: {}", r.text);
+
+    // The pub/sub index follows the service table: wait until the subscription is routed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let out = loop {
+        let r = invoke(&node, &slug, "/go").await;
+        assert_eq!(r.s(), 200, "{}", r.text);
+        if r.json["one"]["receivers"] == 1 {
+            break r.json;
+        }
+        assert!(std::time::Instant::now() < deadline, "the subscription is never routed: {}", r.text);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(out["none"], json!({"receivers": 0, "dropped": 0}), "{out}");
+    assert_eq!(out["at"]["partition"], 0, "{out}");
+    assert!(out["at"]["offset"].is_u64(), "{out}");
+
+    eventually(Duration::from_secs(10), "a delivery and a consumed record", || {
+        let (node, slug) = (&node, &slug);
+        async move {
+            let got = invoke(node, slug, "/got").await.json["got"].clone();
+            let rows = got.as_array().cloned().unwrap_or_default();
+            let has = |k: &str| rows.iter().any(|r| r[0] == k);
+            has("pubsub") && has("stream")
+        }
+    })
+    .await;
+    node.shutdown().await;
+}
+}
+
+const ASYNC_RECORDER: &str = r#"
+import { sql } from "std:sql";
+export default {
+  async fetch(req: Request): Promise<Response> {
+    await sql.execute("CREATE TABLE IF NOT EXISTS seen (auth TEXT, inv TEXT, attempt TEXT, body TEXT)");
+    if (req.method === "POST") {
+      await sql.execute("INSERT INTO seen VALUES (?, ?, ?, ?)", [
+        req.headers.get("authorization"),
+        req.headers.get("x-rt-invocation-id"),
+        req.headers.get("x-rt-invocation-attempt"),
+        await req.text(),
+      ]);
+      return new Response("ok");
+    }
+    const r = await sql.execute("SELECT auth, inv, attempt, body FROM seen");
+    return Response.json({ seen: r.rows });
+  },
+};"#;
+
+fn file_has(path: &std::path::Path, needle: &[u8]) -> bool {
+    std::fs::read(path).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle))
+}
+
+node_test! {
+async fn async_headers_are_not_readable_in_queue_db() {
+    let mut node = Restartable::boot(|_| {}).await;
+    let t = new_tenant(&node, "pro").await;
+    let slug = uniq("as");
+    let svc = ship(&node, &t.key, &slug, ASYNC_RECORDER).await;
+    let r = patch(&node, &t.key, &format!("/v1/services/{svc}"), json!({"async": {"enabled": true}})).await;
+    assert_eq!(r.s(), 200, "enable async: {}", r.text);
+
+    let r = invoke_with(
+        &node,
+        &slug,
+        reqwest::Method::POST,
+        "/hook",
+        &[("prefer", "respond-async"), ("authorization", "Bearer secret-xyz")],
+        "body-plain-abc",
+    )
+    .await;
+    assert_eq!(r.s(), 202, "accepted: {}", r.text);
+    let id = r.json["id"].as_str().expect("inv id").to_string();
+    for f in ["queue.db", "queue.db-wal"] {
+        let p = node.data_dir().join(f);
+        assert!(!file_has(&p, b"secret-xyz"), "{f} holds the header in clear");
+        assert!(!file_has(&p, b"body-plain-abc"), "{f} holds the body in clear");
+    }
+
+    eventually(Duration::from_secs(15), "the handler ran", || {
+        let (node, slug) = (&node, &slug);
+        async move { !invoke(node, slug, "/").await.json["seen"].as_array().is_none_or(|a| a.is_empty()) }
+    })
+    .await;
+    let seen = invoke(&node, &slug, "/").await.json["seen"][0].clone();
+    assert_eq!(seen, json!(["Bearer secret-xyz", id, "1", "body-plain-abc"]));
+    node.stop().await;
+}
+}

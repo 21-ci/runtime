@@ -36,8 +36,12 @@ use rt_exec_wasm::{
     WasmPrecompiler, EPOCH_TICK,
 };
 use rt_host::{
+    AppendEntry, AppendedOut, PublishOpts, PublishOut, PubsubBus, ReadOpts, ReadPage, Reply, RequestOpts, StreamBus,
+    TopicInfo,
+};
+use rt_host::{
     CallError, Calls, ConfigBindings, EgressGuard, EgressGuardConfig, EnqueueOpts, FairBlockingPool, FairPoolConfig,
-    GuardedEgress, HostDeps, HostServices, Request, Response, TaskCtx,
+    GuardedEgress, HostDeps, HostError, HostServices, Request, Response, TaskCtx,
 };
 use rt_mem::{Governor, GovernorConfig, MemoryGovernor};
 use rt_obs::{FileLogStore, HdrStatsStore, LogStore, LogStoreConfig, Metrics, MetricsOptions};
@@ -51,6 +55,10 @@ use rt_store::{
     ArtifactStore, DataConfig, LocalArtifactStore, LocalServiceData, MetaStore, PageReq, QueueStore, ServiceDataStore,
     SqliteMetaStore, SqliteQueueStore, SqliteStreamStore, StreamStore,
 };
+use rt_triggers::async_engine::{AsyncEngine, AsyncEngineConfig};
+use rt_triggers::events::EventDispatcher;
+use rt_triggers::pubsub::{PubsubError, PubsubQuota, PubsubRouter};
+use rt_triggers::stream_engine::{StreamEngine, StreamEngineConfig};
 use rt_triggers::{
     CallDispatcher, DelayedEngine, DelayedEngineConfig, HubConfig, QueueEngine, QueueEngineConfig, RouteTable,
     ScheduleEngine, SocketHub,
@@ -247,6 +255,70 @@ impl Calls for LateCalls {
     }
 }
 
+/// The host pub/sub and stream buses, bound once the scheduler exists (the dispatcher submits
+/// through it; the host services are built before it).
+struct LateEvents {
+    inner: OnceLock<Arc<EventDispatcher>>,
+}
+
+impl LateEvents {
+    fn get(&self) -> Result<&EventDispatcher, HostError> {
+        self.inner
+            .get()
+            .map(|d| &**d)
+            .ok_or_else(|| HostError::new("unavailable", "events are not available yet"))
+        // LCOV_EXCL_LINE: bound before any task can run
+    }
+}
+
+#[async_trait]
+impl PubsubBus for LateEvents {
+    async fn publish(
+        &self,
+        from: &TaskCtx,
+        subject: &str,
+        body: Bytes,
+        o: PublishOpts,
+    ) -> Result<PublishOut, HostError> {
+        PubsubBus::publish(self.get()?, from, subject, body, o).await
+    }
+
+    async fn request(&self, from: &TaskCtx, subject: &str, body: Bytes, o: RequestOpts) -> Result<Reply, HostError> {
+        self.get()?.request(from, subject, body, o).await
+    }
+}
+
+#[async_trait]
+impl StreamBus for LateEvents {
+    async fn append(
+        &self,
+        from: &TaskCtx,
+        topic: &str,
+        entries: Vec<AppendEntry>,
+    ) -> Result<Vec<AppendedOut>, HostError> {
+        self.get()?.append(from, topic, entries).await
+    }
+
+    async fn read(&self, from: &TaskCtx, topic: &str, o: ReadOpts) -> Result<ReadPage, HostError> {
+        self.get()?.read(from, topic, o).await
+    }
+
+    async fn info(&self, from: &TaskCtx, topic: &str) -> Result<TopicInfo, HostError> {
+        self.get()?.info(from, topic).await
+    }
+}
+
+/// Tenant quota check of a publish and of each delivery (one invocation each).
+fn pubsub_quota(quotas: Arc<dyn QuotaEnforcer>) -> PubsubQuota {
+    Arc::new(
+        move |tenant: TenantId| match quotas.check(tenant, rt_sec::QuotaOp::Invoke) {
+            Ok(()) => Ok(()),
+            Err(rt_sec::QuotaError::RateLimited { .. }) => Err(PubsubError::RateLimited),
+            Err(_) => Err(PubsubError::QuotaExceeded),
+        },
+    )
+}
+
 /// Audit sink: `events` table (through the control plane writer), a log line, and the optional
 /// extra sink.
 /// The socket hub, bound once the scheduler exists (the host services are built before it).
@@ -416,6 +488,12 @@ struct NodeImpl {
     floored: Mutex<std::collections::HashSet<ServiceId>>,
     /// The node's WebSockets: drained with the node, closed with a deleted service.
     sockets: Arc<SocketHub>,
+    /// `POST /v1/pubsub/publish` routes through it.
+    pubsub: Arc<PubsubRouter>,
+    /// Woken by appends, invalidated by consumer resets, drained with the node.
+    stream_engine: Arc<StreamEngine>,
+    /// Woken by accepted async requests, drained with the node.
+    async_engine: Arc<AsyncEngine>,
 }
 
 /// Apply the live-updatable knobs of `cfg` (`Config::LIVE_KEYS`) to the running node: the
@@ -582,6 +660,22 @@ impl NodeInfo for NodeImpl {
         self.scheduler.set_mode(rt_types::DegradationMode::Drain);
         // Sockets are told the node goes away (1001); new upgrades are refused.
         self.sockets.drain();
+        self.stream_engine.drain();
+        self.async_engine.drain();
+    }
+
+    fn publish(
+        &self,
+        ns: &rt_types::Namespace,
+        subject: &str,
+        body: Bytes,
+        headers: Vec<(String, String)>,
+    ) -> Result<(u32, u32), (&'static str, String)> {
+        // A control API publish is a top-level message: its deliveries run at depth 1.
+        self.pubsub.publish(ns, 1, subject, body, headers).map_err(|e| match e {
+            PubsubError::Validation(m) => ("validation_failed", m),
+            other => (other.code(), other.to_string()),
+        })
     }
 
     fn notify(&self, ev: ControlEvent) {
@@ -661,8 +755,9 @@ impl NodeInfo for NodeImpl {
                 }
                 self.sync_floors();
             }
-            // The event engines are wired later (stream engine, async engine): nothing to wake yet.
-            ControlEvent::StreamAppended(_) | ControlEvent::AsyncAccepted(_) | ControlEvent::ConsumersReset(_) => {}
+            ControlEvent::StreamAppended(topic) => self.stream_engine.notify(topic),
+            ControlEvent::AsyncAccepted(svc) => self.async_engine.notify(svc),
+            ControlEvent::ConsumersReset(svc) => self.stream_engine.invalidate(svc),
         }
     }
 
@@ -1351,6 +1446,7 @@ pub async fn start_with(
     let platform = Arc::new(ConfigBindings::new(cfg.binding.clone(), plan_of, trusted_egress));
     let late_calls = Arc::new(LateCalls { inner: OnceLock::new() });
     let late_sockets = Arc::new(LateSockets { inner: OnceLock::new() });
+    let late_events = Arc::new(LateEvents { inner: OnceLock::new() });
     let host = HostServices::new(HostDeps {
         data: data.clone(),
         queue: queue.clone(),
@@ -1364,7 +1460,9 @@ pub async fn start_with(
         mem: mem.clone(),
         sockets: late_sockets.clone(),
         policy: Some(policy.clone()),
-    });
+    })
+    .with_pubsub(late_events.clone())
+    .with_streams(late_events.clone());
 
     // 6. engines and caches
     let dcfg = DenoExecutorConfig::from_config(&cfg);
@@ -1640,6 +1738,51 @@ pub async fn start_with(
         flood_close_after: ws.flood_close_after,
         ..HubConfig::default()
     };
+    // Events: pub/sub deliveries, stream batches and async invocations go through the same submit.
+    let pubsub = Arc::new(
+        PubsubRouter::new(specs.clone(), submit.clone())
+            .with_metrics(metrics.clone())
+            .with_quota(pubsub_quota(quotas.clone())),
+    );
+    let stream_engine = Arc::new(
+        StreamEngine::new(
+            StreamEngineConfig::default(),
+            streams.clone(),
+            specs.clone(),
+            submit.clone(),
+            clock.clone(),
+        )
+        .with_metrics(metrics.clone()),
+    );
+    let async_engine = Arc::new(
+        AsyncEngine::new(
+            AsyncEngineConfig {
+                max_concurrency: cfg.queue.max_concurrency.max(1) as usize,
+                ..AsyncEngineConfig::default()
+            },
+            queue_db.clone(),
+            Arc::new(crate::specs::AsyncTasks {
+                specs: specs.clone(),
+                secrets: secrets_backend.clone(),
+            }),
+            submit.clone(),
+            clock.clone(),
+        )
+        .with_metrics(metrics.clone()),
+    );
+    let notify_stream: rt_triggers::events::StreamNotify = {
+        let se = stream_engine.clone();
+        Arc::new(move |t| se.notify(t))
+    };
+    let events = EventDispatcher::new(
+        routes.clone(),
+        pubsub.clone(),
+        streams.clone(),
+        plans.clone(),
+        notify_stream,
+    )
+    .with_quota(pubsub_quota(quotas.clone()));
+    let _ = late_events.inner.set(Arc::new(events));
     let sockets = SocketHub::new(hub_cfg, submit, socket_tasks, tokio::runtime::Handle::current());
     sockets.set_metrics(metrics.clone());
     let _ = late_sockets.inner.set(sockets.clone());
@@ -1684,6 +1827,9 @@ pub async fn start_with(
         config_write: Mutex::new(()),
         floored: Mutex::new(std::collections::HashSet::new()),
         sockets: sockets.clone(),
+        pubsub,
+        stream_engine: stream_engine.clone(),
+        async_engine: async_engine.clone(),
     });
 
     // 10. API state and routers
@@ -1864,6 +2010,10 @@ pub async fn start_with(
         background.push(tokio::spawn(async move { q.run().await }));
         let d = delayed_engine.clone();
         background.push(tokio::spawn(async move { d.run().await }));
+        let se = stream_engine.clone();
+        background.push(tokio::spawn(async move { se.run().await }));
+        let ae = async_engine.clone();
+        background.push(tokio::spawn(async move { ae.run().await }));
         // Durable objects' alarms: the pending ones come back from each durable service's data.
         let hub = sockets.clone();
         background.push(tokio::spawn(async move { hub.run_alarms().await }));
