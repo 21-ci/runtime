@@ -26,7 +26,12 @@ const QUEUE_READERS: usize = 2;
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/queue_0001_init.sql")),
     (2, include_str!("../migrations/queue_0002_delayed.sql")),
+    (3, include_str!("../migrations/queue_0003_invocations.sql")),
 ];
+
+#[path = "invocations.rs"]
+pub mod invocations;
+pub use invocations::*;
 
 /// Message size cap.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -129,6 +134,21 @@ pub trait QueueStore: Send + Sync {
         self.retry(id, delay).await
     }
     // LCOV_EXCL_STOP
+    /// Hand leased messages back without using up their delivery: the attempt the lease added
+    /// is refunded (`attempt - 1`, never below 0) and the message is visible again after
+    /// `delay`. Fenced like [`QueueStore::ack_leased`]; returns how many messages were released.
+    /// Used when the delivery never ran (admission refusal, shutdown).
+    // LCOV_EXCL_START: trait default body; the SQLite store overrides it, so only other implementors reach it
+    async fn release_leased(&self, msgs: &[(MsgId, u16)], delay: Duration) -> Result<u64> {
+        let mut n = 0;
+        for (id, attempt) in msgs {
+            if self.retry_leased(*id, *attempt, delay).await.is_ok() {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+    // LCOV_EXCL_STOP
     async fn stats(&self, s: ServiceId) -> Result<QueueStats>;
     async fn dlq_list(&self, s: ServiceId, limit: usize) -> Result<Vec<DlqEntry>>;
     /// Move DLQ messages back with `attempt = 1`; returns how many.
@@ -176,6 +196,8 @@ pub struct SqliteQueueStore {
     due: DueHint,
     /// Times `services_with_ready` went to the database (diagnostics, tests).
     scans: AtomicU64,
+    /// Failed invocations evicted by the per-service cap, not yet taken by the engine.
+    evicted: AtomicU64,
 }
 
 impl SqliteQueueStore {
@@ -227,6 +249,7 @@ impl SqliteQueueStore {
             max_attempts: max_attempts.max(1),
             due: Arc::new(Mutex::new(due)),
             scans: AtomicU64::new(0),
+            evicted: AtomicU64::new(0),
         }))
     }
 
@@ -240,7 +263,7 @@ impl SqliteQueueStore {
                 let tx = c.transaction()?;
                 let key = s.to_string();
                 let mut n = 0u64;
-                for table in ["messages", "dlq", "dedup", "delayed"] {
+                for table in ["messages", "dlq", "dedup", "delayed", "invocations"] {
                     n += tx.execute(&format!("DELETE FROM {table} WHERE service_id = ?1"), [&key])? as u64;
                 }
                 tx.commit()?;
@@ -526,6 +549,40 @@ impl QueueStore for SqliteQueueStore {
         let (max_attempts, due) = (self.max_attempts, self.due.clone());
         self.db
             .call(move |c| retry_tx(c, &due, max_attempts, id, Some(attempt), delay))
+            .await
+    }
+
+    async fn release_leased(&self, msgs: &[(MsgId, u16)], delay: Duration) -> Result<u64> {
+        if msgs.is_empty() {
+            return Ok(0);
+        }
+        let msgs: Vec<(String, i64)> = msgs.iter().map(|(id, a)| (id.to_string(), i64::from(*a))).collect();
+        let due = self.due.clone();
+        self.db
+            .call(move |c| {
+                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let at = now_ms().saturating_add(ms(delay));
+                let mut released = 0u64;
+                let mut services = Vec::new();
+                {
+                    let mut stmt = tx.prepare_cached(
+                        "UPDATE messages SET leased = 0, attempt = max(attempt - 1, 0), visible_at = ?3 \
+                         WHERE id = ?1 AND leased = 1 AND attempt = ?2 RETURNING service_id",
+                    )?;
+                    for (id, attempt) in &msgs {
+                        let s: Option<String> = stmt.query_row(params![id, attempt, at], |r| r.get(0)).optional()?;
+                        if let Some(s) = s {
+                            released += 1;
+                            services.push(s);
+                        }
+                    }
+                }
+                tx.commit()?;
+                for s in services {
+                    lower_due(&due, parse_col(&s, 0)?, at);
+                }
+                Ok(released)
+            })
             .await
     }
 
