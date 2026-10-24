@@ -264,9 +264,10 @@ The published files name three mailboxes on `21-ci.uz`; make sure each one exist
 Repository → Settings → Rules → Rulesets → **New ruleset → Import a ruleset**, once for each of
 `.github/rulesets/main.json`, `release-branches.json` and `tags.json`.
 
-Then let the release App create tags: open the imported **release tags** ruleset → **Bypass list → Add bypass →
-Apps** → your release App → **Save**. Without it the tag release-please creates on merge is refused and no release
-runs. (The App's ID only exists once you create it, so `tags.json` cannot list it.)
+Then say who may create release tags: open the imported **release tags** ruleset → **Bypass list → Add bypass**
+and add **Repository admin** (you, for a tag pushed by hand) and, under **Apps**, the release App (it must be
+installed on the repository first) → **Save**. `tags.json` ships with an empty bypass list because actor IDs differ
+between accounts; without these two entries nobody can create a `v*` tag and no release runs.
 
 ### 7. After the first release
 

@@ -49,8 +49,9 @@ for f in .github/rulesets/*.json; do
 done
 ```
 
-Create the `@21-ci/maintainers` and `@21-ci/security` teams first (CODEOWNERS). `tags.json` lets two actors
-create release tags: the repository admin role (`actor_id` 5) and an `Integration`. Replace that integration's
-`actor_id` (15368, the GitHub Actions app) with the id of the release GitHub App that release-please acts as
-(`RELEASE_APP_ID`): release-please creates the tags with that app's token, so that the tag push starts `release.yml`. The required check name `CI result` is the
+Create the `@21-ci/maintainers` and `@21-ci/security` teams first (CODEOWNERS). `tags.json` has an empty
+bypass list, so it imports into any organization (actor IDs differ between accounts). After importing it, open the
+ruleset → **Bypass list → Add bypass** and add **Repository admin** (so maintainers can push a tag by hand) and the
+release GitHub App that release-please acts as (`RELEASE_APP_ID`; it creates the release tags, and its tag push starts
+`release.yml`). An App only shows up there once it is installed on the repository. The required check name `CI result` is the
 final job of `.github/workflows/ci.yml`; rename both together.
