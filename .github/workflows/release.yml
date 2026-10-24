@@ -266,7 +266,7 @@ jobs:
       - name: trivy (unpacked artifacts) -> SARIF
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          version: v0.76.1 # keep equal to TRIVY_VERSION
           scan-type: rootfs
           scan-ref: dist/scan
           scanners: vuln,secret
@@ -280,6 +280,8 @@ jobs:
           category: release-artifacts
       - uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         id: grype
+        with:
+          grype-version: v0.121.0
       - name: Gate - trivy + grype on every artifact and SBOM (HIGH/CRITICAL with a fix blocks the release)
         env:
           GRYPE: ${{ steps.grype.outputs.cmd }}
@@ -379,7 +381,7 @@ jobs:
         env:
           TRIVY_PLATFORM: linux/amd64
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          version: v0.76.1 # keep equal to TRIVY_VERSION
           image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           scanners: vuln,secret
           trivyignores: .trivyignore
@@ -390,7 +392,7 @@ jobs:
         env:
           TRIVY_PLATFORM: linux/arm64
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          version: v0.76.1 # keep equal to TRIVY_VERSION
           skip-setup-trivy: true
           image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           scanners: vuln,secret
@@ -409,6 +411,8 @@ jobs:
           category: image-${{ matrix.image }}-arm64
       - uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         id: grype
+        with:
+          grype-version: v0.121.0
       - name: Gate - trivy + grype on amd64 and arm64 (HIGH/CRITICAL with a fix blocks the release)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}

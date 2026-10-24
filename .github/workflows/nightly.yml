@@ -51,7 +51,7 @@ jobs:
         env:
           TRIVY_PLATFORM: linux/${{ matrix.platform }}
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          version: v0.76.1 # keep equal to TRIVY_VERSION
           image-ref: ${{ env.REF }}
           scanners: vuln,secret
           trivyignores: .trivyignore
@@ -65,6 +65,8 @@ jobs:
       - uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         if: steps.exists.outputs.yes == 'true'
         id: grype
+        with:
+          grype-version: v0.121.0
       - name: Gate (HIGH/CRITICAL with a fix)
         if: steps.exists.outputs.yes == 'true'
         env:
@@ -104,10 +106,12 @@ jobs:
       - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
         if: steps.dl.outputs.found == 'true'
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          version: v0.76.1 # keep equal to TRIVY_VERSION
       - uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         if: steps.dl.outputs.found == 'true'
         id: grype
+        with:
+          grype-version: v0.121.0
       - name: trivy sbom + grype sbom (HIGH/CRITICAL with a fix)
         if: steps.dl.outputs.found == 'true'
         env:
