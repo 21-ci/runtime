@@ -46,19 +46,20 @@ Returned by the control listener (`/v1/*`, default port 8081) in `error.code`.
 |---|---|---|---|
 | `unauthorized` | 401 | No credential, or the token/key is wrong, expired or revoked. | Send `Authorization: Bearer <token>`. Repeated failures from one IP are rate-limited. |
 | `insufficient_scope` | 403 | The key is valid but lacks the scope for this route, the route is operator-only, a key with a project or environment restriction tried to change an environment or a project, or a new token would hold more than its creator (`details.reason: "escalation"`). | Use a key with the needed scope (see the scope table in the API reference); a new token can hold at most the scopes, projects, environments and lifetime of the key that creates it. |
-| `quota_exceeded` | 403 | A quota would be exceeded: a plan quota (services, schedules per service, pending host claims, ...), 100 projects or 200 self-service keys per tenant. | Delete something, or move the tenant to a bigger plan. |
+| `quota_exceeded` | 403 | A quota would be exceeded: a plan quota (services, schedules per service, pending host claims, topics at `max_topics`, ...), 100 projects or 200 self-service keys per tenant. | Delete something, or move the tenant to a bigger plan. |
 | `trigger_not_allowed` | 403 | The trigger is switched off on the service (`triggers.*`) or the tenant's plan does not allow it. | Enable the trigger on the service, or ask the operator for a plan that allows it. |
 | `binding_not_allowed` | 403 | The tenant's plan may not use this operator binding. | Ask the operator to add the plan to the binding's `allowed_plans`. |
 | `host_not_allowed` | 403 | The custom host does not match the plan's `custom_host_suffixes`. | Use an allowed suffix, or ask the operator to attach the host. |
 | `reserved` | 403 | The system tenant is reserved: operator SDKs live there and are managed only through `/v1/sdks`. | Use the SDK routes (`21ci sdk`) instead of the tenant routes. |
 | `not_found` | 404 | The resource does not exist, belongs to another tenant, or is a service whose project or environment the key does not admit (a restricted key cannot tell these apart). | Check the id or slug, the tenant of your key and its `project_ids` and `environments` (`21ci whoami`). |
 | `slug_taken` | 409 | Another service on the node already uses this slug (slugs are node-wide). | Pick another slug. |
+| `topic_exists` | 409 | The tenant already has a topic with this name (a topic name is unique within the tenant). | Pick another name, or use the existing topic. |
 | `host_taken` | 409 | Another service already holds this host. | Use another host, or remove it from the other service first. |
 | `host_cooldown` | 409 | Your earlier pending claim for this host expired; the same tenant must wait one more TTL. | Wait for the cooldown, or have the operator attach the host. |
 | `version_not_ready` | 409 | The version failed to build and cannot go live. | Read its build logs, fix the source, upload again or `rebuild`. |
 | `tenant_not_empty` | 409 | The tenant still owns services. | Delete them first or pass `?purge=1`. |
 | `project_slug_taken` | 409 | The tenant already has a project with this slug. | Pick another slug, or use the existing project. |
-| `project_not_empty` | 409 | The project still holds services. | Delete the services first. |
+| `project_not_empty` | 409 | The project still holds services or topics. | Delete the services and topics first. |
 | `environment_in_use` | 409 | A service is still in an environment the new list drops. | Move the service to another environment or delete it first. |
 | `sdk_release_exists` | 409 | That SDK name and version was published before; releases are immutable. | Publish under a new version. |
 | `precondition_failed` | 412 | `If-Match` did not match the current `ETag`: somebody changed the service meanwhile. | Re-read the service and retry with the new `ETag`. |
@@ -84,6 +85,7 @@ Returned by the control listener (`/v1/*`, default port 8081) in `error.code`.
 | `rate_limited` | 429 | Too many requests (failed auth per IP, SSE streams per key, ...). Carries `Retry-After`. | Wait for `Retry-After`. |
 | `build_quota` | 429 | The plan's `builds_per_hour` is used up. Carries `Retry-After`. | Wait for `Retry-After` or ask for a bigger plan. |
 | `queue_full` | 429 | The service queue is at the plan's `max_queue_depth`. Carries `Retry-After`. | Let consumers catch up, or check the DLQ. |
+| `stream_full` | 429 | The tenant's topics hold more records and dead letters than the plan's storage cap allows. | Let consumers catch up and trim retention, or ask for a bigger plan. |
 | `not_implemented` | 501 | The route exists in the API but is not implemented in this release. | None. |
 | `control_disabled` | 503 | A release build started without `RT_ROOT_TOKEN`: the control API is off. | Set `RT_ROOT_TOKEN` (or `RT_ROOT_TOKEN_FILE`) and restart. |
 
@@ -97,10 +99,13 @@ Returned by the public (port 8080) and internal listeners when a request to a se
 | `unauthorized` | 401 | The service has `access: key` and the request has no valid key with `invoke`. | Send `Authorization: Bearer rtk_…` with the `invoke` scope. |
 | `forbidden` | 403 | An ingress rule (path prefix or IP allow list) refused the request. | Check the service's `ingress` block. |
 | `trigger_not_allowed` | 403 | The tenant's plan does not allow the `http` trigger. | Ask the operator for a plan that allows `http`. |
+| `async_not_allowed` | 403 | The request asked for asynchronous delivery (`X-Rt-Invocation-Type: Event`) but the service's async invocation is off (`async.enabled` is `false`). `Prefer: respond-async` is ignored in that case and the request runs synchronously. | Enable async invocation on the service, or send the request synchronously. |
 | `method_not_allowed` | 405 | The method is not in `ingress.allowed_methods`. | Use an allowed method or change the rule. |
 | `too_large` | 413 | The request body is over `limits.max_body_bytes` (default 10 MB). | Send less, or raise the service limit within the plan. |
 | `rate_limited` | 429 | The plan's `rps` token bucket or a service ingress `rate_limit` is exhausted. Carries `Retry-After`. | Back off for `Retry-After`. |
 | `quota_exceeded` | 429 | A plan quota such as `invocations_per_day` is used up. Carries `Retry-After`. | Wait for the quota window or upgrade the plan. |
+| `async_backlog_full` | 429 | The service already holds its maximum of pending asynchronous invocations. Carries `Retry-After: 1`. | Retry after 1 s, or let the backlog drain. |
+| `idempotency_mismatch` | 409 | The `Idempotency-Key` of an asynchronous invocation was used before with a different request. The same request with the same key returns the original `202`. | Use a fresh key for a different request. |
 | `tenant_concurrency` | 429 | Legacy: no longer produced. Busy capacity now waits in a queue. | None. |
 | `service_concurrency` | 429 | Legacy: no longer produced. Busy capacity now waits in a queue. | None. |
 | `guest_error` | 500 | The handler threw, rejected, trapped, or returned something that is not a `Response`. The body never contains the message. | Read the service logs (`21ci logs <svc>`); the stack is there. |
@@ -116,6 +121,19 @@ Returned by the public (port 8080) and internal listeners when a request to a se
 | `route_stale` | 503 | A control change (deploy, config) is being applied to the routing table. Carries `Retry-After`. | Retry after 1 s (`Retry-After: 1`). |
 | `timeout` | 504 | The task hit its wall-clock limit (`limits.wall_ms`). | Return earlier, stream, or move slow work to a queue. |
 | `call_depth` | 508 | Service-to-service calls nested deeper than 15. | Break the call cycle. |
+
+### Asynchronous invocation failure values
+
+An asynchronous invocation that failed after its `202` keeps an `error` value in its record (`GET /v1/services/{s}/invocations`).
+These values are not HTTP responses:
+
+| `error` | Meaning | Action |
+|---|---|---|
+| `status_429` | The handler answered `429`, so the attempt counts as a failure and is retried | Back off in the handler, or return a different status |
+| `sealed_unreadable` | The stored request cannot be opened (its seal does not verify). It is not retried | Send the request again |
+| `crashed` | The node stopped during a delivery and the record had no attempts left | Check the handler for crashes and retry the request |
+
+Other `5xx` answers are retried until `max_attempts`; then the record fails with the condition `retries_exhausted`.
 
 ## Codes inside guest code
 

@@ -203,14 +203,57 @@ The time a request spent waiting shows up in the `queue` phase of its `server-ti
   and are served before the target's waiting requests. Nested calls therefore cannot deadlock behind their parents. One
   task has at most 16 calls in flight; further calls wait within its deadline.
 - **Builds** count in `max_inflight` only and never wait.
-- **Fairness**: FIFO within a service. When slots free up, tenants take turns, then the services of a tenant, one task
-  per turn.
+- **Fairness**: when slots free up, the waiting work is ordered as described in [Admission order](#admission-order)
+  below. A service's own requests keep their arrival order unless their predicted run times differ.
 - **Queue consumption**: a service consumes its durable queue with at most `queue.max_concurrency` (4) tasks at once,
   within its concurrency limit.
 
 !!! note "Plan caps are per tenant"
     The plan's `max_concurrency` (10 on the built-in `free` plan) bounds all running tasks of a tenant. Requests over it
     wait like any other. A plan change applies with the next request.
+
+### Admission order
+
+When a run slot frees up, the scheduler grants it to the waiting task that comes first in this order:
+
+1. **Calls before requests** within a tenant. Calls are served FIFO among themselves. Builds never wait.
+2. **Between tenants, least service first.** Each tenant has a virtual slot time. A grant charges the tenant the task's
+   predicted run time, and the charge is corrected to the actual run time when the task finishes. The backlogged
+   tenant with the least virtual time goes first, so equal tenants alternate. An idle tenant comes back at most 20 ms
+   behind the others, so it cannot bank credit and then take the whole node.
+3. **Between a tenant's services, earliest deadline first.** Each waiting task gets a deadline key:
+   `arrival + min(sched.aging_factor × predicted, queue_timeout / 2)`. A task predicted short gets an early key and
+   overtakes long tasks that arrived a little before it. A task predicted long gets at most half its queue timeout of
+   credit, so it is overtaken only by work that arrived within that window and is not starved into a timeout. With
+   `sched.aging_factor = 0` the order inside a tenant is plain arrival order.
+
+The prediction is an exponentially weighted average (gain 1/8) of the run time of the service version, measured from
+slot grant to finish. Interactive work (HTTP, calls, pub/sub) and background work (queue, stream, schedules) keep
+separate averages, so slow batch consumers do not inflate the estimate for a service's requests. Until a task has a
+sample, the prediction is 50 ms. Samples are clamped to at least 1 ms and at most 1 h. A task killed by its wall limit
+counts as a sample of the time it ran before the kill.
+
+**Behaviour change.** Earlier releases gave each tenant one turn and then each of its services one turn, one task per
+turn. Now the services of one tenant share a single deadline order. Tasks with similar predicted run times still run in
+arrival order, but a service with short tasks no longer gets an equal share of turns regardless of how long its tasks
+take. Set `sched.aging_factor = 0` for the old within-tenant arrival order.
+
+**Guarantees.** A waiting task can be overtaken within its tenant only by calls, and by tasks that arrived within
+its own deadline window. Between tenants, two always-busy tenants' slot time over any window differs by at most one
+tenant quantum (20 ms) plus the longest predicted run time.
+
+Constants (built into the runtime, not configuration):
+
+| Constant | Value | Meaning |
+|---|---|---|
+| Default prediction | 50 ms | Used before the first sample of a service version |
+| Minimum prediction | 1 ms | Lower bound of a sample |
+| Maximum sample | 1 h | Upper bound of a sample |
+| EWMA gain | 1/8 | Weight of each new sample |
+| Tenant quantum | 20 ms | The most credit an idle tenant can bank |
+| Delay credit cap | 1/2 of `queue_timeout` | Upper bound of a long task's deadline credit |
+
+Node setting: `sched.aging_factor` (default 4, `0` to 64). See [configuration](../config.md).
 
 ## Instances and autoscaling
 

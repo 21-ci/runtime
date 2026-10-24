@@ -57,9 +57,28 @@ Performance. Internal refactoring and test-only changes are left out.
   `host attach|list|get|detach`, `data export`, `build-logs`, `versions <svc> N`, `service update --set|--unset`
   and `node config get`; a global `--retry` for busy answers, `--json` on every command, and exit code 4 for "busy,
   try again later". See the [CLI reference](../cli.md).
+- Pub/sub and streams for services. `std:pubsub` publishes fire-and-forget messages or sends requests with a reply,
+  delivered to the services that subscribe through `events.consume`. `std:stream` writes to a persistent, replayable
+  topic read by consumer groups with offsets, retries and a dead-letter store. Topics are managed with `/v1/topics`,
+  `21ci topic` and MCP; consumer groups with `21ci consumer`, which can also reset offsets and list or purge dead
+  letters. See the [handler reference](../handlers.md) and [error reasons](../reference/errors.md).
+- Asynchronous invocation: a service with `async.enabled = true` accepts `Prefer: respond-async` or
+  `X-Rt-Invocation-Type: Event` and answers `202 Accepted` with an invocation id. The runtime retries failed attempts,
+  honours `Idempotency-Key` and lists records at `GET /v1/services/{s}/invocations`.
+- Instance keep-alive per service: `scaling.min_run_time_ms` (`--min-run-time` on `21ci service create|update`) sets how
+  long a reused Deno isolate or WASM instance may stay idle after it answered. `0` releases it at once unless tasks of
+  the service are waiting for a slot. Node key `sched.min_run_time_max_ms` and the plan limit
+  `limits_max.min_run_time_ms` cap the value. See [Instance lifetime and min_run_time](../handlers.md#instance-lifetime-and-min_run_time).
+- Admission state shows the predicted run time (`pred_ms` in the admission view and `21ci service stats`), and the
+  Prometheus metrics `rt_instance_keepalive_total`, `rt_pubsub_*`, `rt_stream_*`, `rt_async_*` and
+  `rt_queue_throttled_total` are always on. See [Metrics](../reference/metrics.md).
 
 #### Changed
 
+- Admission order is now fair by slot time and deadline. Tenants with the least recent slot time go first; inside a
+  tenant, calls go first and then the earliest deadline, which favours tasks predicted short and bounds how long a long
+  task can be overtaken. The services of one tenant no longer take turns one task each. With `sched.aging_factor = 0`
+  a tenant's waiting tasks run in arrival order. See [Admission order](../concepts/scheduler.md#admission-order).
 - Operator bindings are reachable from operator SDK services only and act for the calling tenant (tenant header, plan,
   rate limit). A tenant service calling `platform.fetch` gets `403 binding_not_allowed`.
 - The `[[sdk]]` configuration section (SDK code bundled into tenant services) and `preload` were removed; a
@@ -78,6 +97,17 @@ Performance. Internal refactoring and test-only changes are left out.
   [Upgrades](../guides/production.md#upgrades) for the reset.
 - The service-data (blocking) pool is work-conserving: when threads are idle, a busy tenant may use more than its
   `blocking_share`, always leaving one thread free.
+
+#### Fixed
+
+- An asynchronous delivery whose stored request cannot be opened fails at once (`sealed_unreadable`) and no longer
+  uses up its retries.
+
+#### Security
+
+- Asynchronous invocation requests are stored sealed (encrypted with the node's secret key, bound to the service and the
+  invocation id) in the queue database. Their headers, such as `Authorization`, and bodies are never kept in plain text
+  on disk, and they are read back only to run the handler.
 
 ### 2026-10-07: review fixes and sample apps
 
