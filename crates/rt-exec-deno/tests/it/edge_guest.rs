@@ -5,7 +5,6 @@
 use crate::common;
 
 use common::*;
-use rt_types::Outcome;
 use serde_json::json;
 
 const INTERNALS: &str = "export default async () => {\n\
@@ -115,17 +114,8 @@ fn dsql_003_iterate_is_capped() {
     run_local(async {
         let mut h = Harness::new(cfg0());
         let p = h.prepare(&ts_upload(ITERATE)).await;
-        // The setup (a cold open, 10,001 inserted rows) can hit sql_busy or the statement budget on a slow,
-        // instrumented runner and throw before the iteration under test; retry it like a client would.
-        let mut tries = 0;
-        let got = loop {
-            tries += 1;
-            let ran = h.run(get("/"), &p).await;
-            if matches!(ran.outcome, Outcome::Ok(_)) || tries == 5 {
-                break read(ran.outcome).await;
-            }
-        };
-        assert_eq!(got.status, 200, "after {tries} tries: {}", got.text());
+        let got = read(h.run_past_cold_open(|| get("/"), &p).await.outcome).await;
+        assert_eq!(got.status, 200, "{}", got.text());
         let v = got.json();
         assert_eq!(v["code"], json!("sql_result_too_large"), "{v}");
         assert!(v["seen"].as_u64().is_some_and(|n| n <= 10_000), "{v}");
@@ -170,10 +160,13 @@ fn preempt_003_host_sql_cpu_counts_toward_the_cpu_limit() {
     run_local(async {
         let mut h = Harness::new(cfg0());
         let p = h.prepare(&ts_upload(SQL_BURN)).await;
-        let mut s = get("/");
-        s.limits.cpu = std::time::Duration::from_millis(150);
-        s.limits.wall = std::time::Duration::from_secs(30);
-        let ran = h.run(s, &p).await;
+        let spec = || {
+            let mut s = get("/");
+            s.limits.cpu = std::time::Duration::from_millis(150);
+            s.limits.wall = std::time::Duration::from_secs(30);
+            s
+        };
+        let ran = h.run_past_cold_open(spec, &p).await;
         let logs: Vec<String> = h.log_records().into_iter().map(|r| r.msg).collect();
         assert!(
             matches!(ran.outcome, rt_types::Outcome::Killed(rt_types::KillReason::CpuLimit)),

@@ -550,6 +550,31 @@ impl Harness {
     pub fn log_records(&self) -> Vec<LogRecord> {
         self.logs.records()
     }
+
+    /// Run a request, again if it failed only because `std:sqlite` was still opening a cold database.
+    ///
+    /// The first statement of a service waits at most its budget for the open (on the blocking pool) and
+    /// otherwise fails fast with `sql_busy` ("database is busy"); the open goes on and the next call finds
+    /// it. That is the documented behaviour; on a slow, instrumented runner it happens, so a test retries
+    /// like a client would. Any other outcome, a CPU-limit kill included, is returned on the first try.
+    pub async fn run_past_cold_open(
+        &mut self,
+        spec: impl Fn() -> rt_types::TaskSpec,
+        prepared: &Arc<DenoPrepared>,
+    ) -> Ran {
+        for _ in 0..9 {
+            let seen = self.log_records().len();
+            let ran = self.run(spec(), prepared).await;
+            let cold = matches!(ran.outcome, Outcome::GuestError)
+                && self.log_records()[seen..]
+                    .iter()
+                    .any(|r| r.msg.contains("database is busy"));
+            if !cold {
+                return ran;
+            }
+        }
+        self.run(spec(), prepared).await
+    }
 }
 
 /// `rt.json` imports of an upload (what the resolver config needs).
