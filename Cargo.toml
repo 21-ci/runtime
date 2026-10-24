@@ -1,0 +1,189 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/rt-types",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "Apache-2.0"
+authors = ["The 21 Cloud Runtime Authors"]
+repository = "https://github.com/21-ci/runtime"
+homepage = "https://21-ci.github.io/runtime/"
+documentation = "https://21-ci.github.io/runtime/"
+keywords = ["serverless", "functions", "deno", "wasm", "runtime"]
+categories = ["web-programming::http-server", "wasm"]
+# Binaries ship through GitHub Releases, Homebrew, apt/rpm/apk and GHCR (packaging/), not crates.io.
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+# `--cfg loom` is used by the rt-sched lock-free queue tests.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[workspace.lints.clippy]
+# Skeleton phase: many bodies are `todo!()`.
+todo = "allow"
+
+# ---------------------------------------------------------------------------
+# Every third-party dependency is pinned here. Crates use `dep.workspace = true`.
+# A new dependency needs a reason in its PR and must pass `cargo deny check` (deny.toml).
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# --- internal crates -------------------------------------------------------
+rt-types = { path = "crates/rt-types" }
+rt-config = { path = "crates/rt-config" }
+rt-mem = { path = "crates/rt-mem" }
+rt-obs = { path = "crates/rt-obs" }
+rt-sec = { path = "crates/rt-sec" }
+rt-sched = { path = "crates/rt-sched" }
+rt-store = { path = "crates/rt-store" }
+rt-cache = { path = "crates/rt-cache" }
+rt-host = { path = "crates/rt-host" }
+rt-build = { path = "crates/rt-build" }
+rt-exec-deno = { path = "crates/rt-exec-deno" }
+rt-exec-wasm = { path = "crates/rt-exec-wasm" }
+rt-triggers = { path = "crates/rt-triggers" }
+rt-api = { path = "crates/rt-api" }
+rt-server = { path = "crates/rt-server" }
+rt-testkit = { path = "crates/rt-testkit" }
+
+# --- async runtime / futures ----------------------------------------------
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util", "signal"] }
+tokio-util = { version = "0.7.18", features = ["io", "rt"] }
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+futures-util = { version = "0.3.32", default-features = false, features = ["std", "sink"] }
+async-trait = "0.1.89"
+
+# --- HTTP stack ------------------------------------------------------------
+http = "1.4.0"
+http-body = "1.0.1"
+http-body-util = "0.1.3"
+bytes = { version = "1.11.1", features = ["serde"] }
+hyper = { version = "1.9.0", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1.17", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
+axum = { version = "0.8.9", features = ["http2", "macros"] }
+tower = { version = "0.5.2", default-features = false, features = ["util", "limit", "timeout"] }
+tower-http = { version = "0.6.6", features = ["trace", "limit", "timeout", "cors"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream", "json"] }
+url = { version = "2.5.7", features = ["serde"] }
+# WebSockets: the node's codec (upgraded ingress sockets, std:sockets) and the outbound client
+# (TLS through tokio-rustls, the copy reqwest already links). No permessage-deflate.
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1.0.4"
+ipnet = { version = "2.11.0", features = ["serde"] }
+# Custom-host DNS TXT verification (same version Deno already links: no second copy).
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "system-config"] }
+
+# --- OpenAPI ---------------------------------------------------------------
+utoipa = { version = "5.4.0", features = ["axum_extras"] }
+utoipa-axum = "0.2.0"
+utoipa-scalar = { version = "0.3.0", features = ["axum"] }
+
+# --- serialization / config ------------------------------------------------
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["raw_value", "preserve_order"] }
+toml = "0.9.8"
+humantime = "2.3.0"
+hex = "0.4.3"
+base64 = "0.22.1"
+
+# --- errors / logging / metrics -------------------------------------------
+thiserror = "2.0.17"
+anyhow = "1.0.100"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+prometheus = { version = "0.14.0", default-features = false }
+hdrhistogram = { version = "7.5.4", default-features = false }
+
+# --- CLI / allocator -------------------------------------------------------
+clap = { version = "4.5.51", features = ["derive", "env"] }
+clap_complete = "4.6.0"
+mimalloc = "0.1.48"
+
+# --- storage ---------------------------------------------------------------
+rusqlite = { version = "0.40.0", features = ["bundled", "hooks", "backup", "limits", "modern_sqlite", "fallible_uint"] }
+
+# --- time / scheduling -----------------------------------------------------
+cron = "0.15.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std", "serde"] }
+chrono-tz = "0.10.4"
+
+# --- crypto (RustCrypto 0.10/0.12 line: same as deno_crypto) ----------------
+aes-gcm = "0.10.3"
+hmac = "0.12.1"
+sha2 = "0.10.9"
+hkdf = "0.12.4"
+rand = "0.8.5"
+zeroize = { version = "1.8.2", features = ["derive"] }
+subtle = "2.6.1"
+
+# --- ids / data structures / concurrency -----------------------------------
+ulid = { version = "1.2.1", features = ["serde"] }
+semver = "1.0.28"
+dashmap = "6.1.0"
+arc-swap = "1.7.1"
+parking_lot = "0.12.5"
+crossbeam-deque = "0.8.6"
+crossbeam-queue = "0.3.12"
+crossbeam-utils = "0.8.21"
+libc = "0.2.177"
+
+# --- build pipeline --------------------------------------------------------
+tar = "0.4.44"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+flate2 = "1.1.5"
+
+# --- WASM ------------------------------------------------------------------
+wasmtime = { version = "48.0.7", features = ["component-model", "async", "pooling-allocator"] }
+wasmtime-wasi = "48.0.7"
+wasmtime-wasi-http = "48.0.7"
+wasmparser = "0.248.0"
+
+# --- Deno (ONE release: v2.9.7, 2026-09-17; versions copied from its Cargo.toml) ---
+deno_core = "=0.412.0"
+deno_webidl = "=0.259.0"
+deno_web = "=0.290.0"
+deno_fetch = "=0.283.0"
+deno_crypto = "=0.273.0"
+deno_error = "=0.7.1"
+deno_ast = { version = "=0.53.3", features = ["transpiling"] }
+
+# --- dev / test ------------------------------------------------------------
+proptest = "1.9.0"
+loom = "0.7.2"
+tempfile = "3.23.0"
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+httpmock = "0.8.3"
+
+[profile.dev]
+# Disk is tight (V8 + wasmtime): keep line tables for our crates, none for deps.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# Cranelift at opt-level 0 makes wasm compilation in tests painfully slow.
+[profile.dev.package.cranelift-codegen]
+opt-level = 1
+[profile.dev.package.cranelift-frontend]
+opt-level = 1
+[profile.dev.package.regalloc2]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+strip = true
+# NB: panic = "abort" is deliberately NOT set: Reservation drop-on-unwind and
+# per-task catch_unwind rely on unwinding (memory reservations are released on panic).
+
+# build.rs of rt-exec-deno runs V8 to create the snapshot; optimize build deps so
+# deno crates are not compiled twice (debug for build.rs + release for the binary).
+[profile.release.build-override]
+opt-level = 3
