@@ -10,7 +10,7 @@ the environment or in files, never in `rt.toml`.
 | [`compose/`](compose/) | Docker Compose: `ghcr.io/21-ci/rt` behind Caddy (automatic HTTPS), read-only root filesystem, no capabilities |
 | [`kubernetes/rt.yaml`](kubernetes/rt.yaml) | plain manifests: StatefulSet + PVC, probes, Services, NetworkPolicy, secrets as files |
 | systemd | the unit and its hardening live with the packages: [`packaging/systemd/rt.service`](../packaging/systemd/rt.service) (installed by the deb/rpm packages) |
-| Homebrew (macOS) | `brew install 21-ci/tap/rt && brew services start rt` ([`packaging/homebrew/`](../packaging/homebrew/)) |
+| Homebrew (macOS) | `brew tap 21-ci/tap && brew trust 21-ci/tap && brew install 21-ci/tap/rt && brew services start rt` ([`packaging/homebrew/`](../packaging/homebrew/)) |
 
 The repository root `docker-compose.yml` is the **development** stack (builds the image from source, everything on
 loopback); use `deploy/compose/` for a server.

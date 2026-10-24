@@ -69,6 +69,7 @@ Pick one way to run a node, then deploy with `21ci`.
 <summary><b>Homebrew</b> (macOS, Linux)</summary>
 
 ```bash
+brew tap 21-ci/tap && brew trust 21-ci/tap    # once: Homebrew asks you to trust a third-party tap
 brew install 21-ci/tap/rt 21-ci/tap/21ci
 brew services start rt             # loopback only; config, token and master key in $(brew --prefix)/etc/rt/
 export RT_ROOT_TOKEN=$(cat "$(brew --prefix)/etc/rt/root-token")
