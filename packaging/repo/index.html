@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 Cloud packages</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 16px; }
+  pre { overflow-x: auto; padding: .75rem 1rem; border-radius: 6px; background: rgba(127,127,127,.12); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+</style>
+</head>
+<body>
+<h1>21 Cloud packages</h1>
+<p>Signed package repositories for <code>rt</code> (the runtime node, deb/rpm) and <code>21ci</code> (the CLI,
+deb/rpm/apk). Source: <a href="https://github.com/21-ci/runtime">github.com/21-ci/runtime</a>.
+Docs: <a href="../">21-ci.github.io/runtime</a>.</p>
+
+<h2>Debian / Ubuntu</h2>
+<pre><code>curl -fsSL https://21-ci.github.io/runtime/packages/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/21cloud.gpg
+echo "deb [signed-by=/etc/apt/keyrings/21cloud.gpg] https://21-ci.github.io/runtime/packages/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/21cloud.list
+sudo apt update &amp;&amp; sudo apt install rt 21ci</code></pre>
+
+<h2>Fedora / RHEL / openSUSE</h2>
+<pre><code>sudo curl -fsSL -o /etc/yum.repos.d/21cloud.repo https://21-ci.github.io/runtime/packages/rpm/21cloud.repo
+sudo dnf install rt 21ci</code></pre>
+
+<h2>Alpine (21ci only)</h2>
+<pre><code>wget -qO /etc/apk/keys/21cloud.rsa.pub https://21-ci.github.io/runtime/packages/apk/21cloud.rsa.pub
+echo "https://21-ci.github.io/runtime/packages/apk" &gt;&gt; /etc/apk/repositories
+apk add 21ci</code></pre>
+<p><code>rt</code> needs glibc (prebuilt V8); on Alpine run the image <code>ghcr.io/21-ci/rt</code>.</p>
+
+<h2>Verify the key</h2>
+<p>The GPG key fingerprint is listed in
+<a href="https://github.com/21-ci/runtime/blob/main/SECURITY.md#verifying-releases">SECURITY.md</a>.
+Compare it with <code>gpg --show-keys gpg.key</code> before you trust the repository.</p>
+</body>
+</html>

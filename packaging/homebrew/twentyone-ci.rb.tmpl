@@ -1,0 +1,48 @@
+# typed: false
+# frozen_string_literal: true
+
+# Generated from packaging/homebrew/twentyone-ci.rb.tmpl in github.com/21-ci/runtime by the release workflow. Do not
+# edit in the tap: changes are overwritten on the next release.
+#
+# Homebrew derives the Ruby class from the formula name, and a name that starts with a digit is not a valid class, so
+# the formula is `twentyone-ci` and the tap carries the alias `Aliases/21ci`: `brew install 21-ci/tap/21ci` works.
+class TwentyoneCi < Formula
+  desc "Command-line client for the 21 Cloud Functions Runtime control API"
+  homepage "https://github.com/21-ci/runtime"
+  version "@VERSION@"
+  license "Apache-2.0"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/21-ci/runtime/releases/download/v@VERSION@/21ci-@VERSION@-aarch64-apple-darwin.tar.gz"
+      sha256 "@SHA256_21ci_aarch64-apple-darwin@"
+    end
+    on_intel do
+      url "https://github.com/21-ci/runtime/releases/download/v@VERSION@/21ci-@VERSION@-x86_64-apple-darwin.tar.gz"
+      sha256 "@SHA256_21ci_x86_64-apple-darwin@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/21-ci/runtime/releases/download/v@VERSION@/21ci-@VERSION@-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "@SHA256_21ci_aarch64-unknown-linux-musl@"
+    end
+    on_intel do
+      url "https://github.com/21-ci/runtime/releases/download/v@VERSION@/21ci-@VERSION@-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "@SHA256_21ci_x86_64-unknown-linux-musl@"
+    end
+  end
+
+  def install
+    bin.install "21ci"
+    generate_completions_from_executable(bin/"21ci", "completion")
+    doc.install "README.md", "LICENSE", "NOTICE"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/21ci --version")
+    # No node to talk to: a network error exits 3 (docs: CLI exit codes).
+    shell_output("#{bin}/21ci --api http://127.0.0.1:9 tenant ls 2>&1", 3)
+  end
+end

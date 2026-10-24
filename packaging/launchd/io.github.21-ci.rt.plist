@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent for rt on macOS without Homebrew (Homebrew users: `brew services start rt` writes its own).
+
+    mkdir -p ~/Library/Application\ Support/rt ~/Library/Logs/rt
+    cp packaging/launchd/io.github.21-ci.rt.plist ~/Library/LaunchAgents/
+    # edit the paths below (binary, config, data) and put the secrets in the two files they name
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.21-ci.rt.plist
+    launchctl kickstart -k gui/$(id -u)/io.github.21-ci.rt
+
+  REPLACE_HOME stands for your home directory (launchd does not expand ~ or $HOME).
+  macOS is a development platform for rt: production runs on Linux.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.21-ci.rt</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/rt</string>
+    <string>--config</string>
+    <string>REPLACE_HOME/Library/Application Support/rt/rt.toml</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RT_ROOT_TOKEN_FILE</key>
+    <string>REPLACE_HOME/Library/Application Support/rt/root-token</string>
+    <key>RT_MASTER_KEY_FILE</key>
+    <string>REPLACE_HOME/Library/Application Support/rt/master.key</string>
+    <key>RT_LOG</key>
+    <string>info</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>REPLACE_HOME/Library/Application Support/rt</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>65536</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>REPLACE_HOME/Library/Logs/rt/rt.log</string>
+  <key>StandardErrorPath</key>
+  <string>REPLACE_HOME/Library/Logs/rt/rt.log</string>
+</dict>
+</plist>
