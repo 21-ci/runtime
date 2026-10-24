@@ -15,6 +15,7 @@ members = [
   "crates/rt-exec-deno",
   "crates/rt-exec-wasm",
   "crates/rt-triggers",
+  "crates/rt-api",
 ]
 
 [workspace.package]

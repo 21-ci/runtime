@@ -1,0 +1,61 @@
+[package]
+name = "rt-api"
+description = "Control API /v1, invoke router /s/{slug}/*, OpenAPI + Scalar, metrics/health (L5)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rt-types.workspace = true
+rt-config.workspace = true
+rt-mem.workspace = true
+rt-obs.workspace = true
+rt-sec.workspace = true
+rt-sched.workspace = true
+rt-store.workspace = true
+rt-triggers.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+hyper-util = { workspace = true, features = ["server-graceful"] }
+utoipa.workspace = true
+utoipa-axum.workspace = true
+utoipa-scalar.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros"] }
+tokio-stream.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+ipnet.workspace = true
+arc-swap.workspace = true
+chrono.workspace = true
+rand.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+sha2.workspace = true
+hickory-resolver.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+rt-testkit.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
