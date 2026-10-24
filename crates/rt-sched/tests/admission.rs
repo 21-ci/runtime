@@ -2878,3 +2878,184 @@ fn perf_admission_slow_path_10k_waiting_over_1k_tenants() {
         "mean over 5 us/op: enqueue {e:.0}, release {r:.0}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Fair order in the simulation (feature 2): the estimator learns from finished tasks
+// ---------------------------------------------------------------------------------------------
+
+/// One node slot, a tenant with a short and a long service, generous queue bounds.
+fn one_slot() -> SimRuntime {
+    SimRuntime::new(fixed(1, 1).sched(|s| {
+        s.max_inflight = 1;
+        s.max_queued = 20_000;
+    }))
+}
+
+/// Run one task of each spec alone so the estimator knows their run times.
+fn warm_up(sim: &mut SimRuntime, specs: &[&dyn Fn() -> TaskSpec]) {
+    for s in specs {
+        let mut t = admitted(sim.submit_existing(s()));
+        sim.run_until_idle();
+        assert_ok(sim.outcome(&mut t));
+    }
+}
+
+/// AC-SCH-40: under contention a tenant's short job starts before its long job that queued
+/// first, once finished tasks taught the estimator their run times.
+#[test]
+fn ac_sch_40_short_jobs_start_first_under_contention() {
+    let mut sim = one_slot();
+    sim.scripts().set_for_service(ids::service(1), script![io(5)]);
+    sim.scripts().set_for_service(ids::service(2), script![io(2000)]);
+    sim.scripts().set_for_service(ids::service(3), script![io(100)]);
+    let short = || d(1).tenant(1).queue_timeout_ms(30_000).finish();
+    let long = || d(2).tenant(1).queue_timeout_ms(30_000).finish();
+    warm_up(&mut sim, &[&short, &long, &short, &long]);
+
+    let mut blocker = admitted(sim.submit_existing(d(3).tenant(1).queue_timeout_ms(30_000).finish()));
+    let mut l = admitted(sim.submit_existing(long()));
+    let mut s = admitted(sim.submit_existing(short()));
+    sim.run_until_idle();
+    for t in [&mut blocker, &mut l, &mut s] {
+        assert_ok(sim.outcome(t));
+    }
+    let (ql, qs) = (l.timings().queue, s.timings().queue);
+    assert!(qs < ql, "the short job waited {qs:?}, the long one {ql:?}");
+    assert!(ql >= ms(100), "the long job waited for the short one: {ql:?}");
+}
+
+/// AC-SCH-41: a long job is overtaken only by short arrivals within half its queue timeout: it
+/// starts by `submit + Q/2 + one short job` under a steady stream of short jobs, and nothing
+/// times out.
+#[test]
+fn ac_sch_41_a_long_job_starts_within_half_the_queue_timeout_under_a_stream_of_short_jobs() {
+    let q = 5_000;
+    let mut sim = one_slot();
+    sim.scripts().set_for_service(ids::service(1), script![io(5)]);
+    sim.scripts().set_for_service(ids::service(2), script![io(2000)]);
+    let short = || d(1).tenant(1).queue_timeout_ms(q).finish();
+    let long = || d(2).tenant(1).queue_timeout_ms(q).finish();
+    warm_up(&mut sim, &[&short, &long, &short, &long]);
+
+    let mut shorts = Vec::new();
+    for _ in 0..4 {
+        shorts.push(admitted(sim.submit_existing(short())));
+    }
+    let mut l = admitted(sim.submit_existing(long()));
+    // a short job every 5 ms for 3 s: the slot never goes idle
+    for _ in 0..600 {
+        shorts.push(admitted(sim.submit_existing(short())));
+        sim.run_for(ms(5));
+    }
+    sim.run_until_idle();
+    assert_ok(sim.outcome(&mut l));
+    let started = l.timings().queue;
+    assert!(
+        started <= ms(q / 2 + 5 + 20),
+        "the long job started {started:?} after it was submitted"
+    );
+    assert!(
+        started >= ms(q / 2 - 100),
+        "short arrivals inside Q/2 went first: {started:?}"
+    );
+    for mut t in shorts {
+        assert_ok(sim.outcome(&mut t));
+    }
+}
+
+/// AC-SCH-42: two busy tenants get equal slot time, not equal task counts (5 ms vs 500 ms jobs).
+#[test]
+fn ac_sch_42_two_busy_tenants_get_equal_slot_time() {
+    let mut sim = one_slot();
+    sim.scripts().set_for_service(ids::service(1), script![io(5)]);
+    sim.scripts().set_for_service(ids::service(2), script![io(500)]);
+    let a = || d(1).tenant(1).queue_timeout_ms(600_000).finish();
+    let b = || d(2).tenant(2).queue_timeout_ms(600_000).finish();
+    warm_up(&mut sim, &[&a, &b]);
+    let mut ta: Vec<SimTask> = (0..4_000).map(|_| admitted(sim.submit_existing(a()))).collect();
+    let mut tb: Vec<SimTask> = (0..40).map(|_| admitted(sim.submit_existing(b()))).collect();
+    sim.run_for(Duration::from_secs(10));
+    let done =
+        |sim: &mut SimRuntime, v: &mut Vec<SimTask>| v.iter_mut().filter_map(|t| sim.outcome(t).map(|_| ())).count();
+    let slot_a = ms(5) * done(&mut sim, &mut ta) as u32;
+    let slot_b = ms(500) * done(&mut sim, &mut tb) as u32;
+    let diff = slot_a.abs_diff(slot_b);
+    assert!(
+        diff <= TENANT_QUANTUM + ms(500) + ms(100),
+        "slot time A {slot_a:?} vs B {slot_b:?}"
+    );
+    assert!(slot_a > Duration::from_secs(3) && slot_b > Duration::from_secs(3));
+    sim.run_until_idle();
+}
+
+/// AC-SCH-43: granted waiters land in the wait-by-size histogram and aged grants are counted
+/// on the node registry.
+#[test]
+fn ac_sch_43_the_wait_by_size_histogram_and_aged_grants_are_reported() {
+    use rt_obs::{Metrics, MetricsOptions};
+    use rt_sched::{Scheduler, SimClock, UnitSource};
+    use rt_testkit::{
+        MockBuildExecutor, MockDenoExecutor, MockPreparedSource, MockWasmExecutor, ScriptBook, TestGovernor,
+        VirtualClock,
+    };
+
+    let metrics = Metrics::new(MetricsOptions::default()).expect("metrics");
+    let clock = Arc::new(VirtualClock::new());
+    let book = ScriptBook::new();
+    book.set_default(script![io(5)]);
+    let source = MockPreparedSource::new();
+    source.set_auto_ready(true);
+    let mut cfg = fixed(1, 1).sched;
+    cfg.max_inflight = 1;
+    cfg.aging_factor = 0;
+    cfg.max_queued = 100;
+    let (b1, b2, b3) = (book.clone(), book.clone(), book.clone());
+    let mut sim = Scheduler::builder(cfg, clock.clone(), TestGovernor::with_mb(4096))
+        .executor(move || MockDenoExecutor::new(b1.clone()), source.clone(), 0)
+        .executor(move || MockWasmExecutor::new(b2.clone()), source.clone(), 0)
+        .executor(move || MockBuildExecutor::new(b3.clone()), Arc::new(UnitSource), 0)
+        .metrics(metrics.clone())
+        .build_sim(clock.clone() as Arc<dyn SimClock>)
+        .expect("sim");
+    // one task alone teaches the estimator a 5 ms run time (before that the prior is the wall limit)
+    let first = sim.scheduler().submit(d(1).tenant(1).queue_timeout_ms(30_000).finish());
+    sim.run_until_idle(100_000);
+    drop(first);
+    let handles: Vec<_> = (0..5)
+        .map(|_| {
+            sim.scheduler()
+                .submit(d(1).tenant(1).queue_timeout_ms(30_000).finish())
+                .expect("admitted")
+        })
+        .collect();
+    sim.run_until_idle(100_000);
+    sim.advance(Duration::from_secs(2));
+    drop(handles);
+    let text = metrics.render();
+    let count = text
+        .lines()
+        .find(|l| l.starts_with("rt_admission_wait_by_size_seconds_count{size=\"short\"}"))
+        .unwrap_or_else(|| panic!("no short series:\n{text}"));
+    assert!(count.ends_with(" 4"), "four waiters were granted: {count}");
+    let aged = text
+        .lines()
+        .find(|l| l.starts_with("rt_admission_aged_grants_total "))
+        .unwrap_or_else(|| panic!("no aged grants:\n{text}"));
+    assert!(
+        aged.ends_with(" 4"),
+        "aging 0: every grant is at or after its key: {aged}"
+    );
+}
+
+/// PRED-002 end to end: a wall kill in the scheduler feeds the estimator about the wall limit
+/// (a censored sample), so the service is not predicted as fast.
+#[test]
+fn pred_003_a_wall_kill_in_the_scheduler_feeds_the_estimator() {
+    let mut sim = sim(1, 1);
+    sim.scripts().set_for_service(ids::service(1), script![io(5_000)]);
+    let mut t = admitted(sim.submit_existing(d(1).wall_limit(200).finish()));
+    sim.run_until_idle();
+    assert_killed(sim.outcome(&mut t), rt_types::KillReason::WallTimeout);
+    let pred = scaling_of(&sim, 1).pred[0].expect("a sample was taken");
+    assert!(pred >= ms(150) && pred <= ms(300), "{pred:?}");
+}
