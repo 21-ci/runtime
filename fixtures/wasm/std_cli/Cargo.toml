@@ -1,0 +1,24 @@
+[package]
+name = "rt-fixture-std-cli"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "WSM-21: a full-std Rust component (println!, env, IsTerminal) imports wasi:cli/terminal-*"
+
+# A cdylib built for `wasm32-wasip2` is already a WebAssembly component; the `wasip2` crate
+# embeds the `wasi:http/proxy` world, so it exports `wasi:http/incoming-handler`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasip2 = "2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
+
+# Standalone crate: NOT a member of the runtime workspace.
+[workspace]

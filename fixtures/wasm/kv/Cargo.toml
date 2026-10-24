@@ -1,0 +1,24 @@
+[package]
+name = "rt-fixture-kv"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "WSM-06: round-trips a value through std:host/kv"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasip2 = "2"
+# Bindings for `std:host/kv` generated from /wit/rt-host.wit; `wasi:http/proxy` comes from `wasip2`.
+wit-bindgen = { version = "0.62", default-features = false, features = ["macros", "realloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
+
+# Standalone crate: NOT a member of the runtime workspace.
+[workspace]

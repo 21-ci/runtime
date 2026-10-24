@@ -1,0 +1,23 @@
+[package]
+name = "rt-fixture-edge"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Edge cases (scratchpad edge-cases.md): stack overflow, odd stdout, accept without an offer, invalid UTF-8 across the ABI, large blob puts"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasip2 = "2"
+wit-bindgen = { version = "0.62", default-features = false, features = ["macros", "realloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
+
+# Standalone crate: NOT a member of the runtime workspace.
+[workspace]

@@ -1,0 +1,24 @@
+[package]
+name = "rt-fixture-stdout-log"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "WSM-07: writes to wasi:cli stdout/stderr"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasip2 = "2"
+# Bindings for `std:host/log` generated from /wit/rt-host.wit (the `/fields` route).
+wit-bindgen = { version = "0.62", default-features = false, features = ["macros", "realloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
+
+# Standalone crate: NOT a member of the runtime workspace.
+[workspace]
