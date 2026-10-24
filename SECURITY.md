@@ -1026,7 +1026,8 @@ curl -fsSL https://21-ci.github.io/runtime/packages/gpg.key | gpg --show-keys --
 # expected: the fingerprint below
 ```
 
-Package signing key: `21 Cloud Packages <packages@21ci.uz>`, fingerprint `PENDING-NEW-KEY` (set when the key is
-created; a changed key is announced in the release notes).
+Package signing key: `21 Cloud Packages <packages@21ci.uz>`, fingerprint
+`2018 24B4 6B59 F184 7241  11EE 67A8 C631 FC31 2DB3` (RSA 4096, expires 2029-10-23; a changed key is announced in
+the release notes).
 
 The Homebrew formulae pin the SHA-256 of each tarball; `brew` verifies it on install.
