@@ -370,7 +370,7 @@ async fn ac_async_eng_08_status_429_is_retried() {
     assert_eq!(s.submitted.load(Ordering::SeqCst), 2);
 }
 
-/// An unreadable sealed payload fails at once: no task, no backoff wait.
+/// An unreadable sealed payload fails at once: no task, no backoff wait, no further attempts.
 #[tokio::test]
 async fn ac_async_eng_09_unreadable_payload_fails_without_retry() {
     let store = SqliteQueueStore::open_in_memory(5).unwrap();
@@ -385,6 +385,8 @@ async fn ac_async_eng_09_unreadable_payload_fails_without_retry() {
     let r = finished(&run.store, svc(1), a).await;
     assert_eq!(r.state, InvocationState::Failed);
     assert_eq!(r.error.as_deref(), Some(SEALED_UNREADABLE));
+    assert_eq!(r.condition.as_deref(), Some("unreadable"));
+    assert_eq!(r.attempts, 1, "the remaining attempts are not spent");
     assert_eq!(s.submitted.load(Ordering::SeqCst), 0);
 }
 

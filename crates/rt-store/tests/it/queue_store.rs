@@ -928,6 +928,32 @@ mod invocations {
         assert!(q.lease_invocations(s, 10, LONG).await.expect("lease").is_empty());
     }
 
+    /// `fail_now` fails the leased delivery at once (condition `unreadable`, no retry) and is
+    /// fenced like `fail_attempt`.
+    #[tokio::test]
+    async fn ac_async_11_fail_now_fails_at_once_without_retry() {
+        let q = queue(5);
+        let s = svc(1);
+        let id = accept_new(&q, inv(s, None, "h")).await;
+        assert!(matches!(
+            q.fail_now(id, 1, "sealed_unreadable").await,
+            Err(StoreError::NotFound)
+        ));
+        let l = q.lease_invocations(s, 10, LONG).await.expect("lease");
+        assert!(matches!(
+            q.fail_now(id, 2, "sealed_unreadable").await,
+            Err(StoreError::NotFound)
+        ));
+        q.fail_now(id, l[0].attempt, "sealed_unreadable")
+            .await
+            .expect("fail now");
+        let r = q.invocation(s, id).await.expect("get").expect("record");
+        assert_eq!(r.state, InvocationState::Failed);
+        assert_eq!(r.condition.as_deref(), Some("unreadable"));
+        assert_eq!((r.error.as_deref(), r.attempts), (Some("sealed_unreadable"), 1));
+        assert!(q.lease_invocations(s, 10, LONG).await.expect("lease").is_empty());
+    }
+
     /// A release (throttle) hands the delivery back without spending an attempt.
     #[tokio::test]
     async fn ac_async_03_release_does_not_count_an_attempt() {

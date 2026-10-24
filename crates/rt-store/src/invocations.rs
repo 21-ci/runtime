@@ -169,6 +169,9 @@ pub trait InvocationStore: Send + Sync {
         status: Option<u16>,
         delay: Duration,
     ) -> Result<InvocationState>;
+    /// Delivery `attempt` can never run (e.g. its sealed request is unreadable): `failed` at once
+    /// with condition `unreadable` and `error`, no retry. `NotFound` = stale settle.
+    async fn fail_now(&self, id: InvocationId, attempt: u16, error: &str) -> Result<()>;
     /// Delivery `attempt` never ran (throttle): the attempt is refunded and the record is visible
     /// again after `delay`. `false` = stale settle.
     async fn release(&self, id: InvocationId, attempt: u16, delay: Duration) -> Result<bool>;
@@ -383,6 +386,7 @@ fn fail_tx(
     error: &str,
     status: Option<u16>,
     delay: Duration,
+    now_fail: bool,
 ) -> Result<(InvocationState, u64)> {
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now = now_ms();
@@ -399,11 +403,19 @@ fn fail_tx(
         return Err(StoreError::NotFound);
     };
     let status = status.map(i64::from);
-    let (state, evicted) = if i64::from(attempt) >= max_attempts {
+    let (state, evicted) = if now_fail || i64::from(attempt) >= max_attempts {
+        let condition = if now_fail { "unreadable" } else { "retries_exhausted" };
         tx.execute(
-            "UPDATE invocations SET state = 'failed', leased = 0, condition = 'retries_exhausted', error = ?2, \
+            "UPDATE invocations SET state = 'failed', leased = 0, condition = ?6, error = ?2, \
              status = ?3, updated_at = ?4, expires_at = ?5 WHERE id = ?1",
-            params![key, error, status, now, now.saturating_add(ASYNC_FAILED_RETENTION_MS)],
+            params![
+                key,
+                error,
+                status,
+                now,
+                now.saturating_add(ASYNC_FAILED_RETENTION_MS),
+                condition
+            ],
         )?;
         (InvocationState::Failed, evict_failed(&tx, &service)?)
     } else {
@@ -506,10 +518,20 @@ impl InvocationStore for SqliteQueueStore {
         let error = error.to_string();
         let (state, evicted) = self
             .db
-            .call(move |c| fail_tx(c, id, attempt, &error, status, delay))
+            .call(move |c| fail_tx(c, id, attempt, &error, status, delay, false))
             .await?;
         self.evicted.fetch_add(evicted, Ordering::Relaxed);
         Ok(state)
+    }
+
+    async fn fail_now(&self, id: InvocationId, attempt: u16, error: &str) -> Result<()> {
+        let error = error.to_string();
+        let (_, evicted) = self
+            .db
+            .call(move |c| fail_tx(c, id, attempt, &error, None, Duration::ZERO, true))
+            .await?;
+        self.evicted.fetch_add(evicted, Ordering::Relaxed);
+        Ok(())
     }
 
     async fn release(&self, id: InvocationId, attempt: u16, delay: Duration) -> Result<bool> {
