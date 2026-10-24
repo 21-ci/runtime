@@ -13,13 +13,16 @@
 //!   current is not kept;
 //! - only clean finishes are kept (the executor checks: no kill, no guest error or unhandled
 //!   rejection, nothing left on the event loop, memory within bounds, `reuse_max_uses`);
-//! - kept isolates expire after `reuse_idle_ttl` (not the ones the scheduler's published warm target
-//!   asks for: that many per service are *protected* from the TTL, D-B2) and are shed at memory
-//!   pressure `High` (down to the protected ones) or `Critical` (all).
+//! - every kept isolate carries its own expiry, set when it is parked: the service's
+//!   `min_run_time` after the answer, else `reuse_idle_ttl` (inherit). A *handoff* isolate
+//!   (`min_run_time = 0` while work of the service waited) is also dropped at the first trim that
+//!   sees no waiting work. The isolates the scheduler's published warm target asks for are
+//!   *protected* from expiry (D-B2): that many per service never expire. Kept isolates are shed at
+//!   memory pressure `High` (down to the protected ones) or `Critical` (all).
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use rt_types::{EnvBundle, PreparedKey, ServiceId, ServiceRef, TenantId};
 
@@ -71,6 +74,17 @@ pub struct Keep {
 pub struct Kept {
     pub iso: Isolate,
     pub parked: Instant,
+    /// Not taken nor kept (above the protected count) from this instant on.
+    pub expires: Instant,
+    /// Kept only while work of its service waits in admission (`min_run_time = 0`).
+    pub handoff: bool,
+}
+
+impl Kept {
+    /// Past its keep-alive at `now`, or a handoff with nothing left waiting.
+    fn done(&self, now: Instant, waiting: bool) -> bool {
+        now >= self.expires || (self.handoff && !waiting)
+    }
 }
 
 struct Entry {
@@ -111,18 +125,11 @@ impl WarmStore {
     }
 
     /// Take the warmest idle isolate for `id`. Isolates kept for another version of the same
-    /// service, and expired ones, are moved to `dispose`; this task's version then becomes the
-    /// one kept for the service. The first `protected` isolates of a service do not expire. A
-    /// service with nothing kept gets no entry here (only `park` creates one), and entries left
-    /// empty are dropped by [`WarmStore::trim`].
-    pub fn take(
-        &mut self,
-        id: &WarmId,
-        now: Instant,
-        ttl: Duration,
-        protected: usize,
-        dispose: &mut Vec<Isolate>,
-    ) -> Option<Kept> {
+    /// service, and expired ones (`now >= expires`), are moved to `dispose`; this task's version
+    /// then becomes the one kept for the service. The first `protected` isolates of a service do
+    /// not expire. A service with nothing kept gets no entry here (only `park` creates one), and
+    /// entries left empty are dropped by [`WarmStore::trim`].
+    pub fn take(&mut self, id: &WarmId, now: Instant, protected: usize, dispose: &mut Vec<Isolate>) -> Option<Kept> {
         let entry = self.services.get_mut(&(id.service.tenant, id.service.service))?;
         if entry.id != *id {
             self.total -= entry.idle.len();
@@ -133,22 +140,25 @@ impl WarmStore {
             let held = entry.idle.len();
             let k = entry.idle.pop_back()?;
             self.total -= 1;
-            if held <= protected || now.duration_since(k.parked) < ttl {
+            if held <= protected || now < k.expires {
                 return Some(k);
             }
             dispose.push(k.iso);
         }
     }
 
-    /// Keep `iso` for `id` (at most `bound` for the service, `total_bound` overall: the oldest
-    /// go first, those above their service's protected count before the protected ones).
-    /// Returns the isolates to dispose: `iso` itself when its version is no longer the service's
-    /// current one or nothing may be kept.
+    /// Keep `iso` for `id` until `expires` (`handoff`: see [`Kept::handoff`]), at most `bound`
+    /// for the service, `total_bound` overall: the oldest go first, those above their service's
+    /// protected count before the protected ones. Returns the isolates to dispose: `iso` itself
+    /// when its version is no longer the service's current one or nothing may be kept.
+    #[allow(clippy::too_many_arguments)]
     pub fn park(
         &mut self,
         id: &WarmId,
         iso: Isolate,
         now: Instant,
+        expires: Instant,
+        handoff: bool,
         bound: usize,
         total_bound: usize,
         protected: impl Fn(&WarmId) -> usize,
@@ -175,7 +185,12 @@ impl WarmStore {
                 out.push(k.iso);
             }
         }
-        entry.idle.push_back(Kept { iso, parked: now });
+        entry.idle.push_back(Kept {
+            iso,
+            parked: now,
+            expires,
+            handoff,
+        });
         self.total += 1;
         while self.total > total_bound {
             let Some(k) = self.pop_oldest(&protected) else { break };
@@ -201,19 +216,38 @@ impl WarmStore {
         Some(k)
     }
 
-    /// Trim every service to its [`Keep::bound`] (oldest first) and drop isolates idle longer than
-    /// `ttl`, except the first [`Keep::protected`] of a service; services left empty are
+    /// Trim every service to its [`Keep::bound`] (oldest first) and drop the isolates whose
+    /// keep-alive ended ([`Kept::expires`] passed, or a handoff while `has_waiting` is false for
+    /// the service), except the newest [`Keep::protected`] of a service; services left empty are
     /// forgotten. Returns what to dispose.
-    pub fn trim(&mut self, now: Instant, ttl: Duration, mut keep_of: impl FnMut(&WarmId) -> Keep) -> Vec<Isolate> {
+    pub fn trim(
+        &mut self,
+        now: Instant,
+        mut keep_of: impl FnMut(&WarmId) -> Keep,
+        has_waiting: impl Fn(&WarmId) -> bool,
+    ) -> Vec<Isolate> {
         let mut out = Vec::new();
         for entry in self.services.values_mut() {
             let keep = keep_of(&entry.id);
-            while entry.idle.len() > keep.bound
-                || (entry.idle.len() > keep.protected
-                    && entry.idle.front().is_some_and(|k| now.duration_since(k.parked) >= ttl))
-            {
+            while entry.idle.len() > keep.bound {
                 if let Some(k) = entry.idle.pop_front() {
                     out.push(k.iso);
+                }
+            }
+            let mut removable = entry.idle.len().saturating_sub(keep.protected);
+            if removable == 0 {
+                continue;
+            }
+            let waiting = entry.idle.iter().any(|k| k.handoff) && has_waiting(&entry.id);
+            let mut i = 0;
+            while i < entry.idle.len() && removable > 0 {
+                if entry.idle[i].done(now, waiting) {
+                    if let Some(k) = entry.idle.remove(i) {
+                        out.push(k.iso);
+                    }
+                    removable -= 1;
+                } else {
+                    i += 1;
                 }
             }
         }
@@ -275,17 +309,12 @@ mod tests {
         let mut store = WarmStore::default();
         let mut dispose = Vec::new();
         for _ in 0..3 {
-            assert!(store
-                .take(&id, Instant::now(), Duration::from_secs(60), 2, &mut dispose)
-                .is_none());
+            assert!(store.take(&id, Instant::now(), 2, &mut dispose).is_none());
         }
         assert_eq!((store.services(), store.len(), dispose.len()), (0, 0, 0));
         assert!(store.is_empty());
         assert!(store
-            .trim(Instant::now(), Duration::from_secs(60), |_| Keep {
-                bound: 4,
-                protected: 0
-            })
+            .trim(Instant::now(), |_| Keep { bound: 4, protected: 0 }, |_| false)
             .is_empty());
         assert!(store.shed_to(|_| 0).is_empty());
     }
