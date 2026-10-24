@@ -1,0 +1,10 @@
+# gitleaks findings reviewed as false positives: test fixtures and sample values shaped like keys
+# (wrong-secret-0123456789, tok-canary-1234567, a hex test constant). One fingerprint per finding:
+# <commit>:<file>:<rule>:<line>. Real secrets are never added here: rotate them and rewrite instead.
+012a72dfc41e9aba16141d9adf61ca96ef4f9fed:crates/rt-triggers/src/sockets/mod.rs:generic-api-key:61
+4739df111a558a6691400bdee7c632bc61201f6d:sample/apps/telegram-bot/smoke.sh:generic-api-key:61
+529f0f4f179be1eb5f059a326535095e920d6685:crates/rt-cache/tests/policy.rs:generic-api-key:106
+61eccbfd1745c52c2629acb52d915a9a93023315:crates/rt-exec-deno/tests/it/edge_warm_ws.rs:generic-api-key:165
+8b8c800684158317dc6cc9f06cc085588cd21d10:crates/rt-exec-deno/tests/it/edge_warm_ws.rs:generic-api-key:159
+ce29eab205780215240242050436e8abcfd3b552:sample/apps/telegram-bot/smoke.sh:generic-api-key:61
+ff1389eb71232727911e68aa7f9d04228a30fc0b:crates/rt-cache/tests/policy.rs:generic-api-key:126

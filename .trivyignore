@@ -1,10 +1,11 @@
 # Findings Trivy may skip. Every CI and release scan blocks on HIGH/CRITICAL with a fix available; an entry here is a
 # reviewed exception, never a way to make a red build green.
 #
-# Format (one per line):   <ID>   exp:<YYYY-MM-DD>   # <why it does not apply> (<reviewer>, <date>)
+# Format: a comment line with why it does not apply (<reviewer>, <date>), then   <ID> exp:<YYYY-MM-DD>
 # The expiry makes Trivy report the finding again after that date, so every exception is re-reviewed.
 #
 # Rust advisories (RUSTSEC-*) are reviewed in deny.toml [advisories].ignore; mirror an entry here only when Trivy
 # reports the same advisory from a cargo-auditable binary, with the same reason.
 #
-# No exceptions yet.
+# hickory-resolver 0.25 only through deno_fetch (pinned by Deno); guest fetch goes through rt-host's egress guard on hickory 0.26.2, so Deno's resolver is not called. Same reasoning as deny.toml RUSTSEC-2026-0118/0119. (Alex Sayfi, 2026-10-24)
+GHSA-5j98-2g5x-46v6 exp:2027-01-31

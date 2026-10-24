@@ -128,7 +128,8 @@ async fn wload_004_a_component_with_two_memories_is_refused_at_precompile() {
 async fn wit_004_a_put_over_the_blob_cap_is_refused_and_the_next_task_runs() {
     let mut rig = Rig::new();
     let edge = prepared("edge");
-    let reply = rig.run(&edge, Req::get("/blobput?mb=101")).await.reply();
+    // Filling 101 MiB in the guest takes seconds of CPU on a slow runner; the limit under test is the blob cap.
+    let reply = rig.run(&edge, Req::get("/blobput?mb=101").cpu_ms(30_000)).await.reply();
     assert_eq!(reply.status, 500);
     assert_eq!(reply.text(), "blob_error:storage_quota");
 

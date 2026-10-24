@@ -22,6 +22,9 @@ ignore = [
   { id = "RUSTSEC-2026-0349", reason = "pinned by deno_tls; downgrade is to classical key exchange, still authenticated" },
   # rsa through deno_crypto (WebCrypto in the guest's own isolate): no network-observable timing.
   { id = "RUSTSEC-2023-0071", reason = "deno_crypto; no fixed rsa release exists" },
+  # crypto-bigint 0.5 through deno_crypto -> elliptic-curve 0.13 (WebCrypto ECDSA/ECDH on the guest's own keys
+  # in its own isolate); the fix is 0.7.6 only (our 0.7 is on it). Revisit when Deno moves to elliptic-curve 0.14.
+  { id = "RUSTSEC-2026-0387", reason = "0.5 is pinned by deno_crypto; no 0.5 fix; guest keys only" },
   # rand 0.8 pinned by deno_crypto; the unsoundness needs `rand::rng()` (0.9+) with a custom logger.
   { id = "RUSTSEC-2026-0097", reason = "pinned by deno_crypto; trigger not reachable on 0.8" },
   # zip: only `ZipArchive::extract` / `ZipStreamReader::extract` are affected; rt-build reads entries
