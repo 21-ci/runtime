@@ -6,6 +6,8 @@ members = [
   "crates/rt-obs",
   "crates/rt-mem",
   "crates/rt-sec",
+  "crates/rt-sched",
+  "crates/rt-testkit",
 ]
 
 [workspace.package]
