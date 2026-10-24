@@ -1,0 +1,49 @@
+# 21 Cloud Functions Runtime
+
+> Self-hosted, multi-tenant functions runtime in Rust (Apache-2.0). Tenants deploy TypeScript/JavaScript (run in Deno isolates, a fresh isolate per task) or WASM components (WASI P2 `wasi:http`, run in wasmtime) through a REST control API or the `21ci` CLI. Every service gets an HTTP route (`/s/{slug}`), interval/cron and one-off schedules, a durable queue with DLQ, KV/SQL/blob storage, env and sealed secrets, service-to-service calls and typed RPC, WebSockets held by the node, and durable objects. Guest APIs are the `std:*` modules (Deno) and the `std:host` WIT package (WASM).
+
+Docs site: https://21-ci.github.io/runtime/ . Source: https://github.com/21-ci/runtime .
+
+## Docs
+
+- [README](https://github.com/21-ci/runtime/blob/main/README.md): features, listeners, quickstart (docker compose), CLI, configuration, development, layout
+- [Guest code reference](https://github.com/21-ci/runtime/blob/main/docs/handlers.md): handler forms, `ctx`, triggers, request rules, `std:*` modules, WebSockets, durable objects, WASM contract, limits, invoke outcomes
+- [Control API](https://github.com/21-ci/runtime/blob/main/docs/api.md): auth and scopes, routes, service config blocks, error codes, invoke API, plans
+- [CLI (21ci)](https://github.com/21-ci/runtime/blob/main/docs/cli.md): contexts, every command, scopes, CI usage, exit codes
+- [Configuration](https://github.com/21-ci/runtime/blob/main/docs/config.md): `rt.toml`, profiles, sections, live vs restart-required keys
+- [Deployment and operations](https://github.com/21-ci/runtime/blob/main/docs/deploy.md): ports, environment, reverse proxy and TLS, health, backup, upgrade, master-key rotation
+- [MCP server](https://github.com/21-ci/runtime/blob/main/docs/mcp.md): `POST /mcp` tools for AI assistants, connecting Claude Code, Claude Desktop, Cursor
+- [Security](https://github.com/21-ci/runtime/blob/main/SECURITY.md): threat model, Deno and WASM sandboxes, egress guard, storage isolation, WebSocket caps, secrets, hardening checklist
+
+## API and interfaces
+
+- [OpenAPI 3.1](https://github.com/21-ci/runtime/blob/main/openapi/openapi.json): the control API, generated from the code
+- [std:host WIT](https://github.com/21-ci/runtime/blob/main/wit/rt-host.wit): host interfaces and worlds for WASM components
+- [Deno std:* modules](https://github.com/21-ci/runtime/tree/main/js): `rt_*.js` (imported as `std:*`) and `bootstrap.js`
+
+## Skills for coding agents
+
+- [Skills index](https://github.com/21-ci/runtime/blob/main/skills/README.md): what the skills are and how to install them
+- [21cloud-deno-service](https://github.com/21-ci/runtime/blob/main/skills/21cloud-deno-service/SKILL.md): writing TypeScript/JavaScript services
+- [21cloud-wasm-service](https://github.com/21-ci/runtime/blob/main/skills/21cloud-wasm-service/SKILL.md): writing WASM component services in Rust or JS
+- [21ci-deploy](https://github.com/21-ci/runtime/blob/main/skills/21ci-deploy/SKILL.md): deploying and operating services with `21ci`
+- [AGENTS.md](https://github.com/21-ci/runtime/blob/main/AGENTS.md): working on the runtime's own code
+
+## Samples
+
+- [Samples index](https://github.com/21-ci/runtime/blob/main/sample/README.md): every example, scripts, upload formats
+- [Deno hello](https://github.com/21-ci/runtime/tree/main/sample/deno/hello): Form A handler and `ctx`
+- [Deno scheduled-queue](https://github.com/21-ci/runtime/tree/main/sample/deno/scheduled-queue): Form B with `fetch`, `scheduled`, `queue`
+- [Deno npm-zod](https://github.com/21-ci/runtime/tree/main/sample/deno/npm-zod): `npm:` dependency and `rt.json` import map
+- [Rust WASM hello](https://github.com/21-ci/runtime/tree/main/sample/wasm/rust-hello): minimal `wasm32-wasip2` component
+- [JS WASM component](https://github.com/21-ci/runtime/tree/main/sample/wasm/js-componentize): `jco componentize`
+- [chat-room app](https://github.com/21-ci/runtime/tree/main/sample/apps/chat-room): durable objects and WebSockets
+- [edge-gateway app](https://github.com/21-ci/runtime/tree/main/sample/apps/edge-gateway): Rust component using `std:host` in front of Deno services
+- [events app](https://github.com/21-ci/runtime/tree/main/sample/apps/events): SQL transactions, idempotency, RPC
+- [Deploy scripts](https://github.com/21-ci/runtime/tree/main/sample/scripts): `deploy.sh`, `invoke.sh`, `svc-id.sh`
+
+## Optional
+
+- [Operator SDK sample](https://github.com/21-ci/runtime/tree/main/sample/operator-sdk): an SDK published with `21ci sdk publish`
+- [telegram-bot app](https://github.com/21-ci/runtime/tree/main/sample/apps/telegram-bot), [live-queue app](https://github.com/21-ci/runtime/tree/main/sample/apps/live-queue), [cbu-rates app](https://github.com/21-ci/runtime/tree/main/sample/apps/cbu-rates)
+- [Config defconfigs](https://github.com/21-ci/runtime/tree/main/config/defconfigs) and [schema](https://github.com/21-ci/runtime/blob/main/config/schema.json)
