@@ -1370,6 +1370,8 @@ async fn services_create(
                     deno,
                     durable,
                     ws,
+                    events: Default::default(),
+                    async_invoke: Default::default(),
                 },
             },
             warm_floor_cap(&plan),
@@ -1497,6 +1499,8 @@ async fn services_patch(
         triggers: block("triggers", b.triggers)?,
         ingress: block("ingress", b.ingress)?,
         egress: block("egress", b.egress)?,
+        events: Default::default(),
+        async_invoke: Default::default(),
     };
     check_ingress_egress(patch.ingress.as_ref(), patch.egress.as_ref())?;
     // `min_instances` / `max_instances` come from the scaling block (and the profile's ceiling):

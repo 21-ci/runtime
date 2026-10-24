@@ -55,6 +55,7 @@ pub fn pro_plan() -> Plan {
             wall_ms: 120_000,
             cpu_ms: 10_000,
             memory_mb: 512,
+            min_run_time_ms: 600_000,
         },
         builds_per_hour: 100_000,
         custom_host_suffixes: vec![".bots.example.com".to_string()],
@@ -64,6 +65,11 @@ pub fn pro_plan() -> Plan {
         max_sockets: 10_000,
         max_sockets_per_object: 10_000,
         ws_max_message_bytes: 1024 * 1024,
+        max_async_pending: 100_000,
+        max_topics: 1_000,
+        max_topic_partitions: 16,
+        max_stream_mb: 10_240,
+        max_stream_retention_hours: 720,
     }
 }
 
