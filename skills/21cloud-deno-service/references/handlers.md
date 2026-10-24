@@ -78,7 +78,7 @@ schedules are created in code with `std:schedule`.
 
 | Topic | Rule |
 |---|---|
-| Lifetime | Fresh isolate per task by default. With `deno.reuse_isolates` (on in the `min_latency` profile) a cleanly finished isolate may serve later requests of the same version: globals persist as a cache only (replaced after an error, env/secret change, 1,000 requests, idle, memory pressure) |
+| Lifetime | Fresh isolate per task by default. With `deno.reuse_isolates` (on in the `min_latency` profile) a cleanly finished isolate may serve later requests of the same version: globals persist as a cache only (replaced after an error, env/secret change, 1,000 requests, idle, memory pressure). The idle limit is `scaling.min_run_time_ms` when the service sets it: `0` drops the isolate after the answer unless requests are queued for it, so module-level caches may be cold more often |
 | Web APIs | `fetch`, `Request`, `Response`, `Headers`, `FormData`, `URL`, `URLPattern`, `URLSearchParams`, streams, `TextEncoder/Decoder`, `Blob`, `File`, `FileReader`, `atob/btoa`, timers, `AbortController`, events, `structuredClone`, `CompressionStream`, `MessageChannel`, `crypto` (WebCrypto), `console`, `performance` |
 | WebAssembly | Available; every wasm memory counts against `memory_mb`; shared memories are refused |
 | Removed | `Worker`, `SharedWorker`, `SharedArrayBuffer`, `Atomics.wait/waitAsync/notify`, `ShadowRealm`, `caches`; `Deno` is only `Deno.env` |

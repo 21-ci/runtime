@@ -155,7 +155,7 @@ persists between those tasks, and the next task skips isolate creation and modul
 | Per service | `{"deno": {"reuse_isolates": true}}` or `21ci service update <svc> --reuse-isolates true` | `{"wasm": {"reuse_instances": true}}` or `21ci service update <svc> --reuse-instances true` |
 | Node default | `[deno] reuse_isolates` | `[wasm] reuse_instances` |
 | Kept per service | The autoscaler's warm target, else `deno.reuse_max_idle` (4) per scheduler thread; at most `deno.reuse_max_idle_total` (16) per thread across services | `wasm.reuse_max_idle` (8) per processor |
-| Expires | Idle for `deno.reuse_idle_ttl` (60 s); after `deno.reuse_max_uses` (1,000) tasks | Idle for the service's `cache.idle_ttl` without a warm target; after 1,000 tasks |
+| Expires | Idle for `deno.reuse_idle_ttl` (60 s), or for the service's `scaling.min_run_time_ms` when it is set (`0`: at once, unless tasks of the service wait for a slot, then at most the queue timeout); after `deno.reuse_max_uses` (1,000) tasks | Idle for the service's `cache.idle_ttl`, or for `scaling.min_run_time_ms` when it is set, without a warm target; after 1,000 tasks |
 
 A sandbox is **kept** only if all of this holds:
 

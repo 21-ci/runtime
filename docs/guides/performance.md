@@ -158,7 +158,10 @@ semantics:
 - **Only clean finishes are kept.** An isolate is reused only if the handler, the response body and every
   `waitUntil` succeeded, no timer or pending operation is left, the task was not killed, and its memory stayed
   within ¾ of `memory_mb` and did not grow more than max(16 MiB, 50 %) beyond what it held after its first request.
-  It is replaced after `deno.reuse_max_uses` (1,000) requests and disposed after `deno.reuse_idle_ttl` (60 s) idle.
+  It is replaced after `deno.reuse_max_uses` (1,000) requests and disposed after `deno.reuse_idle_ttl` (60 s) idle,
+  or after the service's `scaling.min_run_time_ms` when it is set. A value of `0` releases an idle isolate at once
+  unless tasks of the service are waiting for a slot, which saves memory at the cost of a cold start for the next
+  request. See [Instance lifetime and min_run_time](../handlers.md#instance-lifetime-and-min_run_time).
 - **Env and secrets are read per request.** If your code read the environment and it changed since (a rotated
   secret), the isolate is discarded.
 - **WASM**: linear memory (statics, allocator state, caches) persists the same way. An instance is dropped after a

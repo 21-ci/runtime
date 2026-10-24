@@ -121,8 +121,45 @@ kept 24 h when they succeeded and 7 d when they failed; a service keeps at most 
 
 ## Instance lifetime and min_run_time
 
-The `min_run_time` service setting, and how long an instance stays alive after it answers, is documented here in the
-next update.
+An instance (a Deno isolate or a WASM instance) can be reused by the next task of the same service version on the same
+Machine. Reuse is on only where the executor setting allows it (`deno.reuse_isolates`, `wasm.reuse_instances`, see
+[Execution](concepts/execution.md)). `scaling.min_run_time_ms` controls how long a reused instance may stay idle after
+it answered:
+
+| Value | After the answer |
+|---|---|
+| unset (inherit) | Today's behaviour: `deno.reuse_idle_ttl` (60 s) for Deno, the service's `cache.idle_ttl` for WASM |
+| `n > 0` | Kept for at most `n` ms, then released. It can be released earlier under memory pressure, after `reuse_max_uses`, or after a version change |
+| `0` | Released at once, unless tasks of this service are waiting for a run slot. Then it is kept for them, at most `queue_timeout` |
+
+- **When the clock starts.** The answer is done when the handler has finished and the response body has ended, after
+  every `ctx.waitUntil` promise has settled. Streaming time and `waitUntil` time are not keep-alive time: the instance
+  is busy until then, bounded by `limits.wall_ms`. The client's TCP acknowledgement is not waited for.
+- **What survives.** Module state and globals. They are a cache, not storage: a later task can run on a different
+  instance, and the runtime can drop any idle instance at any time. Keep data in `std:kv`, `std:sql` or `std:blob`.
+  Only instances that finished cleanly are kept, whatever the setting. A killed, failed or tainted instance is never
+  kept.
+- **Warm floor.** The instances that `scaling.min_instances` asks for are always kept, even at `0`. `min_run_time`
+  only governs the instances above that.
+- **Waiting work.** At `0`, an instance that is kept for waiting tasks is handed to the first task of its service that
+  is granted a slot. A handoff happens for buffered answers. For streamed answers it is best effort: the slot is freed
+  when the head is sent, before the tail ends.
+- **Reuse off.** With reuse off every task gets a fresh instance and `min_run_time_ms` has no effect. The setting is
+  accepted anyway, because reuse may come from a profile.
+- **WebSockets and durable objects.** Socket event tasks and durable requests always use reuse when `ws.warm` is on
+  (the default). With `0`, a warm object's instance, and the state its constructor set up, goes cold between events
+  unless more events are waiting.
+- **Limits.** The value is an integer in milliseconds, `>= 0`. The node caps it at `sched.min_run_time_max_ms` (600000)
+  and the plan at `limits_max.min_run_time_ms` (60000 by default). A larger value is refused with `422
+  limit_exceeds_plan`.
+
+```bash
+21ci service update hello --min-run-time 0       # release at once unless work waits
+21ci service update hello --min-run-time 5000     # keep an idle instance for up to 5 s
+21ci service update hello --unset scaling.min_run_time_ms
+```
+
+The service's `effective.min_run_time_ms` shows the value in force and its source (`service`, `plan` or `default`).
 
 ## SDK modules (Deno)
 
