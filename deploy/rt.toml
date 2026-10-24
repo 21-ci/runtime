@@ -1,0 +1,54 @@
+# rt.toml: production defaults for one node (systemd package, Homebrew service and container images).
+#
+# Everything not set here keeps the built-in default, which is the `balanced` profile (config/defconfigs/balanced.toml
+# lists every key). Unknown keys fail startup with the key path. Check what the node resolves with:
+#
+#   rt --print-config --config /etc/rt/rt.toml
+#
+# Precedence: built-in defaults < this file < RT__SECTION__KEY=value environment. The container images override the
+# listener binds and data_dir through RT__ variables (see the Dockerfile); packages use this file as it is.
+#
+# Secrets never go here: set RT_ROOT_TOKEN and RT_MASTER_KEY (or the *_FILE variants) in the environment
+# (/etc/default/rt or /etc/sysconfig/rt for the systemd unit, docker/k8s secrets for containers).
+
+[node]
+data_dir = "/var/lib/rt"
+default_profile = "balanced"        # max_density | balanced | min_latency
+
+[listeners]
+# Terminate TLS in a reverse proxy in front of `public` (deploy/compose has a Caddy example).
+public = "127.0.0.1:8080"
+internal = "unix:/var/lib/rt/rt.sock"
+# The control API and metrics have no network ACL of their own: keep them on loopback or a private network.
+control = "127.0.0.1:8081"
+metrics = "127.0.0.1:9090"
+
+[routing]
+base_domain = ""                    # e.g. "fn.example.com" for {slug}.fn.example.com (needs a wildcard cert)
+
+[ingress]
+# The reverse proxy on this host. Only peers in these CIDRs may set X-Forwarded-For.
+trusted_proxies = ["127.0.0.1/32", "::1/128"]
+
+[security]
+seccomp = true
+# Release builds ship the prebuilt V8 without its sandbox; `true` refuses to start until a sandboxed V8 ships
+# (SECURITY.md, "Known limitations").
+require_v8_sandbox = false
+reserved_hosts = []                 # hosts tenants can never claim, e.g. your control-plane domain
+
+[egress]
+denied_ports = [25, 465, 587]       # no SMTP from guests; add your internal ranges to denied_cidrs
+denied_cidrs = []
+
+[logs]
+retention_days = 7
+max_mb_per_service = 50
+
+[deploy]
+retain_versions = 10
+auto_rollback = true
+
+# Tenant plans: the `free` plan always exists. Add your own, e.g.:
+# [plans.pro]
+# ...                               (keys: config/schema.json, docs "Configuration" page)

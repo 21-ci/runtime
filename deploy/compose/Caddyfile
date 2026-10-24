@@ -1,0 +1,32 @@
+# Public invoke listener behind Caddy. Certificates come from Let's Encrypt / ZeroSSL automatically.
+#
+# For {slug}.{$RT_DOMAIN} routing add `*.{$RT_DOMAIN}` to the site address, set RT_BASE_DOMAIN to the same domain,
+# and configure a DNS challenge (wildcard certificates need one): https://caddyserver.com/docs/automatic-https
+
+# Caddy trusts no incoming X-Forwarded-For (no `trusted_proxies`), so the header rt receives carries the real
+# client address; rt trusts it only from Caddy (RT__INGRESS__TRUSTED_PROXIES in docker-compose.yml).
+{
+	email {$ACME_EMAIL}
+}
+
+{$RT_DOMAIN} {
+	encode zstd gzip
+
+	# Only the invoke surface is public; the control API stays on the host's loopback (port 8081).
+	reverse_proxy rt:8080 {
+		flush_interval -1          # streamed responses and SSE
+		transport http {
+			read_timeout 5m
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

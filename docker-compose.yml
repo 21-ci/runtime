@@ -1,0 +1,52 @@
+# One runtime node.
+#
+#   cp .env.example .env     # then replace both secrets: openssl rand -hex 32
+#   docker compose up -d --build
+#   docker compose logs -f rt
+#   docker compose down            # keeps the rt-data volume; add -v to delete the data
+#
+# Ports are published on loopback only. The control API (8081) and metrics (9090) have no network
+# ACL of their own: put a reverse proxy / VPN in front before exposing the public invoke port (8080).
+name: rt
+
+services:
+  rt:
+    image: ${RT_IMAGE:-rt:dev}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${RT_PUBLIC_PORT:-8080}:8080"    # public invoke:  /s/{slug}/...
+      - "127.0.0.1:${RT_CONTROL_PORT:-8081}:8081"   # control API:    /v1/..., /docs
+      - "127.0.0.1:${RT_METRICS_PORT:-9090}:9090"   # /metrics /healthz /readyz
+    environment:
+      # Secrets come from .env (compose reads it automatically) or from the shell environment.
+      RT_ROOT_TOKEN: "${RT_ROOT_TOKEN:?set RT_ROOT_TOKEN in .env (generate with: openssl rand -hex 32)}"
+      RT_MASTER_KEY: "${RT_MASTER_KEY:?set RT_MASTER_KEY in .env (64 hex chars: openssl rand -hex 32)}"
+      RT_LOG: ${RT_LOG:-info}
+      # Any config key can be overridden here: RT__SECTION__KEY=value (docs/config.md). Examples:
+      # RT__NODE__DEFAULT_PROFILE: min_latency
+      # RT__SCHED__PROCESSORS: "4"
+    volumes:
+      - rt-data:/data
+      # Optional node config. Uncomment to use your own file (make defconfig PROFILE=balanced > rt.toml).
+      # Without it the image runs on the built-in defaults (profile `balanced`). The listener binds,
+      # data_dir and require_v8_sandbox set by the image env override the file; see the Dockerfile.
+      # - ./rt.toml:/etc/rt/rt.toml:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    stop_grace_period: 30s
+    # Reference box of the density target: 4 vCPUs, 2 GiB.
+    # cpus: 4
+    # mem_limit: 2g
+
+volumes:
+  rt-data:
