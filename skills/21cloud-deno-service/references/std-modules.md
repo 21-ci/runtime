@@ -10,6 +10,8 @@ import { sql } from "std:sql";
 import { Database } from "std:sqlite";           // or "bun:sqlite"; default export is Database too
 import { blob } from "std:blob";
 import { enqueue } from "std:queue";
+import { publish, request } from "std:pubsub";  // subjects: fan-out now, or one reply
+import { append, appendBatch, read, info } from "std:stream";  // topics: durable, partitioned, replayable
 import { services, call, ServiceError } from "std:services";
 import { schedule } from "std:schedule";
 import { lock } from "std:lock";
@@ -105,6 +107,48 @@ Stream uploads straight through: `await blob.put(key, req.body!, { contentType }
 tenant (it may be the caller itself: `ctx.service.slug`). `body`: JSON or `Uint8Array`, at most 1 MB. Delay at most
 7 days. The same `dedupId` within 24 h is delivered once. The target's `call.allowed_callers` applies (default: same
 project and environment). Codes: `not_found`, `forbidden`, `queue_full`.
+
+## `std:pubsub`
+
+`publish(subject, body, { headers? }) -> { receivers, dropped }`: resolves after routing, not after delivery. Nothing is
+stored: a subscriber that is down misses the message. `receivers` = handed to the scheduler, `dropped` = copies left out
+(fan-out cap of 100, quota, a subscriber with 64 deliveries in flight, refusals).
+
+`request(subject, body, { headers?, timeoutMs = 5000 }) -> reply`: one responder (round robin), first answer wins. The reply
+is parsed JSON for `application/json`, a string for `text/*`, bytes otherwise, `undefined` when empty. `timeoutMs` at most
+30000 and never past `ctx.deadline`.
+
+Subjects: `.`-separated tokens of `[A-Za-z0-9_-]`, at most 256 bytes and 16 tokens, not `_rt…`, no wildcards in a publish.
+Bodies: at most 1 MiB (a `Uint8Array` as is, anything else as JSON). Headers: at most 32, 16 KiB, no `x-rt-*`.
+
+Subscribers declare `events.subscribe` on the service (`[{"subject": "orders.*.created", "group": "billing"}, {"subject": "pricing.quote"}]`;
+`*` one token, `>` the rest; `group` = queue group, one member gets each message) and export `pubsub(msg, ctx)`.
+
+Codes: `validation_failed`, `too_large`, `unavailable`, `rate_limited`, `quota_exceeded`, `call_depth`, `no_responders`,
+`timeout`, `responder_failed`, `overloaded`, `queue_timeout`, `shed`, `memory`, `draining`.
+
+## `std:stream`
+
+`append(topic, body, { key?, headers?, dedupId? }) -> { partition, offset, duplicate }`: durable when it resolves. The same
+`key` (at most 256 bytes) goes to the same partition, in order. The same `dedupId` (at most 128 bytes) on the topic within
+2 minutes returns the first record's position with `duplicate: true`.
+
+`appendBatch(topic, [{ body, key?, headers?, dedupId? }]) -> [{ partition, offset, duplicate }]`: 1 to 100 records, at most
+4 MiB, one transaction (all or nothing).
+
+`read(topic, { partition?, from?, fromTime?, limit = 100 }) -> { records, next, end }`: replay without a consumer group.
+`from` is `"earliest"`, `"latest"` or an offset; `fromTime` epoch ms; give one of them. `limit` 1 to 100. `partition` is
+**required** on a topic with more than one partition (`validation_failed`).
+
+`info(topic) -> { name, partitions: [{ partition, first, next }], retentionHours, maxMb, bytes }`.
+
+Record: `{ partition, offset, key, body, headers, timestamp }`. Consumers declare `events.consume`
+(`[{"topic": "orders", "group": "billing", "start": "earliest", "batch_size": 100, "max_attempts": 10, "on_exhausted": "dlq"}]`)
+and export `stream(batch, ctx)`; see [handlers.md](handlers.md#dispatch) for the batch and `failAt`.
+
+Codes: `validation_failed`, `too_large`, `not_found`, `stream_full`, `rate_limited`, `quota_exceeded`, `unavailable`.
+
+Async HTTP invocations need no module: the service sets `async.enabled` and callers send `Prefer: respond-async`.
 
 ## `std:services`
 

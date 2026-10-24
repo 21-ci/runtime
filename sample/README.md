@@ -40,6 +40,7 @@ it reads the same `RT_API` / `RT_INVOKE` / `RT_KEY`):
 | blob-upload | deno, Form A | `std:blob`, streamed upload and download | `deno/blob-upload/` |
 | npm-zod | deno, Form A | `npm:` dependency, `rt.json` import map | `deno/npm-zod/` |
 | scheduled-queue | deno, Form B | `fetch` + `scheduled` + `queue`, `std:queue`, schedules, DLQ | `deno/scheduled-queue/` |
+| streams | deno, Form B | `std:stream` topics (append, `dedupId`, consumer with `failAt`), `std:pubsub` publish, subscribe and request/reply, async invoke | `deno/streams/` (two services) |
 | service-call | deno, Form A | `std:services` `call`, `ctx.waitUntil`, call depth | `deno/service-call/` |
 | env-secrets | deno, Form A | env + secrets via `Deno.env`, header hygiene | `deno/env-secrets/` |
 | platform-sdk | deno, Form A | the operator SDK through `std:sdk` / `sdk:acme`: no SDK code in the service (needs the operator setup) | `deno/platform-sdk/` |

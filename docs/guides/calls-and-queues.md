@@ -564,6 +564,13 @@ Redriven messages start again at attempt 1. Redrive and purge need `queue:write`
 Node-wide settings (`queue.batch_size`, `queue.max_attempts`, `queue.max_concurrency`) are in
 [`[queue]`](../config.md#other-sections).
 
+## Other ways to hand off work
+
+A queue hands each message to one worker and keeps it until the worker acks. Three other mechanisms cover the rest:
+pub/sub subjects (`std:pubsub`) for fan-out now and request/reply, topics (`std:stream`) for ordered, replayable
+records read by consumer groups, and async invocations for HTTP calls that should be accepted and run later. Which one
+fits, with their limits and commands, is in [Events, topics and async invocations](events-and-streams.md).
+
 ## Next steps
 
 - [Schedules](schedules.md): run a handler on an interval or a cron expression, and feed a queue from it.
