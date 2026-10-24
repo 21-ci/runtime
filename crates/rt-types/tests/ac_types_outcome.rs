@@ -150,6 +150,11 @@ fn every_documented_reason_except_ingress_only_ones_is_produced_by_some_outcome(
         ("method_not_allowed", 405),
         ("too_large", 413),
         ("route_stale", 503),
+        // async invocation: refused at accept, before any task exists
+        ("async_not_allowed", 403),
+        ("async_backlog_full", 429),
+        ("idempotency_mismatch", 409),
+        ("bad_request", 400),
     ];
     let produced: Vec<&str> = all_non_ok_outcomes().iter().filter_map(Outcome::reason).collect();
     for reason in doc.keys() {
