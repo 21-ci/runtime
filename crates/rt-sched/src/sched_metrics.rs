@@ -4,9 +4,10 @@
 //! `metrics.per_service_top_n`; everything else is node-level with fixed labels.
 
 use prometheus::{
-    GaugeVec, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rt_obs::Metrics;
@@ -36,6 +37,10 @@ pub(crate) struct SchedMetrics {
     admission_queued: IntGauge,
     admission_queued_bytes: IntGauge,
     pub admission_queue_wait_seconds: Histogram,
+    admission_wait_by_size_seconds: HistogramVec, // size
+    admission_aged_grants_total: IntCounter,
+    /// `Admission::aged_grants` at the last tick (the counter adds the delta).
+    aged_seen: AtomicU64,
     autoscale_adjustments_total: IntCounterVec, // direction, cause
     warm_target_instances: IntGaugeVec,         // kind
     pub spinner_mismatch_total: IntCounter,
@@ -80,6 +85,23 @@ impl SchedMetrics {
             )
             .ok()
             .map(|c| register(r, c))?,
+            admission_wait_by_size_seconds: HistogramVec::new(
+                HistogramOpts::new(
+                    "rt_admission_wait_by_size_seconds",
+                    "Admission wait of tasks that queued, by predicted run time (short <50 ms, medium <1 s, long)",
+                )
+                .buckets(WAIT_BUCKETS.to_vec()),
+                &["size"],
+            )
+            .ok()
+            .map(|c| register(r, c))?,
+            admission_aged_grants_total: IntCounter::new(
+                "rt_admission_aged_grants_total",
+                "Waiting tasks granted at or after their deadline key (aging in effect)",
+            )
+            .ok()
+            .map(|c| register(r, c))?,
+            aged_seen: AtomicU64::new(0),
             autoscale_adjustments_total: IntCounterVec::new(
                 Opts::new("rt_autoscale_adjustments_total", "Adaptive concurrency limit changes"),
                 &["direction", "cause"],
@@ -147,6 +169,20 @@ impl SchedMetrics {
             .map(|c| register(r, c))?,
             labels: Mutex::new(LabelCache::default()),
         })
+    }
+
+    /// Observe the admission wait of a granted task in its size bucket (`pred_ns`: the
+    /// predicted run time charged at the grant).
+    pub fn observe_wait_by_size(&self, pred_ns: u64, waited_secs: f64) {
+        self.admission_wait_by_size_seconds
+            .with_label_values(&[size_label(pred_ns)])
+            .observe(waited_secs);
+    }
+
+    /// Add the aged grants since the last call (`total`: `Admission::aged_grants`).
+    pub fn observe_aged_grants(&self, total: u64) {
+        let prev = self.aged_seen.swap(total, Ordering::AcqRel);
+        self.admission_aged_grants_total.inc_by(total.saturating_sub(prev));
     }
 
     /// Publish one autoscaler tick. Per-service series exist only with `metrics.per_service`
@@ -240,6 +276,15 @@ impl SchedMetrics {
     }
 }
 
+/// Size bucket of a predicted run time: `short` under 50 ms, `medium` under 1 s, else `long`.
+pub(crate) fn size_label(pred_ns: u64) -> &'static str {
+    match pred_ns {
+        n if n < 50_000_000 => "short",
+        n if n < 1_000_000_000 => "medium",
+        _ => "long",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +373,24 @@ mod tests {
             0,
             "a quiet service's series are removed"
         );
+    }
+
+    #[test]
+    fn size_label_buckets() {
+        assert_eq!(size_label(0), "short");
+        assert_eq!(size_label(49_999_999), "short");
+        assert_eq!(size_label(50_000_000), "medium");
+        assert_eq!(size_label(999_999_999), "medium");
+        assert_eq!(size_label(1_000_000_000), "long");
+    }
+
+    /// The aged-grants counter adds deltas of the admission counter.
+    #[test]
+    fn aged_grants_counter_adds_deltas() {
+        let m = Metrics::new(MetricsOptions::default()).expect("metrics");
+        let sm = SchedMetrics::new(&m).expect("collectors");
+        sm.observe_aged_grants(3);
+        sm.observe_aged_grants(5);
+        assert_eq!(sm.admission_aged_grants_total.get(), 5);
     }
 }

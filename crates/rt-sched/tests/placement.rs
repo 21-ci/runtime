@@ -477,3 +477,52 @@ fn ac_sch_23_schedules_at_least_one_million_noop_tasks_per_second() {
     real.shutdown();
     assert!(rate >= 1_000_000.0, "scheduled and completed only {rate:.0} tasks/s");
 }
+
+// ---------------------------------------------------------------------------------------------
+// AC-SCH-44: locality of handoffs (min_run_time keep-alive)
+// ---------------------------------------------------------------------------------------------
+
+/// A service limited to one instance: its second task waits for the first one's slot.
+fn one_instance(reuse: bool) -> TaskSpec {
+    let mut spec = d(1).max_concurrency(1, 10).queue_timeout_ms(30_000).finish();
+    spec.knobs.reuse_isolates = reuse;
+    spec
+}
+
+/// Where the second task (granted the slot the first one freed on P0) was placed.
+fn handoff_place(seed: u64, reuse: bool) -> (ProcId, Option<ProcId>) {
+    let mut sim = SimRuntime::new(fixed(2, 1).seed(seed).keep_trace(true));
+    sim.scripts()
+        .set_for_service(rt_testkit::ids::service(1), script![io(5)]);
+    let p0 = sim.procs_of(TaskKind::DENO)[0];
+    let mut first = admitted(sim.submit_existing_to_proc(p0, one_instance(reuse)));
+    let mut second = admitted(sim.submit_existing(one_instance(reuse)));
+    sim.run_until_idle();
+    assert_ok(sim.outcome(&mut first));
+    assert_ok(sim.outcome(&mut second));
+    let placed = sim.trace().into_iter().find_map(|e| match e {
+        TraceEvent::Place { task, proc, grq, .. } if task == second.id && !grq => Some(proc),
+        _ => None,
+    });
+    (p0, placed.flatten())
+}
+
+/// AC-SCH-44: a task of a service that reuses instances, granted the slot its predecessor freed,
+/// is placed on the P that freed it (where the kept instance waits).
+#[test]
+fn ac_sch_44_a_granted_task_of_a_reusing_service_runs_on_the_p_that_freed_its_slot() {
+    for seed in 0..8 {
+        let (p0, placed) = handoff_place(seed, true);
+        assert_eq!(placed, Some(p0), "seed {seed}");
+    }
+}
+
+/// AC-SCH-44: without reuse the granted task is placed as any external submit (two choices).
+#[test]
+fn ac_sch_44_without_reuse_placement_is_unchanged() {
+    let elsewhere = (0..16).filter(|&seed| {
+        let (p0, placed) = handoff_place(seed, false);
+        placed.is_some_and(|p| p != p0)
+    });
+    assert!(elsewhere.count() > 0, "some seeds place the waiter on the other P");
+}

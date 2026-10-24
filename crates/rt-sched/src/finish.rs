@@ -68,16 +68,29 @@ impl SchedInner {
         // A waiting (queued) ticket was taken by `cancel_service_queued`: only running ones here.
         let granted = match &ticket {
             Some(tk) if !tk.queued => {
+                let granted_at = self.start + Duration::from_nanos(tk.granted_ns);
                 // Grant → finish, artifact waits excluded: what the autoscaler compares to its baseline.
                 let ran = matches!(outcome, Outcome::Ok(_) | Outcome::GuestError) && tk.class != SlotClass::Build;
                 let latency = ran.then(|| {
-                    let granted = self.start + Duration::from_nanos(tk.granted_ns);
-                    now.saturating_duration_since(granted.max(task.enqueued_at))
+                    now.saturating_duration_since(granted_at.max(task.enqueued_at))
                         .saturating_sub(timings.wait_runtime)
                 });
-                self.admission.release(tk, self.rel_ns(now), latency)
+                // Estimator sample: a kill (not shutdown) is a censored sample of the slot hold time,
+                // about the wall limit for a wall kill.
+                let sample = match &outcome {
+                    Outcome::Killed(r) if *r != KillReason::Shutdown && tk.class != SlotClass::Build => {
+                        Some(now.saturating_duration_since(granted_at))
+                    }
+                    _ => latency,
+                };
+                self.admission.release_with(tk, self.rel_ns(now), latency, sample)
             }
             _ => Vec::new(),
+        };
+        // Where the freed slot was: a granted task of the same service may find its kept instance there.
+        let near = match (live, &info) {
+            (Some(l), Some(i)) => self.machines[l.machine].proc().map(|p| (i.service, p)),
+            _ => None,
         };
         self.completed.fetch_add(1, Ordering::AcqRel);
 
@@ -110,7 +123,7 @@ impl SchedInner {
         if let Some(tx) = task.done_tx.lock().take() {
             let _ = tx.send(outcome);
         }
-        self.promote_all(granted, now);
+        self.promote_all_near(granted, now, near);
         self.wake_memory_waiters();
     }
 

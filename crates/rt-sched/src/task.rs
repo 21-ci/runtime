@@ -198,6 +198,9 @@ pub(crate) struct TaskInfo {
     pub key: PreparedKey,
     /// `(enqueued_at + queue_timeout, id)` while the task has not started.
     pub queue_deadline: Option<Instant>,
+    /// The service reuses instances after a clean answer (`reuse_isolates` / `reuse_instances`):
+    /// a task granted the slot it frees is placed on the same P to find the kept instance.
+    pub affine: bool,
 }
 
 /// Mutable scheduler-side state of a task.

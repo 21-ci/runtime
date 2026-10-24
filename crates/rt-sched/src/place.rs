@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use rt_mem::Owner;
-use rt_types::{DegradationMode, PreparedKey, RejectReason, RuntimeKind, TaskId, TaskKind, TaskSpec, Trigger};
+use rt_types::{
+    DegradationMode, PreparedKey, RejectReason, RuntimeKind, ServiceId, TaskId, TaskKind, TaskSpec, Trigger,
+};
 use tokio::sync::oneshot;
 
 use crate::admission::{AdmitContext, AdmitRequest};
@@ -116,6 +118,7 @@ impl SchedInner {
             reserve_bytes: reserve,
             key,
             queue_deadline: enqueued_at.checked_add(spec.knobs.queue_timeout),
+            affine: spec.knobs.reuse_isolates || spec.knobs.reuse_instances,
         };
         let mut spec = Some(spec);
         let mut made: Option<(Arc<Task>, oneshot::Receiver<rt_types::Outcome>)> = None;
@@ -164,23 +167,57 @@ impl SchedInner {
 
     /// Start tasks that were granted a run slot after waiting in their service queue.
     pub fn promote_all(&self, granted: Vec<Arc<Task>>, now: Instant) {
+        self.promote_all_near(granted, now, None);
+    }
+
+    /// [`Self::promote_all`] after a task of `near.0` freed its slot on P `near.1`: the first
+    /// granted task of that service that reuses instances goes to that P's LRQ tail (where the
+    /// instance it can reuse was kept), when the P is of its kind. Admission already chose which
+    /// task runs; this only chooses where.
+    pub fn promote_all_near(
+        &self,
+        granted: Vec<Arc<Task>>,
+        now: Instant,
+        mut near: Option<(ServiceId, rt_types::ProcId)>,
+    ) {
         for task in granted {
-            self.promote(&task, now);
+            let target = match near {
+                Some((svc, p)) if self.is_affine_to(&task, svc) && self.proc(p).kind() == task.shared.kind => {
+                    near = None;
+                    Target::Proc(p)
+                }
+                _ => Target::External,
+            };
+            self.promote(&task, now, target);
         }
     }
 
-    fn promote(&self, task: &Arc<Task>, now: Instant) {
+    fn is_affine_to(&self, task: &Task, service: ServiceId) -> bool {
+        task.shared
+            .ext
+            .lock()
+            .info
+            .as_ref()
+            .is_some_and(|i| i.affine && i.service == service)
+    }
+
+    fn promote(&self, task: &Arc<Task>, now: Instant, target: Target) {
         let granted_ns = self.rel_ns(now);
-        if let Some(tk) = task.shared.ext.lock().ticket.as_mut() {
-            tk.queued = false;
-            tk.granted_ns = granted_ns;
-        }
+        let pred_ns = match task.shared.ext.lock().ticket.as_mut() {
+            Some(tk) => {
+                tk.queued = false;
+                tk.granted_ns = granted_ns;
+                tk.pred_ns
+            }
+            None => 0,
+        };
         if let Some(m) = &self.sched_metrics {
-            m.admission_queue_wait_seconds
-                .observe(now.saturating_duration_since(task.enqueued_at).as_secs_f64());
+            let waited = now.saturating_duration_since(task.enqueued_at).as_secs_f64();
+            m.admission_queue_wait_seconds.observe(waited);
+            m.observe_wait_by_size(pred_ns, waited);
         }
         if task.shared.state.transition(TaskState::New, TaskState::Runnable) {
-            self.place_new(task, Target::External);
+            self.place_new(task, target);
         }
     }
 

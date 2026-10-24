@@ -503,6 +503,7 @@ impl SchedInner {
         self.update_retry_after(now);
         let (warm, per_service) = self.publish_warm(&reports, pressure);
         if let (Some(sm), Some(m)) = (&self.sched_metrics, &self.metrics) {
+            sm.observe_aged_grants(self.admission.aged_grants());
             sm.observe_tick(
                 m,
                 self.admission.running(),
