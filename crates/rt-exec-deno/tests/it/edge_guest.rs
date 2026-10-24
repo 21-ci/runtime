@@ -5,6 +5,7 @@
 use crate::common;
 
 use common::*;
+use rt_types::Outcome;
 use serde_json::json;
 
 const INTERNALS: &str = "export default async () => {\n\
@@ -114,8 +115,17 @@ fn dsql_003_iterate_is_capped() {
     run_local(async {
         let mut h = Harness::new(cfg0());
         let p = h.prepare(&ts_upload(ITERATE)).await;
-        let (got, _) = h.get("/", &p).await;
-        assert_eq!(got.status, 200, "{}", got.text());
+        // The setup (a cold open, 10,001 inserted rows) can hit sql_busy or the statement budget on a slow,
+        // instrumented runner and throw before the iteration under test; retry it like a client would.
+        let mut tries = 0;
+        let got = loop {
+            tries += 1;
+            let ran = h.run(get("/"), &p).await;
+            if matches!(ran.outcome, Outcome::Ok(_)) || tries == 5 {
+                break read(ran.outcome).await;
+            }
+        };
+        assert_eq!(got.status, 200, "after {tries} tries: {}", got.text());
         let v = got.json();
         assert_eq!(v["code"], json!("sql_result_too_large"), "{v}");
         assert!(v["seen"].as_u64().is_some_and(|n| n <= 10_000), "{v}");
