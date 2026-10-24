@@ -653,3 +653,31 @@ pub fn svc(n: u128) -> ServiceId {
 mod recording_hub;
 #[allow(unused_imports)]
 pub use recording_hub::{info, RecordingHub};
+
+// ---------------------------------------------------------------------------------------------
+// Admission backlog stub (`min_run_time` handoff)
+// ---------------------------------------------------------------------------------------------
+
+/// A scheduler stand-in: every service has `n` tasks waiting in admission.
+#[derive(Default)]
+pub struct TestBacklog(pub std::sync::atomic::AtomicU32);
+
+impl TestBacklog {
+    /// Registered on `targets` (which only holds a weak reference: keep the returned `Arc`).
+    pub fn on(targets: &rt_sched::WarmTargets) -> Arc<Self> {
+        let b = Arc::new(Self::default());
+        let as_dyn: Arc<dyn rt_sched::Backlog> = b.clone();
+        targets.set_backlog(Arc::downgrade(&as_dyn));
+        b
+    }
+
+    pub fn set(&self, n: u32) {
+        self.0.store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl rt_sched::Backlog for TestBacklog {
+    fn waiting(&self, _service: ServiceId) -> u32 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}

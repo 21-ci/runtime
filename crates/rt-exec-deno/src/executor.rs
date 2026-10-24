@@ -54,7 +54,7 @@ use futures_util::FutureExt;
 use rt_host::{HostHandle, HostServices};
 use rt_mem::{MemCategory, Owner, Pressure};
 use rt_obs::{LogLevel, Metrics};
-use rt_sched::{ExecCx, Executor, Interrupter, TaskFuture, WarmKey};
+use rt_sched::{after_answer, AfterAnswer, ExecCx, Executor, Interrupter, TaskFuture, WarmKey};
 use rt_types::{
     Body, BodyError, KillReason, Limits, Outcome, Payload, PreparedKey, Reply, ServiceId, ServiceKnobs, ServiceRef,
     TaskId, TaskKind, TaskSpec, TaskTimings, TenantId, Trigger,
@@ -116,6 +116,20 @@ fn target_of(cfg: &DenoExecutorConfig, id: &WarmId) -> usize {
             key: id.key,
         }) as usize
     })
+}
+
+/// Tasks of `id`'s service waiting in admission (0 without a scheduler).
+fn waiting_of(cfg: &DenoExecutorConfig, id: &WarmId) -> u32 {
+    cfg.warm_targets.as_ref().map_or(0, |t| t.waiting(id.service.service))
+}
+
+/// Count `n` keep-alive events of `outcome` (`rt_instance_keepalive_total{kind="deno"}`).
+fn keepalive(metrics: Option<&Metrics>, outcome: &str, n: usize) {
+    if let (Some(m), true) = (metrics, n > 0) {
+        m.instance_keepalive_total
+            .with_label_values(&["deno", outcome])
+            .inc_by(n as u64);
+    }
 }
 
 /// How many isolates to keep for `id`: the scheduler's warm target when one is published, else
@@ -353,11 +367,13 @@ impl DenoExecutor {
         } else {
             s.warm.shed_to(|id| target_of(&self.cfg, id))
         };
+        keepalive(self.metrics.as_deref(), "shed", kept.len());
         s.dispose.extend(kept);
         pressure
     }
 
-    /// Kept isolates past `reuse_idle_ttl` (those above their service's warm target) or above
+    /// Kept isolates past their keep-alive (`min_run_time` or `reuse_idle_ttl`, a handoff once
+    /// nothing of its service waits; those above their service's warm target) or above
     /// their service's bound go to the dispose queue; templates of services that went quiet are
     /// forgotten; a pool larger than it should be shrinks (cheap when nothing is kept).
     fn trim_warm(&self) {
@@ -373,7 +389,9 @@ impl DenoExecutor {
             ..
         } = &mut *s;
         if !warm.is_empty() {
-            dispose.extend(warm.trim(now, cfg.reuse_idle_ttl, |id| warm_keep(cfg, id)));
+            let out = warm.trim(now, |id| warm_keep(cfg, id), |id| waiting_of(cfg, id) > 0);
+            keepalive(self.metrics.as_deref(), "expired", out.len());
+            dispose.extend(out);
         }
         templates.retain(|_, t| {
             target_of(cfg, &t.id) > 0 || warm.len_of(&t.id) > 0 || now.duration_since(t.seen) < TEMPLATE_IDLE
@@ -808,6 +826,7 @@ fn fresh_isolate(
 async fn take_kept(
     cfg: &DenoExecutorConfig,
     shared: &Rc<RefCell<Shared>>,
+    metrics: Option<&Metrics>,
     id: &WarmId,
     handle: &HostHandle,
     limit_bytes: u64,
@@ -816,12 +835,10 @@ async fn take_kept(
         let (kept, expired) = {
             let mut out = Vec::new();
             let protected = target_of(cfg, id);
-            let kept = shared
-                .borrow_mut()
-                .warm
-                .take(id, Instant::now(), cfg.reuse_idle_ttl, protected, &mut out);
+            let kept = shared.borrow_mut().warm.take(id, Instant::now(), protected, &mut out);
             (kept, out)
         };
+        keepalive(metrics, "expired", expired.len());
         for iso in expired {
             dispose_later(shared, cfg.dispose_backlog, iso);
         }
@@ -837,6 +854,7 @@ async fn take_kept(
             // Defensive: a termination request can only come from a kill, and killed isolates
             // are never kept, but a stale one must not fail this task.
             iso.handle.cancel_terminate_execution();
+            keepalive(metrics, "reused", 1);
             return Some(iso);
         }
         dispose_later(shared, cfg.dispose_backlog, iso);
@@ -898,7 +916,7 @@ async fn run_task_as(
     // 2. isolate: one kept for this service version (D-A4), a pooled one, or a new one
     let kept = match &warm_id {
         // A warm-up builds a new isolate: it never takes one that is kept already.
-        Some(id) if !warmup => take_kept(&cfg, &shared, id, &handle, limit_bytes).await,
+        Some(id) if !warmup => take_kept(&cfg, &shared, metrics.as_deref(), id, &handle, limit_bytes).await,
         _ => None,
     };
     let mut iso = match kept {
@@ -1007,6 +1025,8 @@ async fn run_task_as(
         task,
         deadline,
         warm_id,
+        min_run_time: spec.knobs.min_run_time,
+        queue_timeout: spec.knobs.queue_timeout,
         limit_bytes,
         head_cpu: head_cpu.clone(),
         warmup,
@@ -1094,6 +1114,10 @@ struct Driver {
     deadline: Instant,
     /// Reuse is on for this service (`deno.reuse_isolates`): where a clean finish is kept.
     warm_id: Option<WarmId>,
+    /// The service's `min_run_time` (`None`: inherit `reuse_idle_ttl`), see [`Driver::park`].
+    min_run_time: Option<Duration>,
+    /// The service's `queue_timeout`: how long a handoff isolate waits at most.
+    queue_timeout: Duration,
     /// `limits.memory_mb` in bytes.
     limit_bytes: u64,
     /// Guest CPU when the task future returned the head; what the driver uses afterwards (the
@@ -1285,10 +1309,7 @@ impl Driver {
         }
         iso.loader.flush_cache_stats(self.metrics.as_deref());
         let kept = match self.warm_id {
-            Some(id) if reusable && self.keep(&mut iso, &op_state) => {
-                self.park(id, iso);
-                true
-            }
+            Some(id) if reusable && self.keep(&mut iso, &op_state) => self.park(id, iso),
             _ => {
                 dispose_later(&self.shared, self.cfg.dispose_backlog, iso);
                 false
@@ -1375,18 +1396,40 @@ impl Driver {
         true
     }
 
-    fn park(&self, id: WarmId, iso: Isolate) {
-        let bound = warm_keep(&self.cfg, &id).bound;
-        let total = self.cfg.reuse_max_idle_total as usize;
+    /// Keep a reusable isolate per the service's `min_run_time` (`rt_sched::after_answer`): unset,
+    /// for `reuse_idle_ttl` (today's rule); `t > 0`, for `t`; `0` while work of the service waits,
+    /// until that work is gone (at most `queue_timeout`); `0` with nothing waiting, disposed,
+    /// unless the service holds fewer than its warm floor (then kept, protected, expiring now).
+    /// Returns whether it was handed to the store.
+    fn park(&self, id: WarmId, iso: Isolate) -> bool {
         let cfg = &self.cfg;
+        let metrics = self.metrics.as_deref();
+        let now = Instant::now();
+        let (expires, handoff) = match after_answer(self.min_run_time, waiting_of(cfg, &id), self.queue_timeout) {
+            AfterAnswer::Inherit => (now + cfg.reuse_idle_ttl, false),
+            AfterAnswer::For(t) => (now + t, false),
+            AfterAnswer::Handoff { cap } => (now + cap, true),
+            AfterAnswer::Dispose => {
+                if target_of(cfg, &id) <= self.shared.borrow().warm.len_of(&id) {
+                    keepalive(metrics, "disposed", 1);
+                    dispose_later(&self.shared, cfg.dispose_backlog, iso);
+                    return false;
+                }
+                (now, false)
+            }
+        };
+        let bound = warm_keep(cfg, &id).bound;
+        let total = cfg.reuse_max_idle_total as usize;
         let out = self
             .shared
             .borrow_mut()
             .warm
-            .park(&id, iso, Instant::now(), bound, total, |i| target_of(cfg, i));
+            .park(&id, iso, now, expires, handoff, bound, total, |i| target_of(cfg, i));
+        keepalive(metrics, if handoff { "handoff" } else { "kept" }, 1);
         for i in out {
-            dispose_later(&self.shared, self.cfg.dispose_backlog, i);
+            dispose_later(&self.shared, cfg.dispose_backlog, i);
         }
+        true
     }
 }
 
