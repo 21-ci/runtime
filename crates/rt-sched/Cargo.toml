@@ -1,0 +1,49 @@
+[package]
+name = "rt-sched"
+description = "GMP scheduler: tasks, processors, machines, queues, stealing, admission, sysmon, re-kinding (L2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rt-types.workspace = true
+rt-config.workspace = true
+rt-mem.workspace = true
+rt-obs.workspace = true
+# admission / autoscaler / self-check collectors, registered on `rt_obs::Metrics::registry`
+prometheus.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+futures-util.workspace = true
+crossbeam-deque.workspace = true
+crossbeam-queue.workspace = true
+crossbeam-utils.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+arc-swap.workspace = true
+tracing.workspace = true
+libc.workspace = true
+
+[target.'cfg(loom)'.dependencies]
+loom.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+# `--cfg loom` also switches tokio's `net` off, which breaks hyper-util (pulled in by the testkit's
+# HTTP harness). The loom tests (tests/loom.rs) only need rt-sched itself.
+[target.'cfg(not(loom))'.dev-dependencies]
+rt-testkit.workspace = true
