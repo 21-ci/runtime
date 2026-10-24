@@ -169,14 +169,14 @@ publishes them on host `127.0.0.1` only.
 
 | Scope | Allows |
 |---|---|
-| `services:read` | List and read services, projects, environments, versions |
-| `services:write` | Create, update and delete services and projects |
+| `services:read` | List and read services, projects, environments, versions, topics, consumers and invocations |
+| `services:write` | Create, update and delete services, projects and topics |
 | `deploy` | Deploy, rebuild, roll back |
 | `invoke` | Call `access="key"` routes |
 | `logs:read` | Logs and stats |
 | `env:write` | Set env vars |
 | `secrets:write` | Set and delete secrets |
-| `queue:write` | Enqueue, DLQ redrive and purge |
+| `queue:write` | Enqueue, publish, append to topics, consumer resets, DLQ redrive and purge, invocation redrive and purge |
 | `data:admin` | Export a consistent snapshot of a service's `data.db`; drop a durable object's storage |
 | `keys:write` | Self-service keys (`/v1/keys`) |
 | `sockets:write` | Close a service's WebSockets through the control API (audited `sockets.closed_by_api`) |
@@ -216,6 +216,10 @@ Every per-key, per-IP, per-tenant or per-service map on the request path has a c
 counters (credentials with no open stream dropped past 1024), per-service ingress buckets and `ip_allow` lists
 (dropped with their service on every route refresh), SDK caller gates (idle tenants dropped past 10k), lock slots
 (removed on release), socket tickets (swept), env bundles (idle TTL), usage counters (removed once flushed).
+Events: the pub/sub index (subscriptions × services, rebuilt per generation), round-robin counters per (namespace,
+group) and per topic (bounded by groups and topics), the stream engine's cursor cache and in-flight set (bounded by
+consumers × partitions), and throttle counters per service (removed on success). Async in-flight attempts are capped
+at 256 per node.
 
 ### Control API bodies
 
@@ -252,8 +256,11 @@ with the `x-rt-tenant` header. Each tenant has a **plan**. These are the free pl
 | `max_warm_floor_total` | 8 | `builds_per_hour` | 20 |
 | `rps` | 50 | `storage_mb` (KV+SQL+blob, tenant-wide) | 100 |
 | `invocations_per_day` | 100k | `egress_mb_per_day` | 1000 |
-| `limits_max` | 30 s wall · 1 s CPU · 128 MB | `allowed_triggers` | http, interval, queue, call, websocket |
+| `limits_max` | 30 s wall · 1 s CPU · 128 MB · 60 s `min_run_time_ms` | `allowed_triggers` | http, interval, queue, call, websocket, pubsub, stream |
 | `egress_default` | `Allow` | `allow_cross_tenant_calls` | `false` |
+| `max_async_pending` | 10k (pending async invocations per service) | `max_topics` | 10 |
+| `max_topic_partitions` | 4 | `max_stream_mb` (record bytes across the tenant's topics; not in `storage_mb`) | 100 |
+| `max_stream_retention_hours` | 72 | | |
 
 - The quota enforcer checks service count, schedule count and frequency, allowed triggers, an rps token bucket,
   daily invocations, builds per hour, queue depth, daily egress and storage.
@@ -261,6 +268,53 @@ with the `x-rt-tenant` header. Each tenant has a **plan**. These are the free pl
   `min_instances` across a tenant must stay within `max_warm_floor_total`, otherwise `422 limit_exceeds_plan`.
   One tenant can't pin the node's memory with warm instances.
 - A per-service limit above `limits_max` is clamped and recorded as a plan conflict.
+- `scaling.min_run_time_ms` above the plan's `limits_max.min_run_time_ms` (or the node's `sched.min_run_time_max_ms`,
+  whichever is lower) is refused with `422 limit_exceeds_plan`. If the plan is lowered later, the runtime clamps the
+  value at run and records a plan conflict.
+- Pub/sub subscriptions and stream consumers need `pubsub` / `stream` in `allowed_triggers`. A service whose plan
+  does not allow them is left out of the subscription index and the stream engine, and `services` create or patch
+  refuses such a block with `403 trigger_not_allowed`.
+
+---
+
+## Events: pub/sub, streams and async invocations
+
+Pub/sub (`std:pubsub`), streams (`std:stream`, topics with partitions and consumer groups) and async invocations
+share the plan and the ingress checks, and each has its own caps.
+
+- **Namespaces.** A subscription, topic and consumer belongs to the namespace of its service route: tenant, project
+  and environment. A service in `staging` cannot read or append a `production` topic of the same name, and does not
+  receive its pub/sub messages. Another tenant never does either. The namespace comes from the route table, never from
+  a guest payload.
+- **Opt-in async.** `async.enabled` defaults to `false`. Until a service turns it on, `Prefer: respond-async` is
+  ignored and `X-Rt-Invocation-Type: Event` is refused (`403 async_not_allowed`), so an anonymous internet client
+  cannot move a service's work into the background.
+- **Authorization is decided at accept.** For an async invocation, `access: key` is checked when the request is
+  accepted. Revoking the key later does not cancel accepted invocations; purge them with `21ci invocation purge`. At run
+  the runtime re-checks only the live version, `triggers.http` and the plan's `http` trigger.
+- **Stored async headers and body are sealed.** They are encrypted with the node's secret key (AES-256-GCM, additional
+  data = the invocation id and `h` or `b`), so `queue.db` holds only opaque bytes for them. The stored headers are the
+  guest-visible set after ingress hygiene: runtime credentials (`rtk_…`, the root token) and client `x-rt-*` headers are
+  already removed, and the guest's own `Authorization` and cookies are kept because the handler needs them. The
+  sealed data is wiped when the invocation succeeds and kept on failed records (7 days, so they can be redriven). If
+  the key that sealed a record is gone, the record fails once with `sealed_unreadable` and is not retried. No API
+  returns headers or bodies of an invocation.
+- **Caps.** Pending async invocations: `plan.max_async_pending` per service (`429 async_backlog_full` above it). Failed
+  records: 1,000 per service, the oldest evicted. Async attempts: 256 in flight per node, `queue.max_concurrency` per
+  service. Pub/sub: a publish reaches at most 100 receivers (the rest are counted as dropped), at most 64 deliveries in
+  flight per subscriber service, nested publishes stop at depth 15, and each delivery is checked against the tenant
+  quota before it is submitted. Deliveries go through admission (`max_queued`) and are dropped when it refuses them.
+  Streams: each append call takes one tenant rate token; the tenant's byte cap counts records and dead letters
+  (`max_stream_mb`); topics per tenant, partitions per topic and retention are capped by the plan; dead letters are
+  capped at 1,000 per consumer for 7 days. Reply and read pages are capped at 1 MiB; event bodies at 1 MiB.
+- **Guest input.** Every number from a guest is bounded and saturating. Header names and values are validated (`x-rt-`
+  is reserved; no CR, LF or NUL). Bodies are length-checked in the host and again in the store. Store SQL is
+  parameterized, and no guest SQL reaches `streams.db`.
+- **Storage.** `streams.db` sits beside `queue.db` with the same file permissions. Stream bytes are a separate quota
+  from `storage_mb`.
+- **Names and logs.** Subjects and topic names are not secrets: they appear in topic views, consumer views and the
+  `pubsub.published` audit row. Do not put secrets or personal data in them. Bodies and headers never appear in logs,
+  audit data or metric labels.
 
 ---
 
@@ -805,14 +859,19 @@ Builds run in-process. There is no separate OS sandbox for the build step.
 | Scope | Tools |
 |---|---|
 | none | `whoami`, `get_limits` |
-| `services:read` | `list_projects`, `list_environments`, `list_sdks`, `get_sdk_contract`, `list_services`, `get_service`, `list_versions`, `list_schedules`, `list_objects`, `list_sockets` |
-| `services:write` | `create_project`, `create_service`, `update_service`, `delete_service` |
+| `services:read` | `list_projects`, `list_environments`, `list_sdks`, `get_sdk_contract`, `list_services`, `get_service`, `list_versions`, `list_schedules`, `list_objects`, `list_sockets`, `list_topics`, `read_topic`, `list_consumers`, `list_invocations` |
+| `services:write` | `create_project`, `create_service`, `update_service`, `delete_service`, `create_topic` |
 | `deploy` | `deploy_code`, `rollback` |
 | `sockets:write` | `close_socket` |
 | `logs:read` | `get_logs`, `get_stats` |
 | `env:write` + `services:read` | `set_env` |
 | `secrets:write` | `set_secret` |
 | `keys:write` | `list_tokens`, `create_token`, `revoke_token` |
+| `queue:write` | `reset_consumer`, `redrive_invocations` |
+
+`list_topics`, `read_topic`, `list_consumers` and `list_invocations` need `services:read`, and `create_topic` needs
+`services:write`. Topic delete and update, append, publish and DLQ purge are not MCP tools. `read_topic` returns
+record bodies as untrusted data, not instructions.
 
 ---
 
@@ -828,6 +887,7 @@ target `rt::audit`.
 | Config | `env.written` (names only), `secret.written`, `secret.deleted` |
 | Hosts | `host.attached/detached/verified/expired` |
 | Schedules, queues | `schedule.created/updated/deleted`, `dlq.redrive`, `dlq.purge` |
+| Events | `topic.created/updated/deleted/appended` (`appended` carries `{count}` only), `pubsub.published` (`{subject, receivers}`), `consumer.reset`, `consumer.dlq_purged`, `invocations.redriven`, `invocations.purged` |
 | Data, projects, keys | `data.exported`, `project.created/updated/deleted`, `key.created`, `key.deleted` (with `cascaded`) |
 | Security | `security.artifact_tamper` (separate event) |
 
@@ -862,6 +922,9 @@ Failed authentications are rate-limited but not logged individually.
 | `ingress.header_timeout` / `idle_timeout` | 10 s / 60 s | Slowloris protection |
 | `ingress.max_conns_per_ip` / `h2_max_streams` | 256 / 100 | Connection caps |
 | `ingress.sse_streams_per_key` | 10 | Log stream cap |
+| `sched.min_run_time_max_ms` | 600000 | Largest keep-alive (`scaling.min_run_time_ms`) a service may set on this node; the plan may lower it further. Kept instances count against the memory governor and the `reuse_max_idle*` caps; v1 has no per-tenant cap on kept instances, so a tenant with many services can keep up to one per service |
+| `sched.aging_factor` | 4 | Admission order: a waiting task ages toward the front of its tenant's queue, so long waits are not starved. `0` = arrival order within a tenant |
+| `async.enabled` (per service) | `false` | Accept async invocations (`Prefer: respond-async`, `X-Rt-Invocation-Type: Event`). The plan's `max_async_pending` bounds the backlog |
 | `egress.denied_ports` | `[25, 465, 587]` | No outbound SMTP |
 | `egress.denied_hosts` / `denied_cidrs` | `[]` | Extra global blocks |
 | `egress.allow_https_downgrade` | `false` | Allow https→http redirects |

@@ -134,9 +134,9 @@ A project groups a tenant's services and lists their environments. Every tenant 
 
 The default object of a service is `default`. The service's stats (`GET …/stats`) add `sockets: {open, objects}`.
 
-Service object: `{id, tenant_id, slug, runtime, name, profile, project_id, project, environment, live_version, etag, limits, scaling, access, triggers, ingress, egress, call, deno?, wasm?, status: {build_state, tier: T1\|T2\|T3, inflight, last_error, admission}, effective}`; `effective` lists each resolved value with its source (`{"cpu_ms": {"value": 1000, "source": "profile:balanced"}}`); `deno` / `wasm` appear once a knob is set.
+Service object: `{id, tenant_id, slug, runtime, name, profile, project_id, project, environment, live_version, etag, limits, scaling, access, triggers, ingress, egress, call, events?, async?, deno?, wasm?, status: {build_state, tier: T1\|T2\|T3, inflight, last_error, admission}, effective}`; `effective` lists each resolved value with its source (`{"cpu_ms": {"value": 1000, "source": "profile:balanced"}}`); `deno` / `wasm` appear once a knob is set.
 
-`status.admission` is the service's queueing and autoscaler state, `null` while it has none (never run, or idle past its idle TTL): `{kind: deno|wasm|build, limit, min, max, running, queued, queued_bytes, max_queued, queue_wait_ms, queue_timeouts, demand, latency_baseline_ms, warm_per_proc, instances, min_instances, max_instances, target_instances, rps, last_change, idle_ms}`. `limit` is the adaptive concurrency limit within `[min, max]` (the ceiling and the plan's tenant cap); `queue_wait_ms` is the smoothed wait of requests that had to queue (it fades to 0 while requests start without waiting); `queue_timeouts` counts `503 queue_timeout` since the state was created; `demand` is the decaying peak of running tasks and `warm_per_proc` the warm instances the autoscaler asks each processor to keep. An *instance* is one concurrently running copy of the service: `instances` is how many run now (the same as `running`), `min_instances` / `max_instances` the bounds of the limit (`max_instances` equals `max`; `min_instances` is `scaling.min_instances` within the plan), `target_instances` the warm instances wanted in total (`warm_per_proc` times the processors of the kind, at least `min_instances` while the service is known), `rps` the smoothed arrival rate and `last_change` the latest move of `limit` as `{reason: queue|trend|latency|memory|cpu|idle|bounds, from, to, ago_ms}` (`null` if it never moved). `status.inflight` equals `admission.running`.
+`status.admission` is the service's queueing and autoscaler state, `null` while it has none (never run, or idle past its idle TTL): `{kind: deno|wasm|build, limit, min, max, running, queued, queued_bytes, max_queued, queue_wait_ms, queue_timeouts, demand, latency_baseline_ms, warm_per_proc, instances, min_instances, max_instances, target_instances, rps, last_change, idle_ms, pred_ms, pred_background_ms}`. `limit` is the adaptive concurrency limit within `[min, max]` (the ceiling and the plan's tenant cap); `queue_wait_ms` is the smoothed wait of requests that had to queue (it fades to 0 while requests start without waiting); `queue_timeouts` counts `503 queue_timeout` since the state was created; `demand` is the decaying peak of running tasks and `warm_per_proc` the warm instances the autoscaler asks each processor to keep. An *instance* is one concurrently running copy of the service: `instances` is how many run now (the same as `running`), `min_instances` / `max_instances` the bounds of the limit (`max_instances` equals `max`; `min_instances` is `scaling.min_instances` within the plan), `target_instances` the warm instances wanted in total (`warm_per_proc` times the processors of the kind, at least `min_instances` while the service is known), `rps` the smoothed arrival rate and `last_change` the latest move of `limit` as `{reason: queue|trend|latency|memory|cpu|idle|bounds, from, to, ago_ms}` (`null` if it never moved). `pred_ms` is the predicted run time (EWMA) of the service's foreground tasks and `pred_background_ms` the same for queue, stream, async and schedule work; each is `null` until a task has run. `status.inflight` equals `admission.running`.
 
 | Block | Fields (all optional; unknown fields → `422`) | Default |
 |---|---|---|
@@ -145,6 +145,9 @@ Service object: `{id, tenant_id, slug, runtime, name, profile, project_id, proje
 | `scaling` | `min_instances` (kept warm, never scaled to zero; 0 = scale to zero), `max_instances` (hard cap of the adaptive limit, excess requests queue; ≥ 1, 0 = unset), `max_queued` (queue bound, over it `503 overloaded`), `keep_resident`. Both instance bounds above the plan's `max_instances` are clamped to it (`effective` shows source `plan`); `min_instances` above `max_instances` → `422 validation_failed`. `max_concurrency` is the old name of `max_instances` (accepted on input, never returned) | `min_instances` 0; `max_instances` the plan's limit, else the profile ceiling; adaptive in between |
 | `triggers` | `http, interval, cron, queue, call, websocket` (booleans) | all `true` |
 | `durable` | `true`: a durable service (its default export is a class, one instance per object; [handlers](handlers.md#stddurable)). A WASM durable service must export `std:host/socket-handler` (`422 missing_export` on upload, on PATCHing `durable: true` when the live version lacks it, and on moving `live` to such a version) | `false` |
+| `scaling.min_run_time_ms` | Keep-alive in ms (integer, ≥ 0): how long a reused instance may stay idle after its answer, waiting for the next task of the same version. `0` = released right after the answer, unless tasks of the service wait in admission (then at most the service's `queue_timeout`). A maximum the runtime may cut short (memory pressure, version change, `reuse_max_*`), not a guarantee. Only matters while reuse is on. Above the lower of the plan's `limits_max.min_run_time_ms` and the node's `sched.min_run_time_max_ms` → `422 limit_exceeds_plan` (`details` name `field`, `requested`, `max`). The effective value and its source are in `effective.min_run_time_ms` | inherit: `deno.reuse_idle_ttl` (60 s) on Deno, `cache.idle_ttl` on WASM |
+| `events` | `subscribe[]` (`{subject, group?}`, at most 32; subject tokens `[A-Za-z0-9_-]+`, `*`, or `>` as the last token; `group` names a load-balancing group), `consume[]` (`{topic, group?, start?, batch_size?, max_attempts?, on_exhausted?}`, at most 8, `(topic, group)` unique; `start` `earliest`\|`latest` where a new cursor starts, `batch_size` 1–1000, `max_attempts` 1–100, `on_exhausted` `dlq`\|`skip`\|`block`). The plan must allow `pubsub` or `stream` (`403 trigger_not_allowed`); a durable service refuses both (`422 validation_failed`) | no blocks (no subscriptions, no consumers) |
+| `async` | `enabled` (bool; opt-in), `max_attempts` (1–10 function attempts in total), `max_event_age_s` (60–86400 s) | `enabled: false`, `max_attempts` 3, `max_event_age_s` 3600 |
 | `ws` | `allowed_origins[]` (exact origins such as `https://app.example.com`, case-insensitive; empty = any `Origin`; a missing or other `Origin` gets `403 origin_not_allowed` at the upgrade), `warm` (bool: keep the isolate or instance of an event for the next event of the service), `max_sockets` (the service's own cap on open sockets, within the plan's) | any origin, `warm: true`, no own cap |
 | `ingress` | `allowed_methods[], allow_paths[] (prefix*), ip_allow[] (CIDRs), rate_limit {rps, burst}`. A request passes `allow_paths` only if both its raw path and that path with dot segments resolved (`.`, `..`, also as `%2e`, and `\` as `/`) match | none |
 | `egress` | `allowed_hosts[], denied_hosts[]` | plan default |
@@ -218,6 +221,37 @@ Env and secret changes apply to the next task; no redeploy.
 
 A disabled trigger (`triggers.cron=false`, plan `allowed_triggers`) → `403 trigger_not_allowed`. Interval below the plan minimum → `422 schedule_too_frequent`; schedule count above the plan → `403 quota_exceeded`.
 
+### Topics, consumers and invocations
+
+Topics are tenant resources: partitioned, replayable logs (`std:stream`), and the names that `std:pubsub` publishes
+under. `{t}` is a topic id (`tpc_…`) or a topic name (`[a-z0-9][a-z0-9._-]{0,62}`, which may not start with `tpc_`).
+A name resolves in the `project` and `environment` query or body fields (defaults `default` and `production`). A
+topic the key cannot see is `404 not_found`.
+
+| Method | Path | Scope | Body / query → response |
+|---|---|---|---|
+| POST | `/v1/topics` | `services:write` | `{name, project?, environment?, partitions? (1), retention_hours? (24), max_mb? (0)}` → `201` topic. `Idempotency-Key` is honoured. `409 topic_exists`; `403 quota_exceeded` at `max_topics`; `422 limit_exceeds_plan` for partitions, retention or `max_mb` above the plan |
+| GET | `/v1/topics` | `services:read` | `?project&environment` (both optional) → `{items: [topic]}` |
+| GET | `/v1/topics/{t}` | `services:read` | `?project&environment` → topic, with its `consumers` |
+| PATCH | `/v1/topics/{t}` | `services:write` | `{retention_hours?, max_mb?}` → topic |
+| DELETE | `/v1/topics/{t}` | `services:write` | → `204`. Records, cursors and dead letters go with it |
+| POST | `/v1/topics/{t}/messages` | `queue:write` | `{records: [{body, key?, headers?, dedup_id?}]}`, at most 100 records and 4 MiB. `Idempotency-Key` is honoured → `202 {items: [{partition, offset, duplicate}]}`. `429 stream_full` at the tenant's byte cap; each call takes one tenant rate token (`429 rate_limited`) |
+| GET | `/v1/topics/{t}/messages` | `services:read` | `?partition=N&from=<offset>\|earliest\|latest&from_time=<RFC3339>&limit=100` → `{items: [record], next, end}`. A page holds at most 100 records and 1 MiB. `partition` is required on a topic with more than one partition (`422 validation_failed`) |
+| POST | `/v1/pubsub/publish` | `queue:write` | `{subject, body, headers?, project?, environment?}` → `200 {receivers, dropped}`. `receivers` counts the services a delivery was queued for; `dropped` counts those skipped (fan-out cap of 100, per-service backlog, quota or admission refusal) |
+| GET | `/v1/services/{s}/consumers` | `services:read` | → `{items: [consumer]}` |
+| POST | `/v1/services/{s}/consumers/{topic}/{group}/reset` | `queue:write` | `{to: "earliest"\|"latest"\|<offset>\|"<RFC3339>", partition?}` → the consumer. Also unblocks a blocked consumer |
+| GET | `/v1/services/{s}/consumers/{topic}/{group}/dlq` | `services:read` | `?limit=100` → `{items: [dead letter]}` |
+| DELETE | `/v1/services/{s}/consumers/{topic}/{group}/dlq` | `queue:write` | → `204` |
+| GET | `/v1/services/{s}/invocations` | `services:read` | `?state=pending\|succeeded\|failed&limit&cursor` → `{items: [invocation], next_cursor, counts: {pending, failed}}` |
+| GET | `/v1/services/{s}/invocations/{id}` | `services:read` | → invocation |
+| POST | `/v1/services/{s}/invocations/redrive` | `queue:write` | → `200 {redriven}`. Failed invocations go back to pending with their attempts reset |
+| DELETE | `/v1/services/{s}/invocations` | `queue:write` | `?state=failed` (the only value accepted) → `204` |
+
+A record is `{partition, offset, key, headers, body, timestamp}`. An invocation is `{id, state, method, path, has_query,
+attempts, status, condition, error, body_bytes, created_at, updated_at, expires_at}`. `path` never contains the query
+string; `has_query` says whether there was one. No invocation view carries request headers or the body: those may hold
+end-user credentials. Failed invocations are kept 7 days, at most 1,000 per service (the oldest are evicted first).
+
 ### Logs, stats, events
 
 | Method | Path | Scope | Notes |
@@ -236,20 +270,20 @@ Each code is explained in [Error reasons](reference/errors.md#control-api-codes)
 | `unauthorized` | 401 |
 | `insufficient_scope`, `quota_exceeded`, `trigger_not_allowed`, `binding_not_allowed`, `host_not_allowed`, `reserved` (the system tenant) | 403 |
 | `not_found` | 404 |
-| `slug_taken`, `host_taken`, `host_cooldown`, `version_not_ready`, `tenant_not_empty`, `project_slug_taken`, `project_not_empty`, `environment_in_use`, `sdk_release_exists` | 409 |
+| `slug_taken`, `host_taken`, `host_cooldown`, `topic_exists`, `version_not_ready`, `tenant_not_empty`, `project_slug_taken`, `project_not_empty` (also with topics), `environment_in_use` (also with topics), `sdk_release_exists` | 409 |
 | `precondition_failed` | 412 |
 | `too_large`, `storage_quota`, `egress_quota` | 413 |
 | `sql_error`, `sql_not_authorized`, `sql_result_too_large`, `kv_not_integer`, `kv_overflow` (guest data, e.g. on export) | 422 |
 | `sql_busy`, `sql_timeout` | 503 |
 | `validation_failed`, `invalid_artifact`, `missing_export` (a durable WASM service without `socket-handler`), `limit_exceeds_plan`, `schedule_too_frequent`, `idempotency_mismatch`, `no_rpc_surface`, `sdk_contract_missing`, `sdk_unchecked_caller` | 422 |
-| `rate_limited`, `build_quota`, `queue_full` | 429 (`Retry-After` when known) |
+| `rate_limited`, `build_quota`, `queue_full`, `stream_full` | 429 (`Retry-After` when known) |
 | `not_implemented` | 501 |
 | `control_disabled` | 503 |
 | anything else (`internal`) | 500 |
 
 ## MCP
 
-`POST /mcp` on the control listener is a [Model Context Protocol](https://modelcontextprotocol.io) server for AI assistants: 26 tools that call the routes above as the key that connects (`whoami`, `get_limits`, projects, SDKs, services, `deploy_code`, versions and `rollback`, schedules, objects and WebSockets, logs and stats, env and secrets, tokens). It takes a tenant key as a Bearer token, answers JSON, and speaks the `initialize` handshake of 2024-11-05 to 2025-11-25 and the stateless 2026-07-28 revision. See [mcp.md](mcp.md) for the tools, the transport rules and how to connect Claude Code, Claude Desktop and Cursor.
+`POST /mcp` on the control listener is a [Model Context Protocol](https://modelcontextprotocol.io) server for AI assistants: 33 tools that call the routes above as the key that connects (`whoami`, `get_limits`, projects, SDKs, services, `deploy_code`, versions and `rollback`, schedules, objects and WebSockets, logs and stats, env and secrets, tokens, topics and consumers, invocations). It takes a tenant key as a Bearer token, answers JSON, and speaks the `initialize` handshake of 2024-11-05 to 2025-11-25 and the stateless 2026-07-28 revision. See [mcp.md](mcp.md) for the tools, the transport rules and how to connect Claude Code, Claude Desktop and Cursor.
 
 ## Invoke API
 
@@ -280,12 +314,27 @@ Failures are `text/plain` with the reason as body and in `x-rt-reason` (never JS
 | `route_stale` (a control change is being applied; retry after 1 s) | 503 |
 | `timeout` (wall limit) | 504 |
 | `call_depth` | 508 |
+| `async_not_allowed` (`X-Rt-Invocation-Type: Event` while the service's `async.enabled` is off, or on a durable service or a WebSocket upgrade) | 403 |
+| `bad_request` (an unknown `X-Rt-Invocation-Type` value, a bad `Idempotency-Key`) | 400 |
+| `idempotency_mismatch` (the same `Idempotency-Key` on a different method, URI or body) | 409 |
+| `async_backlog_full` (the service has `max_async_pending` pending invocations; `Retry-After: 1`) | 429 |
+
+**Async invocations** are opt-in per service (`async.enabled`, default `false`; set it with `21ci service update <svc> --set async.enabled=true`). With it on, `Prefer: respond-async` (RFC 7240; other preferences are ignored) or `X-Rt-Invocation-Type: Event` makes the invoke path store the request and answer `202 {"id":"inv_…","state":"pending"}` with `x-rt-invocation-id`, before the handler runs. The handler then gets the same method, path, query, headers and body, plus `x-rt-invocation-id` and `x-rt-invocation-attempt` (1-based). Its response body is discarded and only the status counts: a `5xx` or `429` is a failed attempt and is retried until `async.max_attempts` is used up, after which the invocation is `failed`. An invocation still pending `async.max_event_age_s` after it was accepted fails with `event_age_exceeded`. Any other status is a success.
+
+- With `Prefer` and a known `Content-Length` over `min(1 MiB, limits.max_body_bytes)`, the request runs synchronously. With `X-Rt-Invocation-Type: Event` it is `413 too_large`. A body of unknown length is buffered up to the same cap and is `413 too_large` in both modes.
+- An `Idempotency-Key` (1–255 visible ASCII characters) replays the original `202` while the record exists: pending, then 24 h after success or 7 d after failure. The same key with a different method, URI or body is `409 idempotency_mismatch`. The header is always forwarded to the handler unchanged.
+- Headers and body are stored sealed with the node's secret key. Authorization is decided at accept: revoking a key later does not cancel accepted invocations (purge them with `21ci invocation purge`). Ingress checks run first; an accepted request costs one rate-limit token and one daily invocation.
+- Each service may hold `plan.max_async_pending` pending invocations (`429 async_backlog_full` above it). The node runs at most 256 async attempts at once.
+
+Also see [Topics, consumers and invocations](#topics-consumers-and-invocations) for the inspection routes.
 
 **WebSocket upgrades** (`GET` with `Upgrade: websocket`, HTTP/1.1) take the same path, plus, before any task runs: `triggers.websocket` and the plan allow it (`403 trigger_not_allowed`), the node is not draining (`503 draining`) or short of memory (`503 memory`), and the `Origin` is one of `ws.allowed_origins` (`403 origin_not_allowed`). For `access: "key"` a browser, which cannot set `Authorization`, may pass the key as the first subprotocol (`new WebSocket(url, ["rtk_…", "chat"])`); it is removed before the guest sees the request. The guest answers with `sockets.accept(req)` (`101`); any other response goes out as it is. A `101` that the guest did not accept is `502 bad_upgrade`. Socket caps (`ws.max_sockets`, the plan's `max_sockets` and `max_sockets_per_object`, the service's `ws.max_sockets`) fail the guest's `accept` with `limit_exceeded`. See [handlers](handlers.md#websockets-and-durable-objects).
 
 ## Plans (built-in `free`; more under `[plans.<name>]`)
 
-`max_services` 10, `max_concurrency` 10, `max_instances` 4 (per service, 0 = node default), `rps` 50, `invocations_per_day` 100,000, `storage_mb` 100, `egress_mb_per_day` 1,000, `max_schedules` 3, `min_schedule_seconds` 60, `max_queue_depth` 10,000, `builds_per_hour` 20, `allowed_triggers` `http interval queue call websocket` (no `cron`), `limits_max` wall 30 s / CPU 1 s / 128 MB, `custom_host_suffixes` none, `allow_cross_tenant_calls` false, `max_sockets` 1,000 (open sockets of the tenant; 0 = only the node cap), `max_sockets_per_object` 1,000, `ws_max_message_bytes` 1 MiB.
+`max_services` 10, `max_concurrency` 10, `max_instances` 4 (per service, 0 = node default), `rps` 50, `invocations_per_day` 100,000, `storage_mb` 100, `egress_mb_per_day` 1,000, `max_schedules` 3, `min_schedule_seconds` 60, `max_queue_depth` 10,000, `builds_per_hour` 20, `allowed_triggers` `http interval queue call websocket pubsub stream` (no `cron`), `limits_max` wall 30 s / CPU 1 s / 128 MB / `min_run_time_ms` 60 s, `custom_host_suffixes` none, `allow_cross_tenant_calls` false, `max_sockets` 1,000 (open sockets of the tenant; 0 = only the node cap), `max_sockets_per_object` 1,000, `ws_max_message_bytes` 1 MiB, `max_async_pending` 10,000 (pending async invocations per service), `max_topics` 10, `max_topic_partitions` 4, `max_stream_mb` 100 (record bytes across the tenant's topics; not part of `storage_mb`), `max_stream_retention_hours` 72.
+
+The built-in `system` plan (the node's own tenant) uses `limits_max.min_run_time_ms` 600,000, `max_async_pending` 100,000, `max_topics` 1,000, `max_topic_partitions` 16, `max_stream_mb` 10,240 and `max_stream_retention_hours` 720. `limits_max.min_run_time_ms` is the largest `scaling.min_run_time_ms` a service of the plan may set; the node's `sched.min_run_time_max_ms` caps it too (the lower value wins).
 
 ## Example
 

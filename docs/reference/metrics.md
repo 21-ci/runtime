@@ -147,6 +147,29 @@ Only `tier="t1"` is populated for entries, bytes, hits and misses; the `t2` seri
 | `rt_schedule_denied_total` | counter | | Fires dropped because the tenant's plan no longer allows `interval` or `cron` |
 | `rt_queue_depth` | gauge | | Ready messages across all services that consume a queue, refreshed every 30 s |
 | `rt_queue_dlq_total` | counter | | Messages moved to a dead-letter queue |
+| `rt_queue_throttled_total` | counter | | Queue tasks given back to admission (throttled), not counted as attempts |
+| `rt_pubsub_published_total` | counter | | Pub/sub publishes accepted |
+| `rt_pubsub_delivered_total` | counter | | Pub/sub deliveries started |
+| `rt_pubsub_dropped_total` | counter | `reason` = `fanout`, `rejected`, `no_task`, `quota`, `backlog` | Pub/sub deliveries not made: over the fan-out cap, refused by admission, no task, over the tenant quota, or the subscriber's in-flight cap |
+| `rt_stream_appended_total` | counter | | Stream records appended |
+| `rt_stream_delivered_total` | counter | | Stream records handed to consumer handlers |
+| `rt_stream_dlq_total` | counter | | Stream records moved to a consumer's dead letters |
+| `rt_stream_trimmed_total` | counter | | Stream records removed by retention or a size cap |
+| `rt_stream_skipped_total` | counter | `reason` = `exhausted`, `out_of_range` | Stream records skipped by the consumer (no attempts left, or the offset is out of range) |
+| `rt_async_accepted_total` | counter | | Async invocations accepted (`202`) |
+| `rt_async_throttled_total` | counter | | Async attempts given back to admission, not counted as attempts |
+| `rt_async_finished_total` | counter | `condition` = `success`, `retries_exhausted`, `event_age_exceeded` | Async invocations that reached a final state |
+| `rt_async_failed_evicted_total` | counter | | Failed async records removed to keep the 1,000-per-service cap |
+
+Metrics for topics and invocations carry no topic, subject or service labels, so their cardinality is bounded.
+
+## Keep-alive and fair admission
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `rt_admission_wait_by_size_seconds` | histogram | `size` = `short` (predicted run under 50 ms), `medium` (under 1 s), `long` (1 s or more) | Admission wait of granted tasks, split by predicted run time. Short work should wait least; long work must not starve |
+| `rt_admission_aged_grants_total` | counter | | Waiting tasks granted at or after their deadline (aging in effect) |
+| `rt_instance_keepalive_total` | counter | `kind` = `deno`, `wasm`; `outcome` = `kept`, `handoff`, `disposed`, `reused`, `expired`, `shed` | Keep-alive decisions after a task answered: an instance kept for the next task (`kept`), handed to a queued task (`handoff`), released (`disposed`), reused (`reused`), expired by its idle timer (`expired`), or shed under memory pressure (`shed`) |
 
 ## Logs
 

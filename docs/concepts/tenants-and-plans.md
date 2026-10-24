@@ -188,8 +188,13 @@ sees its own plan, with overrides applied, in `GET /v1/me` (`21ci whoami --json`
 | `max_queue_depth` | 10,000 | Messages waiting in one service's queue |
 | `builds_per_hour` | 20 | Version uploads per tenant per hour |
 | `max_pinned_mb` | 0 | Memory a tenant may pin resident (`scaling.keep_resident`). Accepted, but pinning is not wired up in this release <span class="rt-badge rt-badge--planned">planned</span> |
-| `allowed_triggers` | `http`, `interval`, `queue`, `call` | Trigger kinds the tenant may use (no `cron` on `free`) |
-| `limits_max` | `wall_ms` 30,000, `cpu_ms` 1,000, `memory_mb` 128 | Highest per-task limits a service may set |
+| `max_async_pending` | 10,000 | Pending async invocations per service (`429 async_backlog_full` above it) |
+| `max_topics` | 10 | Stream topics per tenant |
+| `max_topic_partitions` | 4 | Partitions of one topic |
+| `max_stream_mb` | 100 | Record bytes across the tenant's topics, dead letters included. Separate from `storage_mb` |
+| `max_stream_retention_hours` | 72 | Longest retention a topic may set (default 24 h) |
+| `allowed_triggers` | `http`, `interval`, `queue`, `call`, `websocket`, `pubsub`, `stream` | Trigger kinds the tenant may use (no `cron` on `free`) |
+| `limits_max` | `wall_ms` 30,000, `cpu_ms` 1,000, `memory_mb` 128, `min_run_time_ms` 60,000 | Highest per-task limits a service may set. `min_run_time_ms` is the largest keep-alive (`scaling.min_run_time_ms`) |
 | `custom_host_suffixes` | none | Domains under which tenants may claim custom hosts |
 | `allow_cross_tenant_calls` | `false` | Whether this tenant's services may call other tenants' services |
 | `blocking_share` | 0.25 | Share of the blocking pool (SQLite, file I/O) one tenant may hold under contention |
@@ -271,6 +276,9 @@ means scheduled and queue tasks get 30 s / 1 s rather than their 300 s / 10 s de
 | `interval`, `cron` | Creating or updating such a schedule is `403 trigger_not_allowed`; fires of existing ones are dropped |
 | `queue` | Enqueueing is refused (`403 trigger_not_allowed`, or `trigger_not_allowed` in guest code); messages already queued wait without using delivery attempts |
 | `call` | `call()` to the tenant's services fails with `trigger_not_allowed` and starts no task |
+| `pubsub` | Services with `events.subscribe` get no pub/sub deliveries; `events.subscribe` on a service is refused (`403 trigger_not_allowed`) |
+| `stream` | Services with `events.consume` stop consuming; their topics keep their records |
+| `websocket` | Upgrades are refused with `403 trigger_not_allowed` |
 
 The service owner has the same switches per service in the `triggers` block; both must allow a trigger. See
 [Triggers](triggers.md#turning-triggers-on-and-off).
