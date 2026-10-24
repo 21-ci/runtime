@@ -1,0 +1,31 @@
+[package]
+name = "rt-types"
+description = "Shared IDs, task/outcome types, limits, reason codes and the ControlPlane trait (L0)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+semver.workspace = true
+bytes.workspace = true
+http.workspace = true
+async-trait.workspace = true
+zeroize.workspace = true
+futures-util.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+sha2.workspace = true
+hex.workspace = true

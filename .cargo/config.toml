@@ -1,0 +1,22 @@
+# One shared target dir (runtime/target) for every crate and every agent.
+# Disk is tight: V8 + wasmtime are big, so never create extra target dirs.
+
+[alias]
+# `cargo lint` == what `make lint` runs.
+lint = "clippy --workspace --all-targets -- -D warnings"
+check-all = "check --workspace --all-targets"
+# Run the rt-sched lock-free queue tests under loom:
+#   RUSTFLAGS="--cfg loom" cargo test -p rt-sched --release --test loom
+
+[term]
+color = "auto"
+
+[net]
+retry = 3
+
+[env]
+# Rust backtraces help in the many `todo!()` bodies of the scaffold.
+RUST_BACKTRACE = { value = "1", force = false }
+
+[build]
+incremental = false

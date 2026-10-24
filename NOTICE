@@ -1,0 +1,10 @@
+21 Cloud Functions Runtime
+Copyright 2026 The 21 Cloud Runtime Authors
+
+This product includes software developed by the 21 Cloud Runtime Authors
+(https://github.com/21-ci/runtime), licensed under the Apache License,
+Version 2.0 (see LICENSE).
+
+Release binaries and container images statically link third-party crates,
+among them V8 (via rusty_v8 / deno_core), wasmtime and SQLite. Their licenses
+are listed in the SBOM attached to every GitHub Release (SPDX JSON).
