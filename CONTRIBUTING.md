@@ -80,6 +80,14 @@ make coverage MODULES=sched ARGS=--missing     # one module, uncovered line rang
 scripts/coverage.sh --fail-under 90 --floor tools=45 --exclusions    # what CI runs: fails a module below 90 %, prints every exclusion
 ```
 
+Run what CI runs before you push (same commands as the workflows; tools: `brew install cargo-deny cargo-audit
+gitleaks semgrep zizmor actionlint shellcheck hadolint trivy grype`):
+
+```bash
+make ci-fast     # fmt, clippy, cargo-deny/audit, gitleaks, semgrep, zizmor, actionlint, shellcheck, hadolint, trivy, docs
+make ci-local    # the above plus every test under coverage and the sample smokes (STAGES="test smokes" for a subset)
+```
+
 The report is `target/coverage/lcov.info` (plus `--html`). CI uploads it to Codecov.
 
 ## Commit style

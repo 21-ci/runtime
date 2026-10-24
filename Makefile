@@ -11,7 +11,7 @@ DATA_DIR  ?= data
 IMAGE     ?= rt:dev
 CONTAINER ?= rt-dev
 
-.PHONY: help build release cli cli-install check lint fmt test test-perf coverage fixtures run dev \
+.PHONY: help build release cli cli-install check lint fmt test test-perf coverage ci-local ci-fast fixtures run dev \
         docker-build docker-run docker-stop docker-logs e2e bench openapi docs docs-venv docs-build docs-serve docs-preview \
         docs-check clean-data
 
@@ -32,6 +32,8 @@ help:
 	@echo "                     fast variant: scripts/test.sh --fast"
 	@echo "  make test-perf     the perf-ignored tests in release mode (scripts/test.sh --perf-only)"
 	@echo "  make coverage      tests under coverage + lcov report (MODULES=\"sched store\" ARGS=\"--html --missing\")"
+	@echo "  make ci-fast       before a push: fmt, clippy, every security scanner, docs (a few minutes)"
+	@echo "  make ci-local      the whole CI locally: + all tests under coverage and the sample smokes (STAGES=\"...\")"
 	@echo "  make fixtures      build fixtures/wasm/out/*.wasm (scripts/build-fixtures.sh)"
 	@echo "  make e2e           docker build + compose up + tests/e2e/run_all.sh + down (scripts/e2e.sh)"
 	@echo "  make bench         list the PRF load scenarios; run one: scripts/bench.sh prf-01 (needs oha)"
@@ -94,6 +96,12 @@ test-perf:
 
 coverage:
 	scripts/coverage.sh $(MODULES) $(ARGS)
+
+ci-local:
+	scripts/ci-local.sh $(STAGES)
+
+ci-fast:
+	scripts/ci-local.sh --fast
 
 fixtures:
 	scripts/build-fixtures.sh

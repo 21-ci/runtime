@@ -52,6 +52,7 @@ Python 3 for `tools/`, Docker + `curl` + `jq` for e2e.
 | `scripts/test.sh --fast -- -p rt-store` | one crate; extra args go to `cargo test` |
 | `cargo test -p rt-store --test it kv_cas::` | one module of a crate's integration-test binary |
 | `make coverage` | `scripts/coverage.sh [MODULE...]`: tests under `cargo-llvm-cov`, per-module table, `target/coverage/lcov.info` (`MODULES="sched store" ARGS="--html --missing"`) |
+| `make ci-fast` / `make ci-local` | `scripts/ci-local.sh`: the CI checks locally (lint + security scanners + docs; `ci-local` adds all tests under coverage and the smokes) |
 | `make test-perf` | `#[ignore = "perf"]` benchmarks, release mode |
 | `make e2e` | docker build + compose + `tests/e2e/run_all.sh` + teardown |
 | `make openapi` | regenerate `openapi/openapi.json`; `scripts/openapi.sh --check` fails on drift |
