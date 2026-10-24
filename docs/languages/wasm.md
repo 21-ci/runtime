@@ -69,6 +69,21 @@ flowchart LR
 - **Limits.** Linear memory is capped by `limits.memory_mb` (128 MB by default), CPU time by `limits.cpu_ms` (1,000 ms
   for HTTP), wall time by `limits.wall_ms`. See [Limits and quotas](../reference/limits.md).
 
+### Events: pub/sub, streams and async invocations
+
+The interfaces `std:host/pubsub` and `std:host/streams` are linked like the others; import them only if the component
+calls them. Subscribers and consumers need no export: the node sends a JSON `POST` to the component's `wasi:http`
+handler and reads the answer.
+
+| Task | Request the component receives | Answer |
+|---|---|---|
+| Pub/sub message (`pubsub`) | `POST /__rt/pubsub`, `x-rt-trigger: pubsub`, body = the message JSON | the 2xx body is the reply to a `request`; non-2xx fails the requester with `responder_failed` |
+| Stream batch (`stream`) | `POST /__rt/stream`, `x-rt-trigger: stream`, body `{topic, group, partition, attempt, messages}` | 2xx commits the batch; `x-rt-stream-fail-at: <offset>` commits the records before that offset and redelivers from it; non-2xx fails the whole batch |
+| Async HTTP invocation | the normal request, with `x-rt-invocation-id` and `x-rt-invocation-attempt` | the status decides: `5xx` and `429` retry, other statuses finish (see [Guest code reference](../handlers.md#async-invocation)) |
+
+Async invocations are off unless the service sets `async.enabled`. A component can read the attempt from the
+`x-rt-invocation-attempt` header; the response body is discarded.
+
 ### What the guest sees
 
 | Aspect | Value |

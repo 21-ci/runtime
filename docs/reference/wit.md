@@ -20,6 +20,8 @@ counterparts are in the [guest API reference](guest-api.md#wasm-equivalents).
 | [`sql`](#sql) | `execute`, `batch` | per-service SQLite database |
 | [`blob`](#blob) | `get`, `head`, `put`, `delete`, `list` | per-service object storage |
 | [`queue`](#queue) | `enqueue` | send a message to a service's queue |
+| [`pubsub`](#pubsub) | `publish`, `request` | in-memory publish/subscribe and request/reply within the namespace |
+| [`streams`](#streams) | `append`, `read`, `info` | durable, partitioned topics with replay (consumers get `POST /__rt/stream`) |
 | [`call`](#call) | `call`, `call-rpc` | call another service in-process; typed RPC |
 | [`sdk`](#sdk) | `invoke` | call an operator SDK (it runs in the runtime) |
 | [`rpc`](#rpc-export) (export) | `handle` | serve RPC calls (world `rpc-service`) |
@@ -178,6 +180,70 @@ is empty, its environment) must admit the caller.
 | `call_failed` | the message was refused (over 1 MB, delay over 7 days) or could not be stored |
 
 For `queue` errors, `message` repeats the code.
+
+## `pubsub`
+
+| Type | Definition |
+|---|---|
+| `headers` | `list<tuple<string, string>>`: names `[a-z0-9][a-z0-9-]{0,63}`, not starting with `x-rt-`; at most 32, 16 KiB in total |
+| `reply` | `{ content-type: option<string>, body: list<u8> }` |
+| `publish-result` | `{ receivers: u32, dropped: u32 }` |
+
+`publish(subject, body, headers) -> result<publish-result, error>` publishes `body` (at most 1 MB) on a subject in the
+caller's namespace. `receivers` counts the deliveries handed to the scheduler, `dropped` the ones refused (fan-out
+over 100, the subscriber's 64 in-flight cap, quota, admission). Subjects are concrete: no wildcards, not starting with
+`_rt`.
+
+`request(subject, body, headers, timeout-ms) -> result<reply, error>` asks one subscriber and waits for its answer.
+`timeout-ms` defaults to 5000, at most 30000, and never runs past the task deadline.
+
+A subscriber is not linked as an export: the node sends `POST /__rt/pubsub` (`x-rt-trigger: pubsub`, JSON body with
+`id`, `subject`, `body`, `headers`, `replyable`, `publishedAt`). The 2xx body is the reply; a non-2xx status makes a
+`request` fail with `responder_failed`.
+
+| Code | Call | When |
+|---|---|---|
+| `validation_failed` | both | bad subject, wildcard, `_rt` subject, bad header or option |
+| `too_large` | both | body over 1 MB, headers over 32 or 16 KiB, reply over 1 MB |
+| `unavailable` | both | outside a task, or the node runs without the event bus |
+| `call_depth` | both | called from a task already 15 hops deep |
+| `rate_limited` / `quota_exceeded` | both | the tenant's rate bucket or daily invocations |
+| `no_responders` | `request` | nothing subscribes to a matching subject |
+| `timeout` | `request` | no reply in time |
+| `responder_failed` | `request` | the responder failed, returned non-2xx, or was killed |
+| `overloaded` / `queue_timeout` / `shed` / `memory` / `draining` | `request` | the responder's task was refused |
+
+## `streams`
+
+| Type | Definition |
+|---|---|
+| `new-entry` | `{ body: list<u8>, key: option<string>, headers, dedup-id: option<string> }` |
+| `appended` | `{ partition: u32, offset: u64, duplicate: bool }` |
+| `entry` | `{ partition: u32, offset: u64, key: option<string>, headers, body: list<u8>, timestamp-ms: s64 }` |
+| `position` | `earliest` \| `latest` \| `offset(u64)` \| `time-ms(s64)` |
+| `read-options` | `{ partition: u32, start: position, limit: u32 }` (`limit` 1 to 100) |
+| `page` | `{ entries: list<entry>, next: u64, end: u64 }` |
+| `topic-info` | `{ name, partitions: list<{ partition, first, next }>, retention-hours: u32, max-mb: u64, bytes: u64 }` |
+
+`append(topic, entries) -> result<list<appended>, error>` writes 1 to 100 entries (4 MiB in total) in one transaction,
+all or nothing. An entry's `key` picks its partition (the same key always lands in the same one); `dedup-id` within
+2 minutes returns the original position with `duplicate: true`. Each call takes one tenant rate token.
+
+`read(topic, opts) -> result<page, error>` replays a partition from `start`. `partition` is always passed in WIT, so
+only an out-of-range partition is an error there. `info(topic) -> result<topic-info, error>` describes the topic.
+
+A consumer is not an export: the node sends `POST /__rt/stream` (`x-rt-trigger: stream`, JSON body `{topic, group,
+partition, attempt, messages}`). A 2xx commits the batch; a `x-rt-stream-fail-at: <offset>` header (one of the delivered
+offsets) commits the records before it and redelivers from it. A non-2xx status fails the whole batch.
+
+| Code | Call | When |
+|---|---|---|
+| `validation_failed` | all | bad topic, key, dedup id, header or option; offset or partition out of range |
+| `too_large` | all | more than 100 entries or 4 MiB in one append, headers over the limits |
+| `unavailable` | all | outside a task, or the node runs without the event bus |
+| `not_found` | all | no topic of that name in the service's namespace |
+| `stream_full` | `append` | the tenant's streams hold its quota |
+| `rate_limited` / `quota_exceeded` | `append` | the tenant's rate bucket or daily invocations |
 
 ## `call`
 

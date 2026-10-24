@@ -37,8 +37,8 @@ against the 10 MB upload.
     }
     ```
 
-    Receives HTTP requests and calls. Schedule fires and queue batches arrive as synthetic `POST` requests to
-    `/__rt/scheduled` and `/__rt/queue`.
+    Receives HTTP requests and calls. Schedule fires, queue batches, pub/sub messages and stream batches arrive as
+    synthetic `POST` requests to `/__rt/scheduled`, `/__rt/queue`, `/__rt/pubsub` and `/__rt/stream`.
 
 === "Form B: an object"
 
@@ -47,6 +47,8 @@ against the 10 MB upload.
       async fetch(req: Request, ctx: Ctx): Promise<Response> { /* http, call */ },
       async scheduled(event: ScheduledEvent, ctx: Ctx): Promise<void> { /* interval, cron */ },
       async queue(batch: QueueBatch, ctx: Ctx): Promise<void> { /* queue */ },
+      async pubsub(msg: PubsubMessage, ctx: Ctx): Promise<unknown> { /* pubsub: the return value is the reply */ },
+      async stream(batch: StreamBatch, ctx: Ctx): Promise<void> { /* stream: a normal return commits the batch */ },
     };
     ```
 
