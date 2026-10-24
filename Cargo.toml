@@ -10,6 +10,7 @@ members = [
   "crates/rt-testkit",
   "crates/rt-store",
   "crates/rt-cache",
+  "crates/rt-host",
 ]
 
 [workspace.package]
