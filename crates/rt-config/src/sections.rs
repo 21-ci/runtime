@@ -153,6 +153,11 @@ section! {
         pub max_queued: u32,
         /// Node bound on the bytes held by queued tasks, in MB. 0 = auto (1/16 of the memory budget).
         pub max_queued_mb: u32,
+        /// Largest `scaling.min_run_time_ms` any service may set on this node (the plan may lower it).
+        pub min_run_time_max_ms: u64,
+        /// `k` in the admission deadline key `since + min(k * pred, queue_timeout / 2)`;
+        /// 0 = arrival order within a tenant.
+        pub aging_factor: u32,
         pub kinds: SchedKindsConfig,
         /// Profile knob (node): spin duration in microseconds before parking.
         pub spin_us: Option<u64>,
@@ -179,6 +184,8 @@ impl Default for SchedConfig {
             max_inflight: 10_000,
             max_queued: 0,
             max_queued_mb: 0,
+            min_run_time_max_ms: 600_000,
+            aging_factor: 4,
             kinds: SchedKindsConfig::default(),
             spin_us: None,
             time_slice: None,

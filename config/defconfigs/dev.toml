@@ -30,6 +30,8 @@ lrq_capacity = 64
 max_inflight = 100              # Very small for dev
 max_queued = 0                  # auto: 4 x max_inflight; over it 503 overloaded
 max_queued_mb = 0               # auto: 1/16 of the memory budget
+min_run_time_max_ms = 600000    # largest scaling.min_run_time_ms a service may set (10 min)
+aging_factor = 4                # admission deadline aging k (0 = arrival order within a tenant)
 spin_us = 0
 time_slice = "10ms"
 pin_threads = false

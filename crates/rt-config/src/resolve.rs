@@ -156,6 +156,10 @@ pub struct EffectiveService {
     /// `deno.reuse_isolates` (D-A4): the service's `config.deno` > node config > the service's
     /// profile.
     pub reuse_isolates: Resolved<bool>,
+    /// Keep-alive after the answer (`scaling.min_run_time_ms`): `None` = inherit the executor's
+    /// idle TTL; an explicit value is clamped to `min(plan.limits_max.min_run_time_ms,
+    /// sched.min_run_time_max_ms)` (source `plan`, conflict recorded).
+    pub min_run_time_ms: Resolved<Option<u64>>,
     /// Explicit values that exceeded the plan at runtime (plan wins; event `plan_conflict`).
     #[serde(skip)]
     pub plan_conflicts: Vec<PlanConflict>,
@@ -232,6 +236,22 @@ pub fn resolve_service(
         }
         _ => Resolved::new(0, Source::Default),
     };
+    let min_run_time_ms = match service.scaling.min_run_time_ms {
+        Some(v) => {
+            let max = plan.limits_max.min_run_time_ms.min(cfg.sched.min_run_time_max_ms);
+            if v > max {
+                conflicts.push(PlanConflict {
+                    field: "min_run_time_ms",
+                    explicit: v,
+                    plan_max: max,
+                });
+                Resolved::new(Some(max), Source::Plan)
+            } else {
+                Resolved::new(Some(v), Source::Service)
+            }
+        }
+        None => Resolved::new(None, Source::Default),
+    };
     let mut scaling = scale.scaling;
     scaling.start = scaling.start.min(max_instances.value).max(min_instances.value);
     scaling.min = scaling.min.min(scaling.start).max(min_instances.value);
@@ -307,6 +327,7 @@ pub fn resolve_service(
             Some(v) => Resolved::new(v, Source::Service),
             None => pick_knob_p(p, cfg.deno.reuse_isolates, sk.deno_reuse_isolates),
         },
+        min_run_time_ms,
         plan_conflicts: conflicts,
         trigger_defaults: TriggerDefaults {
             explicit_wall: service.limits.wall_ms.is_some(),
@@ -360,7 +381,7 @@ impl EffectiveService {
             idle_ttl: self.idle_ttl.value,
             preload: self.preload.value,
             compile: self.compile.value,
-            min_run_time: None,
+            min_run_time: self.min_run_time_ms.value.map(Duration::from_millis),
             scaling: self.scaling,
         }
     }

@@ -151,6 +151,22 @@
         "help": "Node bound on bytes held by queued tasks in MB (0=auto: 1/16 of the memory budget)",
         "profile_scoped": false
       },
+      "min_run_time_max_ms": {
+        "type": "int",
+        "default": 600000,
+        "min": 0,
+        "max": 86400000,
+        "help": "Largest scaling.min_run_time_ms any service may set on this node, ms (the plan may lower it)",
+        "profile_scoped": false
+      },
+      "aging_factor": {
+        "type": "int",
+        "default": 4,
+        "min": 0,
+        "max": 64,
+        "help": "Admission aging k in the deadline key since + min(k*pred, queue_timeout/2) (0 = arrival order within a tenant)",
+        "profile_scoped": false
+      },
       "spin_us": {
         "type": "int",
         "default": 10,
@@ -1219,7 +1235,9 @@
             "interval",
             "queue",
             "call",
-            "websocket"
+            "websocket",
+            "pubsub",
+            "stream"
           ],
           "help": "Trigger kinds the plan allows",
           "items": "enum",
@@ -1229,7 +1247,9 @@
             "cron",
             "queue",
             "call",
-            "websocket"
+            "websocket",
+            "pubsub",
+            "stream"
           ],
           "profile_scoped": false
         },
@@ -1291,6 +1311,42 @@
           "min": 1,
           "help": "Largest WebSocket message a client may send; a larger one closes the socket with 1009",
           "profile_scoped": false
+        },
+        "max_async_pending": {
+          "type": "int",
+          "default": 10000,
+          "min": 0,
+          "help": "Pending async invocations per service (more answer `429 async_backlog_full`)",
+          "profile_scoped": false
+        },
+        "max_topics": {
+          "type": "int",
+          "default": 10,
+          "min": 0,
+          "help": "Stream topics per tenant",
+          "profile_scoped": false
+        },
+        "max_topic_partitions": {
+          "type": "int",
+          "default": 4,
+          "min": 1,
+          "max": 16,
+          "help": "Partitions of one topic (1..=16)",
+          "profile_scoped": false
+        },
+        "max_stream_mb": {
+          "type": "int",
+          "default": 100,
+          "min": 0,
+          "help": "Stream record bytes across the tenant's topics, in MB (not part of storage_mb)",
+          "profile_scoped": false
+        },
+        "max_stream_retention_hours": {
+          "type": "int",
+          "default": 72,
+          "min": 0,
+          "help": "Longest retention a topic may set, in hours",
+          "profile_scoped": false
         }
       },
       "tables": {
@@ -1316,6 +1372,13 @@
               "default": 128,
               "min": 0,
               "help": "Memory limit, MB",
+              "profile_scoped": false
+            },
+            "min_run_time_ms": {
+              "type": "int",
+              "default": 60000,
+              "min": 0,
+              "help": "Largest scaling.min_run_time_ms a service may set, ms",
               "profile_scoped": false
             }
           }

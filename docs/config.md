@@ -188,6 +188,10 @@ max_queued = 0                  # Node bound on waiting tasks; over it 503 overl
                                  # 0 = auto (4 x max_inflight); one service may hold half
 max_queued_mb = 0               # Node bound on bytes held by waiting tasks (MB)
                                  # 0 = auto (1/16 of the memory budget)
+min_run_time_max_ms = 600000    # Largest scaling.min_run_time_ms any service may set (0..=86400000)
+                                 # The plan's limits_max.min_run_time_ms may lower it
+aging_factor = 4                # Admission aging k (0..=64): deadline = since + min(k*pred, queue_timeout/2)
+                                 # 0 = arrival order within a tenant
 
 spin_us = 10                    # Processor spin time (μs) before sleep
                                  # Higher = lower latency but more CPU usage
@@ -470,7 +474,7 @@ Remaining sections keep the shape of the defconfigs; every key is listed in `con
 | `[build]` | `threads`, `memory_mb`, `timeout` (Deno build), `wasm_timeout`, `fetch_timeout` (per module), `npm_cdn`, `allowed_hosts`, `max_deps_mb`, `compile` |
 | `[queue]` | `batch_size`, `max_attempts`, `max_concurrency` (per-service concurrent queue tasks) |
 | `[sysmon]` `[rebalance]` `[io]` `[disk]` `[deploy]` `[s3]` `[supervisor]` `[secrets]` `[egress]` `[logs]` `[metrics]` `[otel]` | see the defconfigs |
-| `[plans.<name>]` | tenant plans (a `free` plan always exists), see [SECURITY.md](https://github.com/21-ci/runtime/blob/main/SECURITY.md#tenancy-plans-and-quotas) |
+| `[plans.<name>]` | tenant plans (a `free` plan always exists), see [SECURITY.md](https://github.com/21-ci/runtime/blob/main/SECURITY.md#tenancy-plans-and-quotas). Event keys: `max_async_pending` (pending async invocations per service, free 10000), `max_topics` (topics per tenant, free 10), `max_topic_partitions` (1..=16, free 4), `max_stream_mb` (stream record MB per tenant, free 100), `max_stream_retention_hours` (free 72); `limits_max.min_run_time_ms` (largest `scaling.min_run_time_ms`, free 60000; the effective cap is the lower of it and `sched.min_run_time_max_ms`). `allowed_triggers` values: `http`, `interval`, `cron`, `queue`, `call`, `websocket`, `pubsub`, `stream` (free default: all but `cron`) |
 | `[[binding]]` | operator platform bindings (reachable from operator SDK services only). Operator SDKs are not configured here: `21ci sdk publish`; a leftover `[[sdk]]` fails to load |
 
 `scaling` is **not** in this list: it is a per-service block, not node configuration.
