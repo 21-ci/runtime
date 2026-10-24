@@ -11,6 +11,12 @@ fn at_least(p: &mut Vec<String>, key: &str, v: u64, min: u64) {
     }
 }
 
+fn at_most(p: &mut Vec<String>, key: &str, v: u64, max: u64) {
+    if v > max {
+        p.push(format!("{key} must be <= {max} (got {v})"));
+    }
+}
+
 fn fraction(p: &mut Vec<String>, key: &str, v: f64) {
     if !(0.0..=1.0).contains(&v) {
         p.push(format!("{key} must be within 0.0..=1.0 (got {v})"));
@@ -83,6 +89,8 @@ pub(crate) fn problems(cfg: &Config) -> Vec<String> {
     at_least(&mut p, "sched.lrq_capacity", u64::from(s.lrq_capacity), 1);
     // One run slot stays reserved for nested service calls (ADM-003): at least 2 (CFG-005).
     at_least(&mut p, "sched.max_inflight", u64::from(s.max_inflight), 2);
+    at_most(&mut p, "sched.min_run_time_max_ms", s.min_run_time_max_ms, 86_400_000);
+    at_most(&mut p, "sched.aging_factor", u64::from(s.aging_factor), 64);
     if let Some(share) = s.warm_share {
         fraction(&mut p, "sched.warm_share", share);
     }
@@ -261,6 +269,14 @@ pub(crate) fn problems(cfg: &Config) -> Vec<String> {
             &format!("plans.{name}.limits_max.memory_mb"),
             u64::from(plan.limits_max.memory_mb),
             1,
+        );
+        let parts = format!("plans.{name}.max_topic_partitions");
+        at_least(&mut p, &parts, u64::from(plan.max_topic_partitions), 1);
+        at_most(
+            &mut p,
+            &parts,
+            u64::from(plan.max_topic_partitions),
+            u64::from(rt_types::events::PARTITIONS_HARD_MAX),
         );
     }
     for (i, b) in cfg.binding.iter().enumerate() {

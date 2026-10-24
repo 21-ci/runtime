@@ -663,6 +663,7 @@ fn plan_with(wall_ms: u64, cpu_ms: u64, memory_mb: u32) -> Plan {
             wall_ms,
             cpu_ms,
             memory_mb,
+            ..PlanLimitsMax::default()
         },
         ..Plan::default()
     }
@@ -753,6 +754,7 @@ fn effective_values_become_task_limits_and_service_knobs() {
             min_instances: Some(2),
             max_queued: Some(16),
             keep_resident: Some(true),
+            min_run_time_ms: Some(250),
         },
         ..Default::default()
     };
@@ -772,6 +774,77 @@ fn effective_values_become_task_limits_and_service_knobs() {
     assert_eq!(knobs.idle_ttl, s(3600));
     assert!(knobs.preload && knobs.reuse_instances && knobs.reuse_isolates);
     assert_eq!(knobs.compile, CompileMode::Eager);
+    assert_eq!(knobs.min_run_time, Some(ms(250)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// min_run_time (keep-alive after the answer)
+// ---------------------------------------------------------------------------------------------
+
+fn with_min_run_time(v: Option<u64>) -> ServiceConfig {
+    ServiceConfig {
+        scaling: ScalingConfig {
+            min_run_time_ms: v,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Unset `scaling.min_run_time_ms` inherits: value `None`, source `default`, no conflict, and
+/// the knob stays `None` (the executor keeps its idle TTL).
+#[test]
+fn mrt_cfg_01_unset_min_run_time_inherits() {
+    let plan = Plan::default();
+    let eff = Config::default().service_effective(None, &with_min_run_time(None), &plan);
+    assert_resolved("min_run_time_ms", eff.min_run_time_ms, None, Source::Default);
+    assert!(eff.plan_conflicts.is_empty());
+    assert_eq!(eff.knobs(&plan).min_run_time, None);
+    let v = serde_json::to_value(&eff).unwrap();
+    assert_eq!(
+        v["min_run_time_ms"],
+        serde_json::json!({"value": null, "source": "default"})
+    );
+}
+
+/// An explicit value within the bounds (including 0 and the maximum itself) is the service's.
+#[test]
+fn mrt_cfg_02_explicit_min_run_time_is_the_service_value() {
+    let plan = Plan::default();
+    for v in [0, 1_500, plan.limits_max.min_run_time_ms] {
+        let eff = Config::default().service_effective(None, &with_min_run_time(Some(v)), &plan);
+        assert_resolved("min_run_time_ms", eff.min_run_time_ms, Some(v), Source::Service);
+        assert!(eff.plan_conflicts.is_empty(), "{v}: {:?}", eff.plan_conflicts);
+    }
+}
+
+/// Over `min(plan.limits_max.min_run_time_ms, sched.min_run_time_max_ms)` the value is clamped
+/// (source `plan`) and a `min_run_time_ms` conflict is recorded; the lower of the two wins.
+#[test]
+fn mrt_cfg_03_min_run_time_over_the_plan_or_node_max_is_clamped_and_recorded() {
+    // the plan is the lower bound
+    let plan = Plan::default(); // 60 s
+    let eff = Config::default().service_effective(None, &with_min_run_time(Some(90_000)), &plan);
+    assert_resolved("min_run_time_ms", eff.min_run_time_ms, Some(60_000), Source::Plan);
+    let c = &eff.plan_conflicts[0];
+    assert_eq!((c.field, c.explicit, c.plan_max), ("min_run_time_ms", 90_000, 60_000));
+    // the node is the lower bound
+    let mut cfg = Config::default();
+    cfg.sched.min_run_time_max_ms = 5_000;
+    let eff = cfg.service_effective(None, &with_min_run_time(Some(10_000)), &plan);
+    assert_resolved("min_run_time_ms", eff.min_run_time_ms, Some(5_000), Source::Plan);
+    assert_eq!(eff.plan_conflicts.len(), 1);
+    assert_eq!(eff.plan_conflicts[0].plan_max, 5_000);
+}
+
+/// `knobs()` carries the resolved value as a `Duration` (0 stays `Some(0)`, not inherit).
+#[test]
+fn mrt_cfg_04_knobs_carry_min_run_time() {
+    let plan = Plan::default();
+    let eff = Config::default().service_effective(None, &with_min_run_time(Some(0)), &plan);
+    assert_eq!(eff.knobs(&plan).min_run_time, Some(Duration::ZERO));
+    let eff = Config::default().service_effective(None, &with_min_run_time(Some(90_000)), &plan);
+    assert_eq!(eff.knobs(&plan).min_run_time, Some(ms(60_000)), "the clamped value");
 }
 
 #[test]
@@ -864,6 +937,7 @@ fn effective_block_serializes_every_value_with_its_source_and_hides_conflicts() 
         "compile",
         "reuse_instances",
         "reuse_isolates",
+        "min_run_time_ms",
     ] {
         assert!(v[key]["source"].is_string(), "effective.{key}.source missing in {v}");
         assert!(v[key].get("value").is_some(), "effective.{key}.value missing in {v}");
