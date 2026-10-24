@@ -11,6 +11,7 @@ members = [
   "crates/rt-store",
   "crates/rt-cache",
   "crates/rt-host",
+  "crates/rt-build",
 ]
 
 [workspace.package]
