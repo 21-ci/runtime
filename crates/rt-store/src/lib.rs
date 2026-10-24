@@ -4,6 +4,7 @@
 //!   schedules, usage, events, cache frequencies (rusqlite, bundled SQLite, WAL);
 //! - [`ArtifactStore`] — content-addressed source/bundle/wasm artifacts (local; S3 = stretch);
 //! - [`QueueStore`] — `queue.db`, durable at-least-once queue + DLQ;
+//! - [`StreamStore`] — `streams.db`, partitioned topic logs with consumer cursors and dead letters;
 //! - [`ServiceDataStore`] — per-service `data.db` (KV + SQL with authorizer) and blobs.
 //!
 //! No other crate writes SQL against these databases.
@@ -18,6 +19,7 @@ pub mod faults;
 pub mod meta;
 pub mod queue;
 mod sqlutil;
+pub mod stream;
 pub mod sync_sql;
 
 pub use artifact::{ArtifactStore, LocalArtifactStore, ARTIFACT_GRACE};
@@ -41,3 +43,7 @@ pub use queue::{
     DlqEntry, Leased, NewMessage, QueueStats, QueueStore, RetryResult, SqliteQueueStore, MIGRATIONS as QUEUE_MIGRATIONS,
 };
 pub use sync_sql::{LocalDb, LocalError, LocalSqlSource, RowRef, RunStats, SqlRef, StmtInfo, TxMode};
+pub use stream::{
+    Appended, Cursor, CursorKey, DeadRecord, NewRecord, PartitionHead, ReadFrom, SqliteStreamStore, StreamStore, Topic,
+    TopicSpec, TrimStats, STREAM_MIGRATIONS,
+};
