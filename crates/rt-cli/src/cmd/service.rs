@@ -22,8 +22,8 @@ pub fn runtime_str(r: RuntimeArg) -> &'static str {
 }
 
 /// Blocks `--set` / `--unset` may touch (`call` has its own flags).
-const BLOCKS: [&str; 8] = [
-    "limits", "scaling", "triggers", "ingress", "egress", "deno", "wasm", "ws",
+const BLOCKS: [&str; 10] = [
+    "limits", "scaling", "triggers", "ingress", "egress", "deno", "wasm", "ws", "events", "async",
 ];
 
 /// One `--set` / `--unset` edit: `block`, the path inside it, the value (`None` = remove).
@@ -111,11 +111,12 @@ fn apply(base: Option<&Value>, edits: &[&Edit]) -> Value {
     root
 }
 
-/// The `--min-instances` / `--max-instances` flags.
+/// The `--min-instances` / `--max-instances` / `--min-run-time` flags.
 #[derive(Clone, Copy, Debug, Default)]
 struct Instances {
     min: Option<u32>,
     max: Option<u32>,
+    min_run_time: Option<std::time::Duration>,
 }
 
 impl Instances {
@@ -149,6 +150,13 @@ fn edits(
                 value: Some(json!(v)),
             });
         }
+    }
+    if let Some(d) = instances.min_run_time {
+        out.push(Edit {
+            block: "scaling".into(),
+            path: vec!["min_run_time_ms".into()],
+            value: Some(json!(u64::try_from(d.as_millis()).unwrap_or(u64::MAX))),
+        });
     }
     if let Some(r) = reuse_isolates {
         out.push(Edit {
@@ -198,6 +206,7 @@ pub fn run(app: &App, cmd: &ServiceCmd) -> Result<()> {
             min_instances,
             max_instances,
             durable,
+            min_run_time,
             set,
             project,
         } => {
@@ -211,6 +220,7 @@ pub fn run(app: &App, cmd: &ServiceCmd) -> Result<()> {
             let instances = Instances {
                 min: *min_instances,
                 max: *max_instances,
+                min_run_time: *min_run_time,
             };
             let edits = edits(*reuse_isolates, *reuse_instances, instances, set, &[])?;
             let mut body = json!({"slug": slug, "runtime": runtime_str(*runtime)});
@@ -248,6 +258,7 @@ pub fn run(app: &App, cmd: &ServiceCmd) -> Result<()> {
             min_instances,
             max_instances,
             durable,
+            min_run_time,
             set,
             unset,
         } => {
@@ -256,6 +267,7 @@ pub fn run(app: &App, cmd: &ServiceCmd) -> Result<()> {
             let instances = Instances {
                 min: *min_instances,
                 max: *max_instances,
+                min_run_time: *min_run_time,
             };
             let edits = edits(*reuse_isolates, *reuse_instances, instances, set, unset)?;
             let mut body = json!({});
@@ -279,7 +291,7 @@ pub fn run(app: &App, cmd: &ServiceCmd) -> Result<()> {
                 return Err(CliError::usage(
                     "nothing to change: give --name, --profile, --access, --env, --allowed-caller, \
                      --no-allowed-callers, --reuse-isolates, --reuse-instances, --min-instances, \
-                     --max-instances, --durable, --set or --unset",
+                     --max-instances, --min-run-time, --durable, --set or --unset",
                 ));
             }
             let c = app.client()?;
@@ -452,6 +464,26 @@ fn instances(s: &Value) -> Option<String> {
     ))
 }
 
+/// `scaling.min_run_time_ms` in words: the effective value and its source when the server sends
+/// one, else the service's own setting.
+fn keep_alive(s: &Value) -> String {
+    let (value, source) = match s.pointer("/effective/min_run_time_ms") {
+        Some(e) if e.is_object() => (
+            e.get("value").and_then(Value::as_u64),
+            e.get("source").and_then(Value::as_str).unwrap_or("service").to_string(),
+        ),
+        _ => (
+            s.pointer("/scaling/min_run_time_ms").and_then(Value::as_u64),
+            "service".to_string(),
+        ),
+    };
+    match value {
+        None => "inherit (node idle TTL)".into(),
+        Some(0) => "0 ms (disposed after the answer unless work waits)".into(),
+        Some(n) => format!("{n} ms ({source})"),
+    }
+}
+
 /// The triggers that are off; `all on` when none is.
 fn triggers(s: &Value) -> String {
     let off: Vec<&str> = s
@@ -494,8 +526,14 @@ fn show(app: &App, s: &Value) {
     if let Some(instances) = instances(s) {
         rows.push(("Instances", instances));
     }
+    rows.push(("Keep-alive", keep_alive(s)));
     rows.push(("Triggers", triggers(s)));
-    for (label, key) in [("Ingress", "ingress"), ("Egress", "egress")] {
+    for (label, key) in [
+        ("Ingress", "ingress"),
+        ("Egress", "egress"),
+        ("Events", "events"),
+        ("Async", "async"),
+    ] {
         let p = fmt::pairs(s.get(key));
         if p != "-" {
             rows.push((label, p));

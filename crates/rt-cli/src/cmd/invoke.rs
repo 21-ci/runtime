@@ -9,7 +9,7 @@ use serde_json::{json, Map, Value};
 
 use super::{resolve, App};
 use crate::cli::InvokeArgs;
-use crate::client::{http_client, net_error, retry_after, rt_reason, send_retrying};
+use crate::client::{http_client, net_error, parse_api_error, retry_after, rt_reason, send_retrying};
 use crate::error::{human_secs, is_busy, CliError, Result, EXIT_BUSY, EXIT_FAILURE};
 use crate::fmt;
 
@@ -41,6 +41,52 @@ fn parse_header(h: &str) -> Result<(HeaderName, HeaderValue)> {
 /// Response headers worth showing: the runtime's `x-rt-*` plus a few standard ones.
 fn shown(name: &str) -> bool {
     name.starts_with("x-rt-") || matches!(name, "content-type" | "server-timing" | "retry-after")
+}
+
+/// `--async`: a `202` prints the invocation id (exit 0); a refusal (`403 async_not_allowed`,
+/// `409 idempotency_mismatch`, `413 too_large`, `429 async_backlog_full`, ...) is an error with
+/// its code. Any other answer (the preference was ignored and the request ran) prints as usual.
+fn async_outcome(
+    app: &App,
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    reason: Option<String>,
+    wait: Option<u64>,
+) -> Result<()> {
+    let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+    if status >= 400 {
+        let mut e = parse_api_error(status, None, &String::from_utf8_lossy(body));
+        if let CliError::Api { code, retry_after, .. } = &mut e {
+            *retry_after = wait;
+            if code.starts_with("http_") {
+                if let Some(r) = reason {
+                    *code = r;
+                }
+            }
+        } // LCOV_EXCL_LINE: parse_api_error always returns CliError::Api
+        return Err(e);
+    }
+    let doc: Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({}));
+    let id = doc
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| header("x-rt-invocation-id"))
+        .unwrap_or_default();
+    let replay = header("x-rt-idempotent-replay").as_deref() == Some("true");
+    if app.json {
+        let mut out = doc.as_object().cloned().unwrap_or_default();
+        out.insert("id".into(), json!(id));
+        out.insert("replay".into(), json!(replay));
+        fmt::print_json(&Value::Object(out));
+    } else {
+        fmt::emitln(&id);
+        if replay {
+            fmt::note("(idempotent replay: accepted before with this key)");
+        }
+    }
+    Ok(())
 }
 
 pub fn run(app: &App, a: &InvokeArgs) -> Result<()> {
@@ -89,6 +135,12 @@ pub fn run(app: &App, a: &InvokeArgs) -> Result<()> {
         }
         rb = rb.body(bytes);
     }
+    if a.async_ {
+        rb = rb.header("prefer", "respond-async");
+        if let Some(k) = &a.idempotency_key {
+            rb = rb.header("idempotency-key", k);
+        }
+    }
     let resp = send_retrying(rb, app.retry, &base)?;
     let status = resp.status();
     let reason = rt_reason(resp.headers());
@@ -109,6 +161,10 @@ pub fn run(app: &App, a: &InvokeArgs) -> Result<()> {
         .find(|(k, _)| k == "content-type")
         .map(|(_, v)| v.to_ascii_lowercase())
         .unwrap_or_default();
+
+    if a.async_ && (status.as_u16() == 202 || status.as_u16() >= 400) {
+        return async_outcome(app, status.as_u16(), &resp_headers, &body, reason, wait);
+    }
 
     if a.body_only {
         let mut out = std::io::stdout().lock();
