@@ -24,14 +24,18 @@ description: |-
 
 contents:
   - src: ${BIN_DIR}/21ci
+    expand: true  # nfpm expands ${VAR} in src/dst only when asked
     dst: /usr/bin/21ci
     file_info:
       mode: 0755
   - src: ${COMPLETIONS_DIR}/21ci.bash
+    expand: true  # nfpm expands ${VAR} in src/dst only when asked
     dst: /usr/share/bash-completion/completions/21ci
   - src: ${COMPLETIONS_DIR}/_21ci
+    expand: true  # nfpm expands ${VAR} in src/dst only when asked
     dst: /usr/share/zsh/site-functions/_21ci
   - src: ${COMPLETIONS_DIR}/21ci.fish
+    expand: true  # nfpm expands ${VAR} in src/dst only when asked
     dst: /usr/share/fish/vendor_completions.d/21ci.fish
   - src: LICENSE
     dst: /usr/share/doc/21ci/LICENSE

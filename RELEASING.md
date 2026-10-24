@@ -47,6 +47,14 @@ What `release.yml` does, in order (a failing step stops everything after it):
 
 ## Other kinds of release
 
+**Before a release that changes packaging** (`packaging/`, the nfpm files, the repository scripts), run the
+packaging test: it builds signed packages and the apt/rpm/apk repositories with throwaway keys and installs from
+them in Debian, Fedora and Alpine containers (needs Docker and nfpm):
+
+```bash
+scripts/test-packages.sh
+```
+
 **Release by hand** (no release-please PR, e.g. the very first release): the version in `Cargo.toml` must
 already match the tag.
 

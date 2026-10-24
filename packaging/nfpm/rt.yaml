@@ -26,6 +26,7 @@ description: |-
 
 contents:
   - src: ${BIN_DIR}/rt
+    expand: true  # nfpm expands ${VAR} in src/dst only when asked
     dst: /usr/bin/rt
     file_info:
       mode: 0755

@@ -49,7 +49,8 @@ done
 }
 
 for dir in "$out"/*/; do
-  createrepo_c --quiet --general-compress-type=zstd "$dir"
+  # gzip: readable by every dnf, yum and zypper, and supported by the createrepo-c Ubuntu ships (no zstd).
+  createrepo_c --quiet --general-compress-type=gz "$dir"
   if [ -n "${PKG_GPG_PASSPHRASE:-}" ]; then
     printf '%s' "$PKG_GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
       --local-user "$PKG_GPG_KEY_ID" --armor --detach-sign "$dir/repodata/repomd.xml"
@@ -66,6 +67,9 @@ enabled=1
 gpgcheck=1
 repo_gpgcheck=1
 gpgkey=${base_url%/rpm}/gpg.key
+# Fedora and EPEL have an unrelated package named rt (Request Tracker) at a higher version; without a priority
+# below their 99, dnf would install that one.
+priority=10
 EOF
 
 echo "rpm.sh: $found package(s) in $out"
