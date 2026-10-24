@@ -491,6 +491,15 @@ pub struct Req {
     pub object: Option<String>,
     /// A socket event or alarm instead of a request.
     pub event: Option<rt_types::SocketEvent>,
+    /// A delivery payload (pub/sub, stream batch) instead of the HTTP request.
+    pub payload: Option<Delivery>,
+}
+
+/// A delivery payload of [`Req::delivery`] (`Payload` itself is not `Clone`).
+#[derive(Clone, Debug)]
+pub enum Delivery {
+    Pubsub(rt_types::events::PubsubMessage),
+    Stream(rt_types::events::StreamBatch),
 }
 
 impl Req {
@@ -515,6 +524,17 @@ impl Req {
             caller: None,
             object: None,
             event: None,
+            payload: None,
+        }
+    }
+
+    /// A delivery task (`trigger` + `payload`, e.g. a pub/sub message or a stream batch), as
+    /// the event dispatcher hands it to the scheduler.
+    pub fn delivery(trigger: Trigger, payload: Delivery) -> Self {
+        Self {
+            trigger: Some(trigger),
+            payload: Some(payload),
+            ..Self::get("/")
         }
     }
 
@@ -729,6 +749,8 @@ pub struct Rig {
     pub calls: Arc<MockCalls>,
     pub control: Arc<StubControl>,
     deps: HostDeps,
+    pubsub: Option<Arc<dyn rt_host::PubsubBus>>,
+    streams: Option<Arc<dyn rt_host::StreamBus>>,
     _data_dir: TempDir,
 }
 
@@ -775,28 +797,56 @@ impl Rig {
             calls,
             control,
             deps,
+            pubsub: None,
+            streams: None,
             _data_dir: data_dir,
         }
+    }
+
+    /// Rebuild the executor over the current deps and event buses.
+    fn rebuild(&mut self) {
+        let mut services = HostServices::new(self.deps.clone());
+        if let Some(b) = &self.pubsub {
+            services = services.with_pubsub(b.clone());
+        }
+        if let Some(b) = &self.streams {
+            services = services.with_streams(b.clone());
+        }
+        self.exec = WasmExecutor::new(self.exec.engine().clone(), services);
+    }
+
+    /// The node's pub/sub router (`std:host/pubsub`; none by default): rebuilds the executor.
+    pub fn pubsub(mut self, bus: Arc<dyn rt_host::PubsubBus>) -> Self {
+        self.pubsub = Some(bus);
+        self.rebuild();
+        self
+    }
+
+    /// The node's stream log (`std:host/streams`; none by default): rebuilds the executor.
+    pub fn streams(mut self, bus: Arc<dyn rt_host::StreamBus>) -> Self {
+        self.streams = Some(bus);
+        self.rebuild();
+        self
     }
 
     /// Operator bindings (`std:host/platform`): rebuilds the executor with `platform`.
     pub fn platform(mut self, platform: Arc<dyn PlatformBindings>) -> Self {
         self.deps.platform = platform;
-        self.exec = WasmExecutor::new(self.exec.engine().clone(), HostServices::new(self.deps.clone()));
+        self.rebuild();
         self
     }
 
     /// The node's socket hub (`NoSockets` by default): rebuilds the executor.
     pub fn sockets(mut self, sockets: Arc<dyn rt_host::SocketHost>) -> Self {
         self.deps.sockets = sockets;
-        self.exec = WasmExecutor::new(self.exec.engine().clone(), HostServices::new(self.deps.clone()));
+        self.rebuild();
         self
     }
 
     /// A different egress guard (outbound WebSockets need a real one): rebuilds the executor.
     pub fn egress(mut self, egress: Arc<dyn rt_host::EgressGuard>) -> Self {
         self.deps.egress = egress;
-        self.exec = WasmExecutor::new(self.exec.engine().clone(), HostServices::new(self.deps.clone()));
+        self.rebuild();
         self
     }
 
@@ -884,6 +934,12 @@ impl Rig {
         }
         if let Some(ev) = &req.event {
             spec.payload = Payload::Socket(ev.clone());
+        }
+        if let Some(p) = &req.payload {
+            spec.payload = match p.clone() {
+                Delivery::Pubsub(m) => Payload::Pubsub(m),
+                Delivery::Stream(b) => Payload::Stream(b),
+            };
         }
         let reservation = self
             .governor

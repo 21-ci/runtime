@@ -48,7 +48,7 @@ pub mod wit {
 
 use wit::std::host::{blob, call, kv, lock, log, platform, queue, schedule, sdk, secrets, sql};
 
-/// Link `std:host/{log,kv,sql,blob,queue,call,platform,secrets}` into `linker`.
+/// Link every `std:host` import (`log`, `kv`, …, `pubsub`, `streams`) into `linker`.
 pub fn add_to_linker(linker: &mut Linker<WasmState>) -> wasmtime::Result<()> {
     log::add_to_linker::<WasmState, HasSelf<WasmState>>(linker, |s| s)?;
     kv::add_to_linker::<WasmState, HasSelf<WasmState>>(linker, |s| s)?;
@@ -64,6 +64,8 @@ pub fn add_to_linker(linker: &mut Linker<WasmState>) -> wasmtime::Result<()> {
     wit::std::host::sockets::add_to_linker::<WasmState, HasSelf<WasmState>>(linker, |s| s)?;
     wit::std::host::durable::add_to_linker::<WasmState, HasSelf<WasmState>>(linker, |s| s)?;
     wit::std::host::ws_client::add_to_linker::<WasmState, HasSelf<WasmState>>(linker, |s| s)?;
+    wit::std::host::pubsub::add_to_linker::<WasmState, HasSelf<WasmState>>(linker, |s| s)?;
+    wit::std::host::streams::add_to_linker::<WasmState, HasSelf<WasmState>>(linker, |s| s)?;
     Ok(())
 }
 
