@@ -21,6 +21,7 @@ use rt_store::{
     CpuMeter, DelayedEntry, DelayedStore, DurableListOptions, DurableValue, DurableWrite, NewDelayed, QueueStore,
     ServiceDataStore,
 };
+use rt_types::events::{REQUEST_TIMEOUT_DEFAULT_MS, REQUEST_TIMEOUT_MAX_MS};
 use rt_types::{
     ControlPlane, EgressRules, EnvBundle, Limits, MsgId, ObjectRef, SecretsVersion, ServiceId, SocketInfo, TaskId,
     TaskSpec, TenantId, TraceCtx, Trigger, UsageBatch, UsageDelta, VersionNo, WsData, DEFAULT_OBJECT, MAX_CALL_DEPTH,
@@ -30,6 +31,10 @@ use zeroize::Zeroizing;
 
 use crate::calls::{BindingError, CallError, Calls, EnqueueOpts, PlatformBindings, TaskCtx};
 use crate::egress::{EgressBudget, EgressError, EgressGuard, EgressPolicy, EgressUsage, Request, Response};
+use crate::events::{
+    check_append, check_info, check_publish, check_read, AppendEntry, AppendedOut, PublishOpts, PublishOut, PubsubBus,
+    ReadOpts, ReadPage, Reply, RequestOpts, StreamBus, TopicInfo,
+};
 use crate::facade::{BlobFacade, FacadeLimits, HostError, KvFacade, SqlFacade, StorageLeft};
 use crate::lock::{LockHold, LockTable};
 use crate::rpc::RpcError;
@@ -108,6 +113,10 @@ pub struct HostServices {
     deps: HostDeps,
     /// The node's `std:lock` table: every task of the node shares it.
     locks: Arc<LockTable>,
+    /// The node's pub/sub router (`std:pubsub`); `None`: every call is `unavailable`.
+    pubsub: Option<Arc<dyn PubsubBus>>,
+    /// The node's stream log (`std:stream`); `None`: every call is `unavailable`.
+    streams: Option<Arc<dyn StreamBus>>,
 }
 
 impl HostServices {
@@ -115,7 +124,21 @@ impl HostServices {
         Self {
             deps,
             locks: LockTable::new(),
+            pubsub: None,
+            streams: None,
         }
+    }
+
+    /// Attach the node's pub/sub router.
+    pub fn with_pubsub(mut self, bus: Arc<dyn PubsubBus>) -> Self {
+        self.pubsub = Some(bus);
+        self
+    }
+
+    /// Attach the node's stream log.
+    pub fn with_streams(mut self, bus: Arc<dyn StreamBus>) -> Self {
+        self.streams = Some(bus);
+        self
     }
 
     pub fn deps(&self) -> &HostDeps {
@@ -889,6 +912,94 @@ impl HostHandle {
             .list(i.ctx.service, after, limit)
             .await
             .map_err(|e| HostError::from_store(&e))
+    }
+
+    fn pubsub_bus(&self) -> Result<&Arc<dyn PubsubBus>, HostError> {
+        let i = &self.inner;
+        if i.detached {
+            return Err(HostError::new("unavailable", "pub/sub is only available inside a task"));
+        }
+        i.services
+            .pubsub
+            .as_ref()
+            .ok_or_else(|| HostError::new("unavailable", "this node runs without the event bus"))
+    }
+
+    fn stream_bus(&self) -> Result<&Arc<dyn StreamBus>, HostError> {
+        let i = &self.inner;
+        if i.detached {
+            return Err(HostError::new(
+                "unavailable",
+                "streams are only available inside a task",
+            ));
+        }
+        i.services
+            .streams
+            .as_ref()
+            .ok_or_else(|| HostError::new("unavailable", "this node runs without the event bus"))
+    }
+
+    fn check_depth(&self) -> Result<(), HostError> {
+        if self.inner.ctx.depth >= MAX_CALL_DEPTH {
+            return Err(HostError::new("call_depth", "pub/sub is nested too deeply"));
+        }
+        Ok(())
+    }
+
+    /// `std:pubsub` `publish(subject, body, opts)`: route to the matching subscribers (at most
+    /// once, in memory). Resolves after routing.
+    pub async fn pubsub_publish(&self, subject: &str, body: Bytes, o: PublishOpts) -> Result<PublishOut, HostError> {
+        let bus = self.pubsub_bus()?;
+        check_publish(subject, &body, &o.headers)?;
+        self.check_depth()?;
+        bus.publish(&self.inner.ctx, subject, body, o).await
+    }
+
+    /// `std:pubsub` `request(subject, body, opts)`: one responder, first answer wins. The timeout
+    /// defaults to [`REQUEST_TIMEOUT_DEFAULT_MS`] and is clamped to [`REQUEST_TIMEOUT_MAX_MS`] and
+    /// the task's remaining time; nothing left -> `timeout`.
+    pub async fn pubsub_request(&self, subject: &str, body: Bytes, mut o: RequestOpts) -> Result<Reply, HostError> {
+        let bus = self.pubsub_bus()?;
+        check_publish(subject, &body, &o.headers)?;
+        self.check_depth()?;
+        let timeout = self.request_timeout(o.timeout)?;
+        o.timeout = Some(timeout);
+        match tokio::time::timeout(timeout, bus.request(&self.inner.ctx, subject, body, o)).await {
+            Ok(r) => r,
+            Err(_) => Err(HostError::new("timeout", "no reply within the timeout")),
+        }
+    }
+
+    /// The effective request timeout: `asked` (default 5 s) clamped to 30 s and the deadline.
+    pub fn request_timeout(&self, asked: Option<Duration>) -> Result<Duration, HostError> {
+        let asked = asked.unwrap_or(Duration::from_millis(REQUEST_TIMEOUT_DEFAULT_MS));
+        let left = self.inner.ctx.deadline.saturating_duration_since(Instant::now());
+        let t = asked.min(Duration::from_millis(REQUEST_TIMEOUT_MAX_MS)).min(left);
+        if t.is_zero() {
+            return Err(HostError::new("timeout", "no time left for a request"));
+        }
+        Ok(t)
+    }
+
+    /// `std:stream` `append` / `appendBatch`: durable when it resolves.
+    pub async fn stream_append(&self, topic: &str, entries: Vec<AppendEntry>) -> Result<Vec<AppendedOut>, HostError> {
+        let bus = self.stream_bus()?;
+        check_append(topic, &entries)?;
+        bus.append(&self.inner.ctx, topic, entries).await
+    }
+
+    /// `std:stream` `read(topic, opts)`: replay without a consumer group.
+    pub async fn stream_read(&self, topic: &str, o: ReadOpts) -> Result<ReadPage, HostError> {
+        let bus = self.stream_bus()?;
+        check_read(topic, &o)?;
+        bus.read(&self.inner.ctx, topic, o).await
+    }
+
+    /// `std:stream` `info(topic)`.
+    pub async fn stream_info(&self, topic: &str) -> Result<TopicInfo, HostError> {
+        let bus = self.stream_bus()?;
+        check_info(topic)?;
+        bus.info(&self.inner.ctx, topic).await
     }
 
     /// The object this task acts for, if any.
