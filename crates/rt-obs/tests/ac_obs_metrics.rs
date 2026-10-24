@@ -204,7 +204,10 @@ fn obs_06_a_fresh_registry_exposes_every_node_metric_before_any_traffic() {
     let m = metrics(false, 100);
     let text = m.render();
     let mut missing = Vec::new();
-    for name in NODE_METRIC_NAMES {
+    for name in NODE_METRIC_NAMES
+        .iter()
+        .chain(rt_obs::metrics::EVENT_METRIC_NAMES.iter())
+    {
         let typed = text.contains(&format!("# TYPE {name} "));
         let sampled = text
             .lines()
@@ -289,6 +292,99 @@ fn simple_instruments_show_up_in_the_scrape() {
     assert_eq!(value(&m, "rt_mem_fragmentation_ratio", &[]), 1.25);
     assert_eq!(value(&m, "rt_egress_bytes_total", &[]), 2048.0);
     assert_eq!(value(&m, "rt_mem_committed_bytes", &[("category", "deno_heap")]), 99.0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Event queues, pub/sub, streams, async invocation, keep-alive
+// ---------------------------------------------------------------------------------------------
+
+/// Every event metric is pre-seeded: a fresh registry lists each reason/condition/outcome series
+/// at zero, so dashboards see the full label set before any traffic.
+#[test]
+fn event_metrics_preseed_every_bounded_label_value_at_zero() {
+    let m = metrics(false, 100);
+    for reason in ["fanout", "rejected", "no_task", "quota", "backlog"] {
+        assert_eq!(value(&m, "rt_pubsub_dropped_total", &[("reason", reason)]), 0.0);
+    }
+    for reason in ["exhausted", "out_of_range"] {
+        assert_eq!(value(&m, "rt_stream_skipped_total", &[("reason", reason)]), 0.0);
+    }
+    for condition in ["success", "retries_exhausted", "event_age_exceeded"] {
+        assert_eq!(value(&m, "rt_async_finished_total", &[("condition", condition)]), 0.0);
+    }
+    for kind in ["deno", "wasm"] {
+        for outcome in ["kept", "handoff", "disposed", "reused", "expired", "shed"] {
+            assert_eq!(
+                value(
+                    &m,
+                    "rt_instance_keepalive_total",
+                    &[("kind", kind), ("outcome", outcome)]
+                ),
+                0.0
+            );
+        }
+    }
+}
+
+/// Event counters reach the scrape, and the dropped/skipped/finished/keep-alive series carry only
+/// their bounded labels (no tenant, service, topic or subject label).
+#[test]
+fn event_counters_are_scraped_with_bounded_labels_only() {
+    let m = metrics(false, 100);
+    m.queue_throttled_total.inc();
+    m.pubsub_published_total.inc_by(2);
+    m.pubsub_delivered_total.inc_by(5);
+    m.pubsub_dropped_total.with_label_values(&["backlog"]).inc_by(4);
+    m.stream_appended_total.inc_by(10);
+    m.stream_delivered_total.inc_by(9);
+    m.stream_dlq_total.inc();
+    m.stream_trimmed_total.inc_by(3);
+    m.stream_skipped_total.with_label_values(&["out_of_range"]).inc();
+    m.async_accepted_total.inc_by(7);
+    m.async_throttled_total.inc_by(2);
+    m.async_finished_total
+        .with_label_values(&["retries_exhausted"])
+        .inc_by(6);
+    m.async_failed_evicted_total.inc();
+    m.instance_keepalive_total
+        .with_label_values(&["wasm", "handoff"])
+        .inc_by(8);
+
+    assert_eq!(value(&m, "rt_queue_throttled_total", &[]), 1.0);
+    assert_eq!(value(&m, "rt_pubsub_published_total", &[]), 2.0);
+    assert_eq!(value(&m, "rt_pubsub_delivered_total", &[]), 5.0);
+    assert_eq!(value(&m, "rt_pubsub_dropped_total", &[("reason", "backlog")]), 4.0);
+    assert_eq!(value(&m, "rt_stream_appended_total", &[]), 10.0);
+    assert_eq!(value(&m, "rt_stream_delivered_total", &[]), 9.0);
+    assert_eq!(value(&m, "rt_stream_dlq_total", &[]), 1.0);
+    assert_eq!(value(&m, "rt_stream_trimmed_total", &[]), 3.0);
+    assert_eq!(value(&m, "rt_stream_skipped_total", &[("reason", "out_of_range")]), 1.0);
+    assert_eq!(value(&m, "rt_async_accepted_total", &[]), 7.0);
+    assert_eq!(value(&m, "rt_async_throttled_total", &[]), 2.0);
+    assert_eq!(
+        value(&m, "rt_async_finished_total", &[("condition", "retries_exhausted")]),
+        6.0
+    );
+    assert_eq!(value(&m, "rt_async_failed_evicted_total", &[]), 1.0);
+    assert_eq!(
+        value(
+            &m,
+            "rt_instance_keepalive_total",
+            &[("kind", "wasm"), ("outcome", "handoff")]
+        ),
+        8.0
+    );
+
+    for line in m.render().lines().filter(|l| {
+        l.starts_with("rt_pubsub_")
+            || l.starts_with("rt_stream_")
+            || l.starts_with("rt_async_")
+            || l.starts_with("rt_instance_keepalive_")
+    }) {
+        for banned in ["tenant", "service", "topic", "subject"] {
+            assert!(!line.contains(&format!("{banned}=")), "label `{banned}` in {line}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
