@@ -5,6 +5,8 @@
 #[path = "common/mod.rs"]
 mod common;
 
+#[path = "flows/async_invoke.rs"]
+mod async_invoke;
 #[path = "flows/build_exec.rs"]
 mod build_exec;
 #[path = "flows/durable.rs"]
@@ -15,6 +17,10 @@ mod e2e;
 mod edge_invoke;
 #[path = "flows/edge_ws.rs"]
 mod edge_ws;
+#[path = "flows/events_pubsub.rs"]
+mod events_pubsub;
+#[path = "flows/events_stream.rs"]
+mod events_stream;
 #[path = "flows/hot_path.rs"]
 mod hot_path;
 #[path = "flows/ingress.rs"]

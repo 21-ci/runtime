@@ -14,6 +14,7 @@
 pub mod clock;
 pub mod engine;
 pub mod executor;
+pub mod host_events;
 pub mod host_wit;
 pub mod host_ws;
 pub mod interrupt;

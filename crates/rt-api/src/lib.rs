@@ -15,12 +15,14 @@
 #![warn(clippy::await_holding_lock, clippy::mem_forget, clippy::undocumented_unsafe_blocks)]
 
 pub mod auth;
+pub mod consumers;
 pub mod control;
 pub mod dto;
 pub mod error;
 pub mod extract;
 pub mod health;
 pub mod hosts;
+pub mod invocations;
 pub mod invoke;
 pub mod limits;
 pub mod mcp;
@@ -30,13 +32,14 @@ pub mod serve;
 pub mod sockets;
 pub mod state;
 pub mod tokens;
+pub mod topics;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 
 pub use auth::Auth;
 pub use control::{
-    control_router, openapi_json_string, refresh_routes, ApiDoc, MAX_CONCURRENT_UPLOADS, MAX_UPLOAD_BODY,
+    api_doc, control_router, openapi_json_string, refresh_routes, ApiDoc, MAX_CONCURRENT_UPLOADS, MAX_UPLOAD_BODY,
 };
 pub use error::{status_for_code, ApiError, ErrorBody, ErrorEnvelope};
 pub use health::health_router;
