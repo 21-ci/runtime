@@ -1,0 +1,30 @@
+[package]
+name = "rust-hello-wasm"
+version = "1.0.0"
+edition = "2021"
+publish = false
+
+# A cdylib built for `wasm32-wasip2` is already a WebAssembly *component*
+# (rustc runs wasm-component-ld). The `wasip2` crate embeds the WIT world
+# `wasi:http/proxy`, so the component exports `wasi:http/incoming-handler`,
+# which is what the runtime requires for `runtime: "wasm"` services.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# default-features = false -> no `std` feature: see the note in src/lib.rs
+# about why this sample is `#![no_std]` (minimal wasi:* import set).
+wasip2 = { version = "2", default-features = false }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+dlmalloc = { version = "0.2", features = ["global"] }
+
+[profile.release]
+opt-level = "s"    # small component = faster upload, cheaper T1/T2 cache entry
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
+
+# Standalone crate: NOT a member of the runtime workspace one directory up.
+# The empty table stops cargo from walking up to /runtime/Cargo.toml.
+[workspace]
