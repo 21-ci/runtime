@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::body::Body;
 use crate::digest::Digest;
+use crate::events::{PubsubMessage, StreamBatch};
 use crate::ids::{MsgId, ProjectId, ScheduleId, ServiceId, TaskId, TenantId, VersionNo};
 use crate::kinds::{RuntimeKind, TaskKind};
 use crate::limits::{Limits, ServiceKnobs};
@@ -83,6 +84,19 @@ pub enum Trigger {
     Alarm {
         object: Arc<str>,
     },
+    /// A pub/sub delivery of `subject`; `depth` = publisher depth + 1 (loop guard); `reply` = a
+    /// `request` waits for the answer.
+    Pubsub {
+        subject: Arc<str>,
+        depth: u8,
+        reply: bool,
+    },
+    /// A stream consumer batch of one partition; `attempt` is 1-based.
+    Stream {
+        topic: Arc<str>,
+        partition: u32,
+        attempt: u16,
+    },
 }
 
 impl Trigger {
@@ -98,13 +112,15 @@ impl Trigger {
             Trigger::Build { .. } => "build",
             Trigger::Socket { .. } => "websocket",
             Trigger::Alarm { .. } => "alarm",
+            Trigger::Pubsub { .. } => "pubsub",
+            Trigger::Stream { .. } => "stream",
         }
     }
 
-    /// Call depth: 0 unless this is a service-to-service call.
+    /// Call depth: 0 unless this is a service-to-service call or a pub/sub delivery.
     pub const fn call_depth(&self) -> u8 {
         match self {
-            Trigger::Call { depth, .. } => *depth,
+            Trigger::Call { depth, .. } | Trigger::Pubsub { depth, .. } => *depth,
             _ => 0,
         }
     }
@@ -181,6 +197,10 @@ pub enum Payload {
     Queue(Vec<QueueMessage>),
     /// A WebSocket event or a durable object's alarm (`Trigger::Socket` / `Trigger::Alarm`).
     Socket(SocketEvent),
+    /// A pub/sub message (`Trigger::Pubsub`).
+    Pubsub(PubsubMessage),
+    /// A stream consumer batch (`Trigger::Stream`).
+    Stream(StreamBatch),
 }
 
 /// Who made an in-process call, as the runtime stamped it: the callee's `ctx.caller`. Set by the

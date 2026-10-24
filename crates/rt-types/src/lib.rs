@@ -7,6 +7,7 @@
 pub mod body;
 pub mod control;
 pub mod digest;
+pub mod events;
 pub mod ids;
 pub mod kinds;
 pub mod limits;
@@ -25,9 +26,10 @@ pub use control::{
     BuildReport, ConfigDelta, ConfigEvent, ConfigSnapshot, ConfigStream, ControlPlane, CpError, CONTROL_PLANE_VERSION,
 };
 pub use digest::{Digest, DigestError};
+pub use events::{Namespace, PubsubMessage, StreamBatch, StreamRecord};
 pub use ids::{
-    EventId, IdError, KeyId, MachineId, MsgId, ProcId, ProjectId, ScheduleId, SecretsVersion, ServiceId, TaskId,
-    TenantId, UploadId, VersionNo,
+    EventId, IdError, InvocationId, KeyId, MachineId, MsgId, ProcId, ProjectId, ScheduleId, SecretsVersion, ServiceId,
+    TaskId, TenantId, TopicId, UploadId, VersionNo,
 };
 pub use kinds::{DegradationMode, Listener, Profile, RuntimeKind, TaskKind};
 pub use limits::{CompileMode, Limits, ScalingKnobs, ServiceKnobs, MAX_CALL_DEPTH};

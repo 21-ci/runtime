@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::digest::Digest;
+use crate::events::{AsyncInvokeConfig, EventsConfig};
 use crate::ids::{EventId, KeyId, ProjectId, ScheduleId, ServiceId, TenantId, VersionNo};
 use crate::kinds::{Profile, RuntimeKind};
 use crate::limits::CompileMode;
@@ -279,6 +280,10 @@ pub struct ScalingConfig {
     pub max_instances: Option<u32>,
     pub max_queued: Option<u32>,
     pub keep_resident: Option<bool>,
+    /// Keep-alive of a reused instance after it answered, in ms. Unset = inherit the executor's
+    /// idle TTL; `0` = dispose at once unless tasks of the service wait. At most
+    /// `min(plan.limits_max.min_run_time_ms, sched.min_run_time_max_ms)`.
+    pub min_run_time_ms: Option<u64>,
 }
 
 impl ScalingConfig {
@@ -329,6 +334,8 @@ impl TriggerSwitches {
             TriggerKind::Queue => self.queue,
             TriggerKind::Call => self.call,
             TriggerKind::Websocket => self.websocket,
+            // Declared by `events.subscribe` / `events.consume`; no switch of their own.
+            TriggerKind::Pubsub | TriggerKind::Stream => true,
         }
     }
 }
@@ -520,6 +527,12 @@ pub struct ServiceConfig {
     /// WebSocket knobs. Omitted from JSON while unset.
     #[serde(skip_serializing_if = "WsServiceConfig::is_unset")]
     pub ws: WsServiceConfig,
+    /// Pub/sub subscriptions and stream consumers. Omitted from JSON while unset.
+    #[serde(skip_serializing_if = "EventsConfig::is_unset")]
+    pub events: EventsConfig,
+    /// Async invocation (`Prefer: respond-async`). Omitted from JSON while unset.
+    #[serde(rename = "async", skip_serializing_if = "AsyncInvokeConfig::is_unset")]
+    pub async_invoke: AsyncInvokeConfig,
 }
 
 /// Per-service WebSocket knobs (`config.ws`, docs/handlers.md "WebSockets").
@@ -662,6 +675,9 @@ pub struct ServicePatch {
     pub deno: Option<DenoServiceConfig>,
     pub durable: Option<bool>,
     pub ws: Option<WsServiceConfig>,
+    pub events: Option<EventsConfig>,
+    #[serde(rename = "async")]
+    pub async_invoke: Option<AsyncInvokeConfig>,
 }
 
 /// Build state of a version.
@@ -883,5 +899,19 @@ impl fmt::Debug for EnvBundle {
                 &self.secrets.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
             )
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scaling block without `min_run_time_ms` inherits (unset).
+    #[test]
+    fn scaling_without_min_run_time_is_inherit() {
+        let s: ScalingConfig = serde_json::from_str(r#"{"min_instances":1}"#).unwrap();
+        assert_eq!(s.min_run_time_ms, None);
+        let z: ScalingConfig = serde_json::from_str(r#"{"min_run_time_ms":0}"#).unwrap();
+        assert_eq!(z.min_run_time_ms, Some(0));
     }
 }
