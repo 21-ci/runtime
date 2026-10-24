@@ -154,3 +154,40 @@ async fn a_queue_opened_without_a_directory_part_is_an_anonymous_database() {
         .await
         .expect("the writer has the schema");
 }
+
+/// QENG-003: `release_leased` hands a leased message back with the lease's attempt refunded, and
+/// only while the message is still on that leased attempt.
+#[tokio::test]
+async fn qeng_003_release_leased_restores_the_attempt_and_is_fenced() {
+    let q = SqliteQueueStore::open_in_memory(2).expect("queue");
+    let s = common::svc(1);
+    let id = q.enqueue(s, NewMessage::new("m")).await.expect("enqueue");
+    assert_eq!(q.release_leased(&[], Duration::ZERO).await.expect("empty"), 0);
+    for _ in 0..5 {
+        let leased = QueueStore::lease(&*q, s, 10, LONG).await.expect("lease");
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].attempt, 1, "a released delivery never used up an attempt");
+        assert_eq!(
+            q.release_leased(&[(id, 2)], Duration::ZERO).await.expect("stale"),
+            0,
+            "fenced"
+        );
+        assert_eq!(q.release_leased(&[(id, 1)], Duration::ZERO).await.expect("release"), 1);
+        assert_eq!(
+            q.release_leased(&[(id, 1)], Duration::ZERO).await.expect("again"),
+            0,
+            "no lease left"
+        );
+    }
+    assert_eq!(q.stats(s).await.expect("stats").dlq, 0);
+    let ready = q.services_with_ready().await.expect("ready");
+    assert_eq!(ready, vec![s], "a release makes the message due again");
+    let delayed = QueueStore::lease(&*q, s, 10, LONG).await.expect("lease");
+    q.release_leased(&[(delayed[0].id, 1)], Duration::from_secs(60))
+        .await
+        .expect("release later");
+    assert!(
+        QueueStore::lease(&*q, s, 10, LONG).await.expect("lease").is_empty(),
+        "invisible until the delay ends"
+    );
+}

@@ -817,3 +817,416 @@ async fn call_011_capped_enqueues_never_overshoot_the_depth() {
         .await;
     assert!(again.is_ok(), "a dedup hit adds nothing: {again:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Async invocations (queue.db v3)
+// ---------------------------------------------------------------------------------------------
+
+mod invocations {
+    use super::*;
+    use rt_store::queue::{Accepted, InvocationState, InvocationStore, NewInvocation, MIGRATIONS};
+    use rt_types::InvocationId;
+
+    fn inv(s: rt_types::ServiceId, key: Option<&str>, hash: &str) -> NewInvocation {
+        NewInvocation {
+            id: InvocationId::new(),
+            service: s,
+            method: "POST".into(),
+            uri: "/hook?x=1".into(),
+            sealed_headers: vec![0, 1, 2, 255],
+            sealed_body: b"sealed-body".to_vec(),
+            body_bytes: 4,
+            max_age: Duration::from_secs(3600),
+            max_attempts: 3,
+            idempotency_key: key.map(str::to_string),
+            request_hash: hash.into(),
+        }
+    }
+
+    async fn accept_new(q: &SqliteQueueStore, n: NewInvocation) -> InvocationId {
+        match q.accept(n, 100_000).await.expect("accept") {
+            Accepted::New(id) => id,
+            other => panic!("expected a new record, got {other:?}"),
+        }
+    }
+
+    /// Accept persists the sealed bytes untouched; a lease hands them back with attempt 1;
+    /// complete marks the record succeeded and wipes headers and body.
+    #[tokio::test]
+    async fn ac_async_01_accept_and_lease_and_complete_wipes_headers_and_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("queue.db");
+        let q = SqliteQueueStore::open(&path, 5).expect("file store");
+        let s = svc(1);
+        let id = accept_new(&q, inv(s, None, "h")).await;
+        assert_eq!(q.services_with_invocations().await.expect("ready"), vec![s]);
+        let l = q.lease_invocations(s, 10, LONG).await.expect("lease");
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].id, id);
+        assert_eq!(l[0].sealed_headers, vec![0, 1, 2, 255], "opaque header bytes kept");
+        assert_eq!(l[0].sealed_body, b"sealed-body".to_vec());
+        assert_eq!(
+            (l[0].attempt, l[0].method.as_str(), l[0].uri.as_str()),
+            (1, "POST", "/hook?x=1")
+        );
+        assert!(
+            q.services_with_invocations().await.expect("ready").is_empty(),
+            "leased = invisible"
+        );
+        assert!(!q.complete(id, 2, 200).await.expect("stale"), "fenced by attempt");
+        assert!(q.complete(id, 1, 204).await.expect("complete"));
+        assert!(!q.complete(id, 1, 204).await.expect("twice"), "no lease left");
+        let r = q.invocation(s, id).await.expect("get").expect("record");
+        assert_eq!(r.state, InvocationState::Succeeded);
+        assert_eq!((r.status, r.condition.as_deref()), (Some(204), Some("success")));
+        assert!(r.expires_at_ms - r.updated_at_ms >= 24 * 3600 * 1000 - 1);
+        let (h, b): (Option<Vec<u8>>, Option<Vec<u8>>) = rusqlite::Connection::open(&path)
+            .expect("raw")
+            .query_row(
+                "SELECT headers, body FROM invocations WHERE id = ?1",
+                [id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert!(h.is_none() && b.is_none(), "headers and body wiped");
+        assert!(
+            q.invocation(svc(2), id).await.expect("other").is_none(),
+            "scoped to its service"
+        );
+    }
+
+    /// A failed attempt is retried after its delay; the attempt at max_attempts fails the record.
+    #[tokio::test]
+    async fn ac_async_02_fail_attempt_retries_then_fails_at_max_attempts() {
+        let q = queue(5);
+        let s = svc(1);
+        let id = accept_new(&q, inv(s, None, "h")).await;
+        for attempt in 1..=3u16 {
+            let l = q.lease_invocations(s, 10, LONG).await.expect("lease");
+            assert_eq!(l[0].attempt, attempt);
+            let st = q
+                .fail_attempt(id, attempt, "status_5xx", Some(503), Duration::ZERO)
+                .await
+                .expect("fail");
+            let want = if attempt < 3 {
+                InvocationState::Pending
+            } else {
+                InvocationState::Failed
+            };
+            assert_eq!(st, want);
+        }
+        let r = q.invocation(s, id).await.expect("get").expect("record");
+        assert_eq!(r.condition.as_deref(), Some("retries_exhausted"));
+        assert_eq!(
+            (r.error.as_deref(), r.status, r.attempts),
+            (Some("status_5xx"), Some(503), 3)
+        );
+        assert!(matches!(
+            q.fail_attempt(id, 3, "x", None, Duration::ZERO).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(q.lease_invocations(s, 10, LONG).await.expect("lease").is_empty());
+    }
+
+    /// A release (throttle) hands the delivery back without spending an attempt.
+    #[tokio::test]
+    async fn ac_async_03_release_does_not_count_an_attempt() {
+        let q = queue(5);
+        let s = svc(1);
+        let id = accept_new(&q, inv(s, None, "h")).await;
+        for _ in 0..10 {
+            let l = q.lease_invocations(s, 10, LONG).await.expect("lease");
+            assert_eq!(l[0].attempt, 1);
+            assert!(!q.release(id, 2, Duration::ZERO).await.expect("stale"));
+            assert!(q.release(id, 1, Duration::ZERO).await.expect("release"));
+        }
+        let l = q.lease_invocations(s, 10, LONG).await.expect("lease");
+        q.release(id, l[0].attempt, LONG).await.expect("release later");
+        assert!(
+            q.lease_invocations(s, 10, LONG).await.expect("lease").is_empty(),
+            "delayed"
+        );
+    }
+
+    /// The service's pending count is capped at accept.
+    #[tokio::test]
+    async fn ac_async_04_backlog_cap_refuses_with_async_backlog_full() {
+        let q = queue(5);
+        let s = svc(1);
+        q.accept(inv(s, None, "a"), 2).await.expect("1");
+        q.accept(inv(s, None, "b"), 2).await.expect("2");
+        assert!(matches!(
+            q.accept(inv(s, None, "c"), 2).await,
+            Err(StoreError::Conflict("async_backlog_full"))
+        ));
+        q.accept(inv(svc(2), None, "c"), 2)
+            .await
+            .expect("other service has its own cap");
+    }
+
+    /// The same key with the same hash replays the record (with its current state).
+    #[tokio::test]
+    async fn ac_async_05_idempotency_key_replays_while_the_record_exists() {
+        let q = queue(5);
+        let s = svc(1);
+        let id = accept_new(&q, inv(s, Some("k"), "h")).await;
+        assert_eq!(
+            q.accept(inv(s, Some("k"), "h"), 100).await.expect("replay"),
+            Accepted::Replay {
+                id,
+                state: InvocationState::Pending
+            }
+        );
+        let l = q.lease_invocations(s, 1, LONG).await.expect("lease");
+        q.complete(id, l[0].attempt, 200).await.expect("complete");
+        assert_eq!(
+            q.accept(inv(s, Some("k"), "h"), 0)
+                .await
+                .expect("replay ignores the cap"),
+            Accepted::Replay {
+                id,
+                state: InvocationState::Succeeded
+            }
+        );
+        accept_new(&q, inv(svc(2), Some("k"), "h")).await;
+        q.expire(i64::MAX - 1).await.expect("sweep");
+        accept_new(&q, inv(s, Some("k"), "h")).await;
+    }
+
+    /// The sweep fails pending records past their age and deletes finished records past retention.
+    #[tokio::test]
+    async fn ac_async_06_expire_fails_event_age_exceeded_and_deletes_finished_records() {
+        let q = queue(5);
+        let s = svc(1);
+        let id = accept_new(&q, inv(s, None, "h")).await;
+        let done = accept_new(&q, inv(s, None, "d")).await;
+        let l = q.lease_invocations(s, 10, LONG).await.expect("lease");
+        let d = l.iter().find(|l| l.id == done).expect("leased");
+        q.complete(done, d.attempt, 200).await.expect("complete");
+        let now = now_ms();
+        let st = q.expire(now).await.expect("nothing yet");
+        assert_eq!((st.aged_out, st.deleted), (0, 0));
+        let st = q.expire(now + 3_600_001).await.expect("age");
+        assert_eq!(st.aged_out, 1);
+        let r = q.invocation(s, id).await.expect("get").expect("record");
+        assert_eq!(
+            (r.state, r.condition.as_deref()),
+            (InvocationState::Failed, Some("event_age_exceeded"))
+        );
+        let st = q.expire(now + 25 * 3600 * 1000).await.expect("retention");
+        assert_eq!(st.deleted, 1, "the succeeded record goes after 24 h");
+        assert!(q.invocation(s, done).await.expect("get").is_none());
+        let st = q.expire(i64::MAX - 1).await.expect("all");
+        assert_eq!(st.deleted, 1, "the failed record goes after 7 d");
+    }
+
+    /// Redrive puts failed records back to pending with attempts 0; purge deletes them.
+    #[tokio::test]
+    async fn ac_async_07_redrive_and_purge_failed() {
+        let q = queue(5);
+        let s = svc(1);
+        let mut one = inv(s, None, "h");
+        one.max_attempts = 1;
+        let id = accept_new(&q, one).await;
+        let l = q.lease_invocations(s, 1, LONG).await.expect("lease");
+        q.fail_attempt(id, l[0].attempt, "guest_error", None, Duration::ZERO)
+            .await
+            .expect("fail");
+        assert_eq!(q.redrive_invocations(s).await.expect("redrive"), 1);
+        let r = q.invocation(s, id).await.expect("get").expect("record");
+        assert_eq!(
+            (r.state, r.attempts, r.error.clone()),
+            (InvocationState::Pending, 0, None)
+        );
+        let l = q.lease_invocations(s, 1, LONG).await.expect("lease again");
+        assert_eq!(l[0].attempt, 1);
+        assert_eq!(
+            l[0].sealed_body,
+            b"sealed-body".to_vec(),
+            "the request survives for redrive"
+        );
+        q.fail_attempt(id, 1, "guest_error", None, Duration::ZERO)
+            .await
+            .expect("fail");
+        assert_eq!(q.purge_failed(svc(2)).await.expect("other"), 0);
+        assert_eq!(q.purge_failed(s).await.expect("purge"), 1);
+        assert!(q.invocation(s, id).await.expect("get").is_none());
+    }
+
+    /// Lists are newest first, filtered by state, paged with an opaque cursor.
+    #[tokio::test]
+    async fn ac_async_08_list_by_state_pages_with_a_cursor() {
+        let q = queue(5);
+        let s = svc(1);
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(accept_new(&q, inv(s, None, &i.to_string())).await);
+            sleep_ms(2).await;
+        }
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let p = q.list_invocations(s, None, 2, cursor).await.expect("page");
+            assert!(p.items.len() <= 2);
+            seen.extend(p.items.iter().map(|r| r.id));
+            match p.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        ids.reverse();
+        assert_eq!(seen, ids, "newest first, every record once");
+        let p = q
+            .list_invocations(s, Some(InvocationState::Failed), 10, None)
+            .await
+            .expect("failed");
+        assert!(p.items.is_empty());
+        assert!(matches!(
+            q.list_invocations(s, None, 10, Some("garbage".into())).await,
+            Err(StoreError::Invalid(_))
+        ));
+    }
+
+    /// A v2 database keeps its messages and gains the invocations table on open.
+    #[tokio::test]
+    async fn ac_async_09_upgrade_from_v2_keeps_messages_and_adds_invocations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("queue.db");
+        {
+            let c = rusqlite::Connection::open(&p).expect("raw");
+            for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 2) {
+                c.execute_batch(sql).expect("old schema");
+                c.pragma_update(None, "user_version", *v).expect("version");
+            }
+            c.execute(
+                "INSERT INTO messages (id, service_id, body, attempt, visible_at, enqueued_at, dedup_id, leased) \
+                 VALUES (?1, ?2, x'6869', 0, 0, 0, NULL, 0)",
+                rusqlite::params![MsgId::new().to_string(), svc(1).to_string()],
+            )
+            .expect("v2 message");
+        }
+        let q = SqliteQueueStore::open(&p, 5).expect("upgrade");
+        let l = q.lease(svc(1), 10, LONG).await.expect("lease");
+        assert_eq!(l[0].body, Bytes::from_static(b"hi"));
+        accept_new(&q, inv(svc(1), None, "h")).await;
+    }
+
+    /// Deleting a service removes its invocations too.
+    #[tokio::test]
+    async fn ac_async_10_purge_service_removes_invocations() {
+        let q = queue(5);
+        let id = accept_new(&q, inv(svc(1), None, "h")).await;
+        let other = accept_new(&q, inv(svc(2), None, "h")).await;
+        assert!(q.purge_service(svc(1)).await.expect("purge") >= 1);
+        assert!(q.invocation(svc(1), id).await.expect("get").is_none());
+        assert!(q.invocation(svc(2), other).await.expect("get").is_some());
+    }
+
+    /// Each lease is an attempt (a crash mid-run spends it); a release refunds it.
+    #[tokio::test]
+    async fn ac_async_11_lease_counts_the_attempt_and_release_refunds_it() {
+        let q = queue(5);
+        let s = svc(1);
+        let id = accept_new(&q, inv(s, None, "h")).await;
+        q.lease_invocations(s, 1, Duration::ZERO).await.expect("lease 1");
+        let l = q
+            .lease_invocations(s, 1, Duration::ZERO)
+            .await
+            .expect("lease after expiry");
+        assert_eq!(l[0].attempt, 2, "the expired lease counted");
+        assert!(
+            !q.complete(id, 1, 200).await.expect("old"),
+            "the first delivery is fenced out"
+        );
+        assert!(q.release(id, 2, Duration::ZERO).await.expect("release"));
+        let r = q.invocation(s, id).await.expect("get").expect("record");
+        assert_eq!(r.attempts, 1);
+    }
+
+    /// A due record whose every attempt was started without a settle fails as `crashed`.
+    #[tokio::test]
+    async fn ac_async_12_a_lease_past_max_attempts_fails_crashed() {
+        let q = queue(5);
+        let s = svc(1);
+        let id = accept_new(&q, inv(s, None, "h")).await;
+        for _ in 0..3 {
+            assert_eq!(q.lease_invocations(s, 1, Duration::ZERO).await.expect("lease").len(), 1);
+        }
+        assert!(q
+            .lease_invocations(s, 1, Duration::ZERO)
+            .await
+            .expect("lease")
+            .is_empty());
+        let r = q.invocation(s, id).await.expect("get").expect("record");
+        assert_eq!(r.state, InvocationState::Failed);
+        assert_eq!(
+            (r.condition.as_deref(), r.error.as_deref()),
+            (Some("retries_exhausted"), Some("crashed"))
+        );
+        assert_eq!(q.lease_invocations(s, 0, LONG).await.expect("zero").len(), 0);
+    }
+
+    /// At most 1000 failed records are kept per service; the oldest go first.
+    #[tokio::test]
+    async fn ac_async_13_failed_records_beyond_1000_are_evicted_oldest_first() {
+        let q = queue(5);
+        let s = svc(1);
+        async fn fail_one(q: &SqliteQueueStore, s: rt_types::ServiceId) -> InvocationId {
+            let mut n = inv(s, None, "h");
+            n.max_attempts = 1;
+            let id = accept_new(q, n).await;
+            q.lease_invocations(s, 1, LONG).await.expect("lease");
+            q.fail_attempt(id, 1, "guest_error", None, Duration::ZERO)
+                .await
+                .expect("fail");
+            id
+        }
+        let oldest = fail_one(&q, s).await;
+        sleep_ms(3).await;
+        let mut last = oldest;
+        for _ in 0..1000 {
+            last = fail_one(&q, s).await;
+        }
+        assert_eq!(q.take_evicted(), 1);
+        assert_eq!(q.take_evicted(), 0, "taken");
+        assert!(
+            q.invocation(s, oldest).await.expect("get").is_none(),
+            "the oldest was evicted"
+        );
+        assert!(q.invocation(s, last).await.expect("get").is_some());
+        let p = q.list_invocations(s, None, 1, None).await.expect("counts");
+        assert_eq!(p.counts.failed, 1000);
+    }
+
+    /// The same idempotency key with another request hash is a conflict.
+    #[tokio::test]
+    async fn ac_async_14_same_key_other_hash_is_idempotency_mismatch() {
+        let q = queue(5);
+        let s = svc(1);
+        accept_new(&q, inv(s, Some("k"), "h1")).await;
+        assert!(matches!(
+            q.accept(inv(s, Some("k"), "h2"), 100).await,
+            Err(StoreError::Conflict("idempotency_mismatch"))
+        ));
+    }
+
+    /// List pages carry the service's pending and failed counts.
+    #[tokio::test]
+    async fn ac_async_15_counts_report_pending_and_failed() {
+        let q = queue(5);
+        let s = svc(1);
+        accept_new(&q, inv(s, None, "a")).await;
+        let mut f = inv(s, None, "b");
+        f.max_attempts = 1;
+        let id = accept_new(&q, f).await;
+        accept_new(&q, inv(svc(2), None, "c")).await;
+        let l = q.lease_invocations(s, 10, LONG).await.expect("lease");
+        let a = l.iter().find(|l| l.id == id).expect("leased").attempt;
+        q.fail_attempt(id, a, "guest_error", None, Duration::ZERO)
+            .await
+            .expect("fail");
+        let p = q.list_invocations(s, None, 10, None).await.expect("list");
+        assert_eq!((p.counts.pending, p.counts.failed), (1, 1));
+        assert_eq!(p.items.len(), 2);
+    }
+}
