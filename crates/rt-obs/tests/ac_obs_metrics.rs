@@ -175,8 +175,8 @@ fn the_node_metric_list_equals_the_metrics_documented_in_the_deploy_guide() {
     );
     assert_eq!(
         documented.len(),
-        46,
-        "docs/deploy.md lists 46 always-on metrics (parser sanity)"
+        60,
+        "docs/deploy.md lists 60 always-on metrics (parser sanity)"
     );
     let missing_in_code: Vec<_> = documented.difference(&listed).collect();
     let undocumented: Vec<_> = listed.difference(&documented).collect();
@@ -204,10 +204,7 @@ fn obs_06_a_fresh_registry_exposes_every_node_metric_before_any_traffic() {
     let m = metrics(false, 100);
     let text = m.render();
     let mut missing = Vec::new();
-    for name in NODE_METRIC_NAMES
-        .iter()
-        .chain(rt_obs::metrics::EVENT_METRIC_NAMES.iter())
-    {
+    for name in NODE_METRIC_NAMES.iter() {
         let typed = text.contains(&format!("# TYPE {name} "));
         let sampled = text
             .lines()

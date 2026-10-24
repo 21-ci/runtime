@@ -144,12 +144,7 @@ pub const NODE_METRIC_NAMES: &[&str] = &[
     names::WS_MESSAGES_TOTAL,
     names::WS_EVENT_TASKS_TOTAL,
     names::WS_CLOSED_TOTAL,
-];
-
-/// Event-queue, pub/sub, stream, async-invocation and keep-alive metrics. Registered and
-/// pre-seeded like the node list; kept apart until their rows are added to the metrics table in
-/// docs/deploy.md (the drift test checks the node list against that table).
-pub const EVENT_METRIC_NAMES: &[&str] = &[
+    // Event queues, pub/sub, streams, async invocations and instance keep-alive.
     names::QUEUE_THROTTLED_TOTAL,
     names::PUBSUB_PUBLISHED_TOTAL,
     names::PUBSUB_DELIVERED_TOTAL,
