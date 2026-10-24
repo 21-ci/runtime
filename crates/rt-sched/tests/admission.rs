@@ -982,6 +982,107 @@ fn a_call_waiting_behind_a_tenant_capped_request_still_gets_its_slot() {
     assert_eq!(a.finish(b1), vec![b2], "B's freed slot goes to A2's call");
 }
 
+fn reentrant(mut spec: TaskSpec) -> TaskSpec {
+    spec.reentrant = true;
+    spec
+}
+
+fn reply_of(tenant: u128, service: u128, k: ServiceKnobs, depth: u8) -> TaskSpec {
+    SpecBuilder::deno()
+        .tenant(tenant)
+        .service(service)
+        .knobs(k)
+        .trigger(Trigger::Pubsub {
+            subject: "self.ping".into(),
+            depth,
+            reply: true,
+        })
+        .finish()
+}
+
+/// A re-entrant call (submitted by a task of the same service, which waits for it holding one of
+/// the service's slots) is not held by `max_instances`: at a ceiling of 1 a self-call and a
+/// self-request reply run beside their parent. Requests and calls from other services still wait
+/// on the ceiling.
+#[test]
+fn adm_reentrant_calls_run_past_max_instances_others_wait() {
+    let mut a = Adm::new(limits(100));
+    let k = knobs(1, 0, 0);
+    let parent = a.admit(&task(1, 1, k)).unwrap();
+    assert!(runs(&parent), "the requester takes the only instance");
+    let p = a.next;
+    assert!(
+        waits(&a.admit(&task(1, 1, k)).unwrap()),
+        "a request waits on the ceiling of 1"
+    );
+    let queued_req = a.next;
+    assert!(
+        waits(&a.admit(&call(1, 1, k)).unwrap()),
+        "a call from another service waits on it"
+    );
+    let queued_call = a.next;
+
+    let c = a.admit(&reentrant(call(1, 1, k))).unwrap();
+    assert!(runs(&c), "a self-call runs beside its parent");
+    let self_call = a.next;
+    assert_eq!(c.ticket.class, SlotClass::Call);
+    let r = a.admit(&reentrant(reply_of(1, 1, k, 2))).unwrap();
+    assert!(runs(&r), "a self-request reply (nested deeper) runs too");
+    let self_reply = a.next;
+    assert_eq!(a.a.service(ids::service(1)).map(|s| (s.running, s.max)), Some((3, 1)));
+
+    // the overshoot drains first: the ceiling is free again only once all three are done
+    assert!(a.finish(self_reply).is_empty());
+    assert!(
+        a.finish(self_call).is_empty(),
+        "running 1 = the ceiling: nobody is granted"
+    );
+    assert_eq!(a.finish(p), vec![queued_call], "the waiting call goes first");
+    assert_eq!(a.finish(queued_call), vec![queued_req]);
+    a.finish(queued_req);
+    assert_eq!((a.a.inflight(), a.a.running(), a.a.queued()), (0, 0, (0, 0)));
+}
+
+/// The re-entrant exemption covers the service ceiling only: the flag means nothing on a request
+/// (`Throttled`), and a re-entrant call is still held by the tenant's call allowance at its depth
+/// and by `max_inflight`.
+#[test]
+fn adm_reentrant_calls_stay_within_the_tenant_allowance_and_max_inflight() {
+    let mut a = Adm::new(limits(100));
+    let k = knobs(1, 0, 2);
+    assert!(runs(&a.admit(&task(1, 1, k)).unwrap()));
+    assert!(
+        waits(&a.admit(&reentrant(task(1, 1, k))).unwrap()),
+        "a request is never re-entrant: it waits on the ceiling"
+    );
+    assert!(runs(&a.admit(&reentrant(call(1, 1, k))).unwrap()));
+    assert!(
+        runs(&a.admit(&reentrant(call(1, 1, k))).unwrap()),
+        "two depth-1 calls: the plan cap of 2"
+    );
+    assert!(
+        waits(&a.admit(&reentrant(call(1, 1, k))).unwrap()),
+        "the third depth-1 call waits on the tenant's call allowance"
+    );
+    assert!(
+        runs(&a.admit(&reentrant(reply_of(1, 1, k, 2))).unwrap()),
+        "depth 2 has its own allowance"
+    );
+
+    let mut b = Adm::new(limits(2));
+    let k = knobs(1, 0, 0);
+    assert!(runs(&b.admit(&task(2, 2, k)).unwrap()));
+    assert!(runs(&b.admit(&reentrant(call(2, 2, k))).unwrap()), "the call reserve");
+    let blocked = b.admit(&reentrant(call(2, 2, k))).unwrap();
+    assert!(waits(&blocked), "max_inflight of 2 holds a re-entrant call");
+    let n = b.next;
+    assert_eq!(
+        b.finish(n - 1),
+        vec![n],
+        "granted past the ceiling once a node slot frees"
+    );
+}
+
 /// Review 7: a call queued for a service that is already listed, while its tenant is out of the
 /// ring (capped), is seen as soon as a node slot frees.
 #[test]
@@ -2748,34 +2849,54 @@ fn sched_002_an_executor_panic_releases_the_slot_and_the_memory() {
     assert_ok(sim.outcome(&mut next));
 }
 
-/// ADM-005 (pinned limitation): a service with one instance calling itself: the child needs the
-/// slot its parent holds, so it waits its queue timeout and ends `queue_timeout`; nothing hangs.
-#[test]
-fn adm_005_a_self_call_at_one_instance_ends_in_queue_timeout() {
+/// A service with one instance calls itself (the child marked `reentrant` or not) while the
+/// parent stays busy waiting on it longer than the queue timeout; returns the child's outcome.
+fn self_call_at_one_instance(reentrant: bool) -> Outcome {
     let mut sim = SimRuntime::new(fixed(1, 1));
     let sched = sim.scheduler().clone();
     let children: Arc<Mutex<Vec<rt_sched::TaskHandle>>> = Arc::default();
     let sink = children.clone();
     sim.scripts().set_call_hook(move |parent, _slug| {
-        let spec = d(1)
+        let mut spec = d(1)
             .max_concurrency(1, 10)
             .queue_timeout_ms(500)
             .trigger(Trigger::Call { parent, depth: 1 })
             .finish();
-        if let Ok(h) = sched.submit(spec) {
-            sink.lock().unwrap().push(h);
+        spec.reentrant = reentrant;
+        // scripts are per service: the child runs the same script, so only the parent's call counts
+        let mut kids = sink.lock().unwrap();
+        if kids.is_empty() {
+            if let Ok(h) = sched.submit(spec) {
+                kids.push(h);
+            }
         }
     });
-    // The parent calls itself, then stays busy (waiting on the child) longer than the timeout.
     let mut parent = admitted(sim.submit(
         d(1).max_concurrency(1, 10).queue_timeout_ms(500).finish(),
         rt_testkit::Script::from(vec![rt_testkit::call("self"), io(2_000)]),
     ));
     sim.run_until_idle();
     assert_ok(sim.outcome(&mut parent));
+    assert_eq!(sim.scheduler().snapshot().inflight, 0, "every run slot is back");
     let mut kids = children.lock().unwrap();
     assert_eq!(kids.len(), 1);
-    let child = futures_util::FutureExt::now_or_never(&mut kids[0]).expect("the child finished");
+    futures_util::FutureExt::now_or_never(&mut kids[0]).expect("the child finished")
+}
+
+/// ADM-005: a service with one instance calling itself: the child is re-entrant (its parent holds
+/// the only slot and waits for it), so it runs past `max_instances` instead of waiting its queue
+/// timeout.
+#[test]
+fn adm_005_a_self_call_at_one_instance_runs_beside_its_parent() {
+    let child = self_call_at_one_instance(true);
+    assert!(matches!(child, Outcome::Ok(_)), "{child:?}");
+}
+
+/// ADM-005b (pinned limitation): a nested call not marked re-entrant (an indirect cycle, A calls B
+/// calls A) still needs the slot an ancestor holds: it ends `queue_timeout`; nothing hangs.
+#[test]
+fn adm_005b_a_nested_call_that_is_not_reentrant_still_ends_in_queue_timeout() {
+    let child = self_call_at_one_instance(false);
     assert!(
         matches!(child, Outcome::Rejected(RejectReason::QueueTimeout)),
         "{child:?}"

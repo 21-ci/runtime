@@ -263,7 +263,6 @@ async fn ac_ps_e2e_05_control_api_publish_reaches_subscribers() {
 node_test! {
 /// AC-PS-E2E-06: a service at `max_instances: 1` that requests a subject it answers itself does
 /// not deadlock: the reply delivery runs in the call class beside the waiting requester.
-#[ignore = "bug: SlotClass::Call is still capped by max_instances (rt-sched admission.rs try_take), self-request waits to queue_timeout"]
 async fn ac_ps_e2e_06_self_request_with_max_instances_1_does_not_deadlock() {
     let node = start_node().await;
     let t = new_tenant(&node, "pro").await;

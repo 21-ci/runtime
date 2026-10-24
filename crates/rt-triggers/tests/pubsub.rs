@@ -463,6 +463,26 @@ async fn ac_ps_16_fanout_truncation_rotates() {
     assert_eq!(all.len(), 150, "two publishes cover every receiver");
 }
 
+/// A request's delivery to the requester's own service is re-entrant (its requester holds one of
+/// the service's slots): the scheduler does not hold it on `max_instances`. A delivery to another
+/// service, or a request without a known requester, is not.
+#[tokio::test]
+async fn ac_ps_17b_a_self_request_delivery_is_reentrant() {
+    let n = ns(1, 1, "prod");
+    let (s, sub) = submitter(ok_answer());
+    let r = PubsubRouter::new(Factory::new(vec![row(&n, 1, "a", None)]), sub);
+    let t = Duration::from_secs(1);
+    r.request_from(&n, Some(svc(1)), 1, "a", Bytes::new(), vec![], t)
+        .await
+        .unwrap();
+    r.request_from(&n, Some(svc(2)), 1, "a", Bytes::new(), vec![], t)
+        .await
+        .unwrap();
+    r.request(&n, 1, "a", Bytes::new(), vec![], t).await.unwrap();
+    let flags: Vec<bool> = s.specs.lock().iter().map(|x| x.reentrant).collect();
+    assert_eq!(flags, vec![true, false, false]);
+}
+
 /// A request's delivery task is `Trigger::Pubsub { reply: true }`; a publish's is `reply: false`.
 #[tokio::test]
 async fn ac_ps_17_request_task_has_reply_true() {

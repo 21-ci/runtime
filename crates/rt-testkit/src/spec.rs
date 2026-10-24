@@ -180,6 +180,7 @@ impl SpecBuilder {
             slug: "".into(),
             caller: None,
             object: None,
+            reentrant: false,
         }
     }
 }

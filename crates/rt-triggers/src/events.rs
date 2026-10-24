@@ -147,7 +147,7 @@ impl PubsubBus for EventDispatcher {
         }
         let (content_type, body) = self
             .pubsub
-            .request(&ns, depth, subject, body, o.headers, timeout)
+            .request_from(&ns, Some(from.service), depth, subject, body, o.headers, timeout)
             .await
             .map_err(pubsub_err)?;
         Ok(Reply { content_type, body })

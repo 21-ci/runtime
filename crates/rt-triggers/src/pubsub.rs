@@ -366,6 +366,24 @@ impl PubsubRouter {
         headers: Vec<(String, String)>,
         timeout: Duration,
     ) -> Result<(Option<String>, Bytes), PubsubError> {
+        self.request_from(ns, None, depth, subject, body, headers, timeout)
+            .await
+    }
+
+    /// [`Self::request`] by a task of service `from`: when the responder is that same service,
+    /// the reply delivery is marked [`TaskSpec::reentrant`] (the requester holds one of its slots
+    /// while it waits, so the delivery must not wait on the service's `max_instances`).
+    #[allow(clippy::too_many_arguments)] // the request's fields plus who asks
+    pub async fn request_from(
+        &self,
+        ns: &Namespace,
+        from: Option<ServiceId>,
+        depth: u8,
+        subject: &str,
+        body: Bytes,
+        headers: Vec<(String, String)>,
+        timeout: Duration,
+    ) -> Result<(Option<String>, Bytes), PubsubError> {
         Self::validate(depth, subject, &body, &headers)?;
         self.check_quota(ns.tenant)?;
         if let Some(m) = &self.metrics {
@@ -384,9 +402,10 @@ impl PubsubRouter {
         let service = list[Self::rr(&self.subject_rr, ns, subject) % list.len()];
         self.check_quota(ns.tenant)?;
         let msg = Self::message(subject, body, headers, true);
-        let spec = self
+        let mut spec = self
             .task(service, msg, depth, Some(timeout))
             .ok_or(PubsubError::NoResponders)?;
+        spec.reentrant = from == Some(service);
         let fut = (self.submit)(spec).map_err(PubsubError::Rejected)?;
         if let Some(m) = &self.metrics {
             m.pubsub_delivered_total.inc();

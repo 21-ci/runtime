@@ -289,6 +289,8 @@ impl Calls for CallDispatcher {
 
         let mut spec = self.tasks.child_task(from, &target, req, depth)?;
         spec.caller = Some(self.caller_stamp(from));
+        // the parent holds one of the target's slots while it waits (see `TaskSpec::reentrant`)
+        spec.reentrant = target.service == from.service;
         // Child wall = min(own limit, parent remaining) (TRG-17).
         spec.limits.wall = spec.limits.wall.min(remaining);
         if spec.limits.wall < Duration::from_millis(1) {
@@ -336,6 +338,8 @@ impl Calls for CallDispatcher {
         }
         let mut spec = self.tasks.child_task(from, &target, req, depth)?;
         spec.caller = Some(self.caller_stamp(from));
+        // the parent holds one of the target's slots while it waits (see `TaskSpec::reentrant`)
+        spec.reentrant = target.service == from.service;
         spec.limits.wall = spec.limits.wall.min(remaining);
         self.run_child(from, &target, spec, Some(object)).await
     }

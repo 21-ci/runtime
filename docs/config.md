@@ -220,7 +220,8 @@ warm_share = 0.15               # Share of the memory budget warm instances may 
 Per-service concurrency is adaptive: each service starts at a profile limit and the
 scheduler grows it while requests wait and latency holds, and shrinks it on latency regressions, memory
 pressure or saturated processors. An *instance* is one concurrently running copy of a service
-A service's `scaling.max_instances` is a hard cap on its instances (the adaptive limit)
+A service's `scaling.max_instances` is a hard cap on its instances (the adaptive limit; only the
+service's own self-calls and self-request replies, whose parent holds an instance, may run past it)
 and `scaling.min_instances` keeps that many warm and floors the limit; both are at most the plan's
 `max_instances`, and the plan's `max_concurrency` caps a tenant. Over a limit, requests wait (FIFO per
 service, fair across tenants).
