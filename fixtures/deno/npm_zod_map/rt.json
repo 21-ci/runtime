@@ -1,0 +1,6 @@
+{
+  "entry": "main.ts",
+  "imports": {
+    "zod": "npm:zod@3"
+  }
+}
