@@ -2300,3 +2300,73 @@ fn fair_001_a_noisy_tenant_cannot_starve_another() {
         assert_ok(sim.outcome(&mut t));
     }
 }
+
+/// Slow-path cost of the admission waitlist (run in release with `--ignored --nocapture`):
+/// 10 k items wait over 1 k tenants x 2 services behind one node slot, then are released one at
+/// a time (each release grants the next waiter). Prints ns/op p50/p99 for the enqueue and for
+/// release+dispatch; asserts a generous mean of at most 5 us per op. Public API only, so it
+/// runs unchanged before and after the fair-order change.
+#[test]
+#[ignore = "perf"]
+fn perf_admission_slow_path_10k_waiting_over_1k_tenants() {
+    const TENANTS: u128 = 1_000;
+    const N: usize = 10_000;
+    let a = Admission::<usize>::new(AdmissionLimits {
+        max_inflight: 1,
+        max_queued: 1 << 20,
+        max_queued_bytes: 1 << 40,
+    });
+    let specs: Vec<TaskSpec> = (0..TENANTS)
+        .flat_map(|t| (0..2u128).map(move |s| task(t + 1, (t + 1) * 10 + s, knobs(1 << 10, 1 << 10, 1 << 10))))
+        .collect();
+    let reqs: Vec<AdmitRequest> = specs.iter().map(req).collect();
+    let mut tickets: Vec<Option<AdmissionTicket>> = vec![None; N];
+    let mut enqueue = Vec::with_capacity(N);
+    let mut running = None;
+    for i in 0..N {
+        let r = &reqs[i % reqs.len()];
+        let mut ticket = None;
+        let t0 = Instant::now();
+        let x = a
+            .admit(r, NORMAL, |t| {
+                ticket = Some(t.clone());
+                i
+            })
+            .expect("admitted");
+        enqueue.push(t0.elapsed().as_nanos() as u64);
+        tickets[i] = ticket;
+        if x.run.is_some() {
+            running = Some(i);
+        }
+    }
+    assert_eq!(a.queued().0 as usize, N - 1, "all but one wait");
+    let mut release = Vec::with_capacity(N);
+    let mut done = 0;
+    while let Some(i) = running.take() {
+        let mut t = tickets[i].take().expect("ticket of the running item");
+        t.queued = false;
+        let t0 = Instant::now();
+        let granted = a.release(&t, 0, None);
+        release.push(t0.elapsed().as_nanos() as u64);
+        done += 1;
+        running = granted.first().copied();
+    }
+    assert_eq!(done, N, "every item ran");
+    let report = |label: &str, v: &mut Vec<u64>| -> f64 {
+        v.sort_unstable();
+        let mean = v.iter().sum::<u64>() as f64 / v.len() as f64;
+        println!(
+            "{label}: mean {mean:.0} ns/op, p50 {} ns, p99 {} ns ({} ops)",
+            v[v.len() / 2],
+            v[v.len() * 99 / 100],
+            v.len()
+        );
+        mean
+    };
+    let e = report("enqueue", &mut enqueue);
+    let r = report("release+dispatch", &mut release);
+    assert!(
+        e <= 5_000.0 && r <= 5_000.0,
+        "mean over 5 us/op: enqueue {e:.0}, release {r:.0}"
+    );
+}

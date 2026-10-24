@@ -18,10 +18,57 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use parking_lot::RwLock;
 use rt_types::{PreparedKey, ServiceId, ServiceRef};
+
+/// How many tasks of a service wait in admission (implemented by the scheduler, read by
+/// executors when a task's answer is done, see [`after_answer`]).
+pub trait Backlog: Send + Sync {
+    /// Tasks of `service` queued in admission right now (all versions).
+    fn waiting(&self, service: ServiceId) -> u32;
+}
+
+/// What an executor does with a reusable instance once its task's answer is done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterAnswer {
+    /// No `min_run_time`: the executor's own keep rule, unchanged.
+    Inherit,
+    /// Park the instance; it expires `Duration` after the answer.
+    For(Duration),
+    /// `min_run_time = 0` with work of the service waiting: park for at most `cap`, and drop it
+    /// at the first housekeeping that sees nothing waiting.
+    Handoff { cap: Duration },
+    /// `min_run_time = 0` and nothing waits: dispose now (unless the warm floor needs it).
+    Dispose,
+}
+
+/// The keep decision at the answer, shared by both executors. The executors' own guards (kills,
+/// guest errors, unclean finish, reuse caps, pressure, memory growth, stale version) run first
+/// and win: this is only consulted for an instance that may be kept at all.
+pub fn after_answer(min_run_time: Option<Duration>, waiting: u32, queue_timeout: Duration) -> AfterAnswer {
+    match min_run_time {
+        None => AfterAnswer::Inherit,
+        Some(t) if !t.is_zero() => AfterAnswer::For(t),
+        Some(_) if waiting > 0 => AfterAnswer::Handoff { cap: queue_timeout },
+        Some(_) => AfterAnswer::Dispose,
+    }
+}
+
+/// The registered backlog probe (a `Weak`, so executors never keep the scheduler alive).
+#[derive(Default)]
+struct BacklogSlot(RwLock<Option<Weak<dyn Backlog>>>);
+
+impl std::fmt::Debug for BacklogSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BacklogSlot")
+            .field("set", &self.0.read().is_some())
+            .finish()
+    }
+}
 
 /// One service's artifact: the unit warm capacity is kept for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -76,6 +123,7 @@ pub fn set_machine_rank(rank: Option<u32>) {
 pub struct WarmTargets {
     snapshot: ArcSwap<HashMap<WarmKey, WarmTarget>>,
     spread: ArcSwap<HashMap<WarmKey, WarmSpread>>,
+    backlog: BacklogSlot,
 }
 
 impl WarmTargets {
@@ -122,12 +170,83 @@ impl WarmTargets {
         self.spread.store(Arc::new(spread));
         self.snapshot.store(Arc::new(targets));
     }
+
+    /// Register the scheduler's backlog probe (replaces any earlier one).
+    pub fn set_backlog(&self, backlog: Weak<dyn Backlog>) {
+        *self.backlog.0.write() = Some(backlog);
+    }
+
+    /// Tasks of `service` waiting in admission; 0 without a registered (live) probe.
+    pub fn waiting(&self, service: ServiceId) -> u32 {
+        let probe = self.backlog.0.read().as_ref().and_then(Weak::upgrade);
+        probe.map_or(0, |b| b.waiting(service))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rt_types::{Digest, RuntimeKind, TenantId, VersionNo};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const Q: Duration = Duration::from_secs(5);
+
+    /// No `min_run_time`: the executor's own rule, whatever waits.
+    #[test]
+    fn after_answer_unset_inherits() {
+        assert_eq!(after_answer(None, 0, Q), AfterAnswer::Inherit);
+        assert_eq!(after_answer(None, 9, Q), AfterAnswer::Inherit);
+    }
+
+    /// A positive `min_run_time` keeps the instance exactly that long, whatever waits.
+    #[test]
+    fn after_answer_positive_keeps_for_that_long() {
+        let t = Duration::from_millis(250);
+        assert_eq!(after_answer(Some(t), 0, Q), AfterAnswer::For(t));
+        assert_eq!(after_answer(Some(t), 3, Q), AfterAnswer::For(t));
+    }
+
+    /// `min_run_time = 0` hands the instance to waiting work (capped at the queue timeout) and
+    /// disposes it when nothing waits.
+    #[test]
+    fn after_answer_zero_hands_off_only_while_work_waits() {
+        assert_eq!(
+            after_answer(Some(Duration::ZERO), 1, Q),
+            AfterAnswer::Handoff { cap: Q }
+        );
+        assert_eq!(after_answer(Some(Duration::ZERO), 0, Q), AfterAnswer::Dispose);
+    }
+
+    struct Fixed(AtomicU32, ServiceId);
+
+    impl Backlog for Fixed {
+        fn waiting(&self, s: ServiceId) -> u32 {
+            if s == self.1 {
+                self.0.load(Ordering::Relaxed)
+            } else {
+                0
+            }
+        }
+    }
+
+    /// Without a registered probe, or once the scheduler behind it is gone, nothing waits.
+    #[test]
+    fn waiting_is_zero_without_a_backlog_or_after_it_is_dropped() {
+        let svc = ServiceId::from_u128(5);
+        let warm = WarmTargets::new();
+        assert_eq!(warm.waiting(svc), 0);
+        let probe = Arc::new(Fixed(AtomicU32::new(4), svc));
+        let as_dyn: Arc<dyn Backlog> = probe.clone();
+        warm.set_backlog(Arc::downgrade(&as_dyn));
+        assert_eq!(warm.waiting(svc), 4);
+        assert_eq!(warm.waiting(ServiceId::from_u128(6)), 0);
+        probe.0.store(1, Ordering::Relaxed);
+        assert_eq!(warm.waiting(svc), 1);
+        assert!(format!("{warm:?}").contains("set: true"));
+        drop(as_dyn);
+        drop(probe);
+        assert_eq!(warm.waiting(svc), 0, "a dropped scheduler leaves no backlog");
+    }
 
     #[test]
     fn a_published_snapshot_replaces_the_previous_one() {
