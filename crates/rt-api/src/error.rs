@@ -15,10 +15,11 @@ pub fn status_for_code(code: &str) -> StatusCode {
         | "trigger_not_allowed"
         | "binding_not_allowed"
         | "host_not_allowed"
-        | "reserved" => StatusCode::FORBIDDEN,
+        | "reserved"
+        | "async_not_allowed" => StatusCode::FORBIDDEN,
         "not_found" => StatusCode::NOT_FOUND,
         "slug_taken" | "host_taken" | "host_cooldown" | "version_not_ready" | "tenant_not_empty"
-        | "project_slug_taken" | "project_not_empty" | "environment_in_use" | "sdk_release_exists" => {
+        | "project_slug_taken" | "project_not_empty" | "environment_in_use" | "sdk_release_exists" | "topic_exists" => {
             StatusCode::CONFLICT
         }
         "precondition_failed" => StatusCode::PRECONDITION_FAILED,
@@ -38,8 +39,10 @@ pub fn status_for_code(code: &str) -> StatusCode {
         | "no_rpc_surface"
         | "sdk_contract_missing"
         | "sdk_unchecked_caller" => StatusCode::UNPROCESSABLE_ENTITY,
-        "rate_limited" | "build_quota" | "queue_full" => StatusCode::TOO_MANY_REQUESTS,
-        "control_disabled" => StatusCode::SERVICE_UNAVAILABLE,
+        "rate_limited" | "build_quota" | "queue_full" | "stream_full" | "async_backlog_full" => {
+            StatusCode::TOO_MANY_REQUESTS
+        }
+        "control_disabled" | "unavailable" => StatusCode::SERVICE_UNAVAILABLE,
         "not_implemented" => StatusCode::NOT_IMPLEMENTED,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -120,6 +123,9 @@ impl From<rt_store::StoreError> for ApiError {
             return ApiError::new(e.code(), e.to_string())
                 .with_details(serde_json::json!({"field": "min_instances", "total": total, "plan_max": cap}));
         }
+        if matches!(e, rt_store::StoreError::Conflict("topic_limit")) {
+            return ApiError::new("quota_exceeded", "the plan's topic limit (`max_topics`) is reached");
+        }
         // Sanitized: only the stable code, never driver text or paths.
         ApiError::new(e.code(), e.code().replace('_', " "))
     }
@@ -173,6 +179,10 @@ mod edge_tests {
         let store = [
             S::NotFound,
             S::Conflict("slug_taken"),
+            S::Conflict("topic_exists"),
+            S::Conflict("topic_limit"),
+            S::Conflict("stream_full"),
+            S::Conflict("idempotency_mismatch"),
             S::PreconditionFailed,
             S::Invalid("x".into()),
             S::StorageQuota,
@@ -200,6 +210,21 @@ mod edge_tests {
             assert_eq!(ApiError::from(e).status().as_u16(), want);
         }
         assert_eq!(status_for_code("internal"), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Event and async codes answer their documented statuses; the store's topic limit is the
+    /// plan's `quota_exceeded`.
+    #[test]
+    fn event_and_async_codes_have_their_statuses() {
+        assert_eq!(status_for_code("topic_exists"), StatusCode::CONFLICT);
+        assert_eq!(status_for_code("stream_full"), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(status_for_code("async_not_allowed"), StatusCode::FORBIDDEN);
+        assert_eq!(status_for_code("async_backlog_full"), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(status_for_code("unavailable"), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status_for_code("trigger_not_allowed"), StatusCode::FORBIDDEN);
+        let e = ApiError::from(rt_store::StoreError::Conflict("topic_limit"));
+        assert_eq!(e.code, "quota_exceeded");
+        assert_eq!(e.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

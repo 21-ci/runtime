@@ -257,6 +257,65 @@ fn valid_secret_name(n: &str) -> bool {
         && !n.starts_with("RT_")
 }
 
+/// `scaling.min_run_time_ms` may not exceed `min(plan.limits_max.min_run_time_ms, node max)`
+/// (`sched.min_run_time_max_ms`): refused with 422 `limit_exceeds_plan` instead of being clamped.
+fn check_scaling_bounds(plan: &Plan, node_max: u64, sc: &ScalingConfig) -> Result<(), ApiError> {
+    if let Some(v) = sc.min_run_time_ms {
+        let max = plan.limits_max.min_run_time_ms.min(node_max);
+        if v > max {
+            return Err(ApiError::new(
+                "limit_exceeds_plan",
+                format!("`scaling.min_run_time_ms` {v} exceeds the maximum {max}"),
+            )
+            .with_details(json!({"field": "min_run_time_ms", "requested": v, "max": max})));
+        }
+    }
+    Ok(())
+}
+
+/// The `events` block of a request: parsed and checked (bounds, grammars, duplicates).
+fn events_block(v: Option<Value>) -> Result<Option<rt_types::events::EventsConfig>, ApiError> {
+    let ev: Option<rt_types::events::EventsConfig> = block("events", v)?;
+    if let Some(e) = &ev {
+        e.validate().map_err(ApiError::invalid)?;
+    }
+    Ok(ev)
+}
+
+/// The `async` block of a request: parsed and checked.
+fn async_block(v: Option<Value>) -> Result<Option<rt_types::events::AsyncInvokeConfig>, ApiError> {
+    let a: Option<rt_types::events::AsyncInvokeConfig> = block("async", v)?;
+    if let Some(c) = &a {
+        c.validate().map_err(ApiError::invalid)?;
+    }
+    Ok(a)
+}
+
+/// A service's `events` block against its durability and plan: durable services cannot subscribe
+/// or consume (422 `validation_failed`); subscriptions need the `pubsub` trigger and consumers the
+/// `stream` trigger of the plan (403 `trigger_not_allowed`).
+fn check_events_allowed(plan: &Plan, durable: bool, ev: &rt_types::events::EventsConfig) -> Result<(), ApiError> {
+    if ev.is_unset() {
+        return Ok(());
+    }
+    if durable {
+        return Err(ApiError::invalid("durable services cannot subscribe or consume in v1"));
+    }
+    let need = [
+        (!ev.subscribe.is_empty(), TriggerKind::Pubsub, "events.subscribe"),
+        (!ev.consume.is_empty(), TriggerKind::Stream, "events.consume"),
+    ];
+    for (used, kind, field) in need {
+        if used && !plan.allows_trigger(kind) {
+            return Err(ApiError::new(
+                "trigger_not_allowed",
+                format!("the plan does not allow the `{}` trigger (`{field}`)", kind.as_str()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn check_limits(plan: &Plan, l: &LimitsConfig) -> Result<(), ApiError> {
     let over = |field: &str, requested: u64, max: u64| {
         ApiError::new(
@@ -613,6 +672,16 @@ async fn service_view(s: &ApiState, svc: &Service) -> Result<ServiceView, ApiErr
         } else {
             blk(&svc.config.ws)
         },
+        events: if svc.config.events.is_unset() {
+            Value::Null
+        } else {
+            blk(&svc.config.events)
+        },
+        async_invoke: if svc.config.async_invoke.is_unset() {
+            Value::Null
+        } else {
+            blk(&svc.config.async_invoke)
+        },
         status: ServiceStatus {
             build_state,
             tier: tier.to_string(),
@@ -675,6 +744,8 @@ fn admission_view_of(
             ago_ms: u64::try_from(c.ago.as_millis()).unwrap_or(u64::MAX),
         }),
         idle_ms: u64::try_from(sc.idle_for.as_millis()).unwrap_or(u64::MAX),
+        pred_ms: sc.pred[0].map(ms_f64),
+        pred_background_ms: sc.pred[1].map(ms_f64),
     }
 }
 
@@ -1157,6 +1228,8 @@ async fn tenants_delete(
         }
     }
     s.meta.delete_tenant(id, purge).await?;
+    // Topics are tenant resources: they go with the tenant (records, cursors, dead letters).
+    s.streams.purge_tenant(id).await?;
     for svc in services {
         if purge {
             let _ = s.data.retire(svc);
@@ -1313,6 +1386,8 @@ async fn services_create(
     let limits: LimitsConfig = block("limits", b.limits)?.unwrap_or_default();
     let scaling: ScalingConfig = block("scaling", b.scaling)?.unwrap_or_default();
     scaling.validate().map_err(ApiError::invalid)?;
+    let events = events_block(b.events)?.unwrap_or_default();
+    let async_invoke = async_block(b.async_invoke)?.unwrap_or_default();
     let triggers: TriggerSwitches = block("triggers", b.triggers)?.unwrap_or_default();
     let ingress: IngressRules = block("ingress", b.ingress)?.unwrap_or_default();
     let egress: EgressRules = block("egress", b.egress)?.unwrap_or_default();
@@ -1344,6 +1419,8 @@ async fn services_create(
     }
     let plan = s.plans.plan_for(tenant);
     check_limits(&plan, &limits)?;
+    check_scaling_bounds(&plan, s.config.load().sched.min_run_time_max_ms, &scaling)?;
+    check_events_allowed(&plan, durable, &events)?;
     let current = s.meta.count_services(tenant).await?;
     s.quotas.check(tenant, QuotaOp::CreateService { current })?;
     let svc = s
@@ -1370,8 +1447,8 @@ async fn services_create(
                     deno,
                     durable,
                     ws,
-                    events: Default::default(),
-                    async_invoke: Default::default(),
+                    events,
+                    async_invoke,
                 },
             },
             warm_floor_cap(&plan),
@@ -1499,10 +1576,18 @@ async fn services_patch(
         triggers: block("triggers", b.triggers)?,
         ingress: block("ingress", b.ingress)?,
         egress: block("egress", b.egress)?,
-        events: Default::default(),
-        async_invoke: Default::default(),
+        events: events_block(b.events)?,
+        async_invoke: async_block(b.async_invoke)?,
     };
     check_ingress_egress(patch.ingress.as_ref(), patch.egress.as_ref())?;
+    let plan = s.plans.plan_for(svc.tenant_id);
+    if let Some(sc) = &patch.scaling {
+        check_scaling_bounds(&plan, s.config.load().sched.min_run_time_max_ms, sc)?;
+    }
+    if patch.events.is_some() || patch.durable.is_some() {
+        let durable = patch.durable.unwrap_or(svc.config.durable);
+        check_events_allowed(&plan, durable, patch.events.as_ref().unwrap_or(&svc.config.events))?;
+    }
     // `min_instances` / `max_instances` come from the scaling block (and the profile's ceiling):
     // the scheduler learns the new bounds with the service's next request, but a floor it holds for
     // an idle service must not outlive an update that may have removed it (D-B2)
@@ -3193,6 +3278,87 @@ pub fn control_router(state: ApiState) -> Router {
 // Unused-import guard for items only referenced from generated OpenAPI code.
 #[allow(dead_code)]
 fn _types(_: Digest, _: ServiceConfig) {}
+
+#[cfg(test)]
+mod event_block_tests {
+    use super::{async_block, check_events_allowed, check_scaling_bounds, events_block};
+    use rt_types::events::EventsConfig;
+    use rt_types::{Plan, ScalingConfig, TriggerKind};
+    use serde_json::json;
+
+    fn scaling(ms: u64) -> ScalingConfig {
+        ScalingConfig {
+            min_run_time_ms: Some(ms),
+            ..ScalingConfig::default()
+        }
+    }
+
+    /// `min_run_time_ms` is bounded by the smaller of the plan cap and the node max, and over it
+    /// is refused with `limit_exceeds_plan` naming the field and the effective maximum.
+    #[test]
+    fn scaling_bounds_use_the_smaller_of_plan_and_node_max() {
+        let plan = Plan::default(); // 60 s
+        check_scaling_bounds(&plan, 600_000, &ScalingConfig::default()).expect("unset");
+        check_scaling_bounds(&plan, 600_000, &scaling(60_000)).expect("at the plan cap");
+        let e = check_scaling_bounds(&plan, 600_000, &scaling(60_001)).expect_err("over the plan");
+        assert_eq!(e.code, "limit_exceeds_plan");
+        assert_eq!(e.details["field"], "min_run_time_ms");
+        assert_eq!(e.details["max"], 60_000);
+        let e = check_scaling_bounds(&plan, 1_000, &scaling(2_000)).expect_err("over the node max");
+        assert_eq!(e.details["max"], 1_000);
+        check_scaling_bounds(&plan, 1_000, &scaling(0)).expect("zero is allowed");
+    }
+
+    /// Block validation names the field; unknown keys and bad values are `validation_failed`.
+    #[test]
+    fn event_and_async_blocks_are_validated_with_field_names() {
+        assert!(events_block(None).expect("absent").is_none());
+        let ok = events_block(Some(
+            json!({"subscribe": [{"subject": "orders.*"}], "consume": [{"topic": "orders"}]}),
+        ))
+        .expect("valid")
+        .expect("some");
+        assert_eq!(ok.consume[0].group, "default");
+        let e = events_block(Some(json!({"subscribe": [{"subject": "a.>.b"}]}))).expect_err("bad pattern");
+        assert_eq!(e.code, "validation_failed");
+        assert!(e.message.contains("events.subscribe[0].subject"), "{}", e.message);
+        let e = events_block(Some(json!({"consume": [{"topic": "tpc_x"}]}))).expect_err("id prefix");
+        assert!(e.message.contains("events.consume[0].topic"), "{}", e.message);
+        let e = events_block(Some(json!({"nope": 1}))).expect_err("unknown key");
+        assert!(e.message.contains("invalid `events`"), "{}", e.message);
+
+        assert!(async_block(Some(json!({"enabled": true}))).expect("valid").is_some());
+        let e = async_block(Some(json!({"max_attempts": 0}))).expect_err("zero attempts");
+        assert!(e.message.contains("async.max_attempts"), "{}", e.message);
+        let e = async_block(Some(json!({"max_event_age_s": 5}))).expect_err("too short");
+        assert!(e.message.contains("async.max_event_age_s"), "{}", e.message);
+    }
+
+    /// Durable services cannot subscribe or consume; a plan without the `pubsub` / `stream`
+    /// trigger refuses the matching part with `trigger_not_allowed`; an empty block always passes.
+    #[test]
+    fn event_blocks_need_a_non_durable_service_and_the_plan_triggers() {
+        let mut ev = EventsConfig::default();
+        let mut plan = Plan::default();
+        plan.allowed_triggers
+            .retain(|k| !matches!(k, TriggerKind::Pubsub | TriggerKind::Stream));
+        check_events_allowed(&plan, true, &ev).expect("empty block");
+        ev.subscribe.push(rt_types::events::Subscription {
+            subject: "a".into(),
+            group: None,
+        });
+        let e = check_events_allowed(&Plan::default(), true, &ev).expect_err("durable");
+        assert_eq!(e.code, "validation_failed");
+        check_events_allowed(&Plan::default(), false, &ev).expect("free plan allows pubsub");
+        let e = check_events_allowed(&plan, false, &ev).expect_err("no pubsub");
+        assert_eq!(e.code, "trigger_not_allowed");
+        assert!(e.message.contains("pubsub"));
+        ev.subscribe.clear();
+        ev.consume.push(rt_types::events::StreamConsumer::new("orders"));
+        let e = check_events_allowed(&plan, false, &ev).expect_err("no stream");
+        assert!(e.message.contains("stream"));
+    }
+}
 
 #[cfg(test)]
 mod tests {
