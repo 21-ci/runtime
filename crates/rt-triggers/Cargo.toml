@@ -1,0 +1,49 @@
+[package]
+name = "rt-triggers"
+description = "Route table, schedule engine (interval + cron), queue engine, call depth (L5)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rt-types.workspace = true
+rt-obs.workspace = true
+rt-sched.workspace = true
+rt-sec.workspace = true
+rt-host.workspace = true
+rt-config.workspace = true
+rt-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+arc-swap.workspace = true
+cron.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+async-trait.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+rand.workspace = true
+tracing.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+http.workspace = true
+tokio-tungstenite.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+rt-testkit.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
