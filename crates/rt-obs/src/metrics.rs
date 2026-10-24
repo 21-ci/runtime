@@ -253,7 +253,7 @@ pub struct Metrics {
     pub stream_skipped_total: IntCounterVec, // reason = exhausted|out_of_range
     pub async_accepted_total: IntCounter,
     pub async_throttled_total: IntCounter,
-    pub async_finished_total: IntCounterVec, // condition = success|retries_exhausted|event_age_exceeded
+    pub async_finished_total: IntCounterVec, // condition = success|retries_exhausted|event_age_exceeded|unreadable
     pub async_failed_evicted_total: IntCounter,
     pub instance_keepalive_total: IntCounterVec, // kind = deno|wasm, outcome = kept|handoff|disposed|reused|expired|shed
     // Opt-in per-service
@@ -545,7 +545,7 @@ impl Metrics {
         for reason in ["exhausted", "out_of_range"] {
             stream_skipped_total.with_label_values(&[reason]).inc_by(0);
         }
-        for condition in ["success", "retries_exhausted", "event_age_exceeded"] {
+        for condition in ["success", "retries_exhausted", "event_age_exceeded", "unreadable"] {
             async_finished_total.with_label_values(&[condition]).inc_by(0);
         }
         for kind in ["deno", "wasm"] {
