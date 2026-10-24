@@ -409,40 +409,16 @@ impl Shared {
         }
     }
 
-    /// The stored request cannot be used: fail it without running the handler. The store fails a
-    /// record only at its last attempt, so the remaining attempts are used up at once (no
-    /// backoff, no task) by re-leasing just this record's service.
+    /// The stored request cannot be used: fail it at once, without running the handler and
+    /// without spending the remaining attempts.
     async fn fail_unreadable(&self, inv: LeasedInvocation, code: &'static str) {
-        let mut inv = inv;
-        loop {
-            if self.fail(&inv, code, None, Duration::ZERO).await {
-                return;
+        match self.store.fail_now(inv.id, inv.attempt, code).await {
+            Ok(()) => {
+                self.finished("unreadable");
+                self.count_evicted();
             }
-            // Lease again: the record is due now. Other due records of the service leased by the
-            // same call are released untouched.
-            let leased = match self
-                .store
-                .lease_invocations(inv.service, 64, Duration::from_secs(60))
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "async: lease failed");
-                    return;
-                }
-            };
-            let mut next = None;
-            for other in leased {
-                if other.id == inv.id {
-                    next = Some(other);
-                } else if let Err(e) = self.store.release(other.id, other.attempt, Duration::ZERO).await {
-                    tracing::warn!(error = %e, "async: release failed");
-                }
-            }
-            match next {
-                Some(n) => inv = n,
-                None => return,
-            }
+            Err(StoreError::NotFound) => tracing::warn!(id = %inv.id, "async: late failure ignored"),
+            Err(e) => tracing::warn!(error = %e, "async: fail failed"),
         }
     }
 }
