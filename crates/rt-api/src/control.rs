@@ -915,7 +915,7 @@ async fn plans_list(State(s): State<ApiState>, a: Auth) -> R<Vec<PlanView>> {
 /// `info.version` of the OpenAPI document, computed once.
 fn api_version() -> &'static str {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    V.get_or_init(|| ApiDoc::openapi().info.version)
+    V.get_or_init(|| api_doc().info.version)
 }
 
 /// The node and API versions; any authenticated caller (no node internals).
@@ -3002,6 +3002,16 @@ async fn data_export(State(s): State<ApiState>, a: Auth, Path(id): Path<String>)
 )]
 pub struct ApiDoc;
 
+/// The complete OpenAPI document: [`ApiDoc`] merged with the event modules' own documents
+/// (`topics`, `consumers`, `invocations`). Served, rendered and checked against `openapi/openapi.json`.
+pub fn api_doc() -> utoipa::openapi::OpenApi {
+    let mut doc = ApiDoc::openapi();
+    doc.merge(crate::topics::Doc::openapi());
+    doc.merge(crate::consumers::Doc::openapi());
+    doc.merge(crate::invocations::Doc::openapi());
+    doc
+}
+
 /// Errors any authenticated route can answer, documented on every operation (OAPI-003): a missing
 /// or bad credential (401), a missing scope or plan limit (403), the failed-auth or rate limiter
 /// (429), and an unknown or foreign id (404) on paths that name one.
@@ -3050,12 +3060,12 @@ impl utoipa::Modify for CommonErrors {
 }
 
 async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
-    Json(ApiDoc::openapi())
+    Json(api_doc())
 }
 
 /// The OpenAPI document as pretty JSON (used by `rt openapi` / `make openapi`).
 pub fn openapi_json_string() -> String {
-    ApiDoc::openapi()
+    api_doc()
         .to_pretty_json()
         .unwrap_or_else(|e| format!("{{\"error\":\"openapi serialization failed: {e}\"}}"))
 }
@@ -3158,6 +3168,10 @@ pub fn control_router(state: ApiState) -> Router {
             "/v1/sdk-grants",
             get(crate::sdks::grants_list).put(crate::sdks::grants_put),
         )
+        // event modules (feature stubs until their owners fill them in)
+        .merge(crate::topics::routes())
+        .merge(crate::consumers::routes())
+        .merge(crate::invocations::routes())
         .route("/v1/openapi.json", get(openapi_json))
         .fallback(not_found_fallback)
         // JSON bodies are capped by `ApiJson`, uploads by `read_upload`; anything else stays small.
@@ -3168,7 +3182,7 @@ pub fn control_router(state: ApiState) -> Router {
     let router = Router::new()
         .merge(api.with_state(state))
         .merge(mcp)
-        .merge(Scalar::with_url("/docs", ApiDoc::openapi()));
+        .merge(Scalar::with_url("/docs", api_doc()));
     crate::invoke::with_http_metrics(router, metrics, "control")
 }
 
@@ -3178,12 +3192,11 @@ fn _types(_: Digest, _: ServiceConfig) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{host_under_suffix, redact_config, strip_userinfo, ApiDoc};
+    use super::{api_doc, host_under_suffix, redact_config, strip_userinfo};
     use serde_json::{json, Value};
-    use utoipa::OpenApi;
 
     fn doc() -> Value {
-        serde_json::to_value(ApiDoc::openapi()).expect("document")
+        serde_json::to_value(api_doc()).expect("document")
     }
 
     /// Every parameter that is not part of the path is a query parameter, and an `Option` one is

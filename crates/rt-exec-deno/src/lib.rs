@@ -22,6 +22,7 @@ pub mod loader;
 pub mod memory;
 pub mod ops;
 pub mod ops_durable;
+pub mod ops_events;
 pub mod ops_sqlite;
 pub mod ops_ws;
 pub mod platform;

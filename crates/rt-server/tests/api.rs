@@ -22,6 +22,8 @@ mod edge_mcp;
 mod edge_upload;
 #[path = "api/introspection.rs"]
 mod introspection;
+#[path = "api/invocations_api.rs"]
+mod invocations_api;
 #[path = "api/mcp.rs"]
 mod mcp;
 #[path = "api/openapi.rs"]
@@ -34,3 +36,5 @@ mod sdk;
 mod tenancy;
 #[path = "api/tokens.rs"]
 mod tokens;
+#[path = "api/topics_api.rs"]
+mod topics_api;
