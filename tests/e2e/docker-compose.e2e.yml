@@ -1,0 +1,6 @@
+# Compose override for the E2E run (scripts/e2e.sh passes it after docker-compose.yml):
+# the node reads tests/e2e/rt.e2e.toml, which defines the `pro` plan the E2E tenants use.
+services:
+  rt:
+    volumes:
+      - ./tests/e2e/rt.e2e.toml:/etc/rt/rt.toml:ro
