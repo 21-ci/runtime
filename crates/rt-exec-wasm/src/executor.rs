@@ -102,6 +102,8 @@ pub struct WasmExecutor {
     /// The process-wide idle-slot budget (shared by every Machine in production).
     slots: Arc<IdleSlots>,
     reuse_max_idle: usize,
+    /// [`Executor::wake_signal`]: an instance was stashed (its expiry may be the next deadline).
+    signal: Arc<tokio::sync::Notify>,
     metrics: Option<Arc<Metrics>>,
     /// The autoscaler's per-P warm targets (`None`: no warm pool).
     warm: Option<Arc<WarmTargets>>,
@@ -131,6 +133,7 @@ impl WasmExecutor {
             idle,
             slots,
             reuse_max_idle: DEFAULT_REUSE_MAX_IDLE,
+            signal: Arc::default(),
             metrics: None,
             warm: None,
             proc: None,
@@ -373,6 +376,7 @@ impl Executor for WasmExecutor {
             idle: self.idle.clone(),
             slots: self.slots.clone(),
             reuse_max_idle: self.reuse_max_idle,
+            signal: self.signal.clone(),
             metrics: self.metrics.clone(),
             warm: self.warm.clone(),
         }))
@@ -380,6 +384,24 @@ impl Executor for WasmExecutor {
 
     fn interrupter(&self) -> Arc<dyn Interrupter> {
         self.interrupter.clone()
+    }
+
+    /// The earliest own keep-alive end (`min_run_time`) of a used idle instance that is still
+    /// ahead: past ones were dropped by the housekeeping before the park, or are kept by the warm
+    /// floor (never expire), so they are not reported (that would spin the Machine).
+    fn next_deadline(&self) -> Option<Instant> {
+        let now = Instant::now();
+        let pool = self.idle.lock();
+        pool.map
+            .values()
+            .flat_map(|l| l.used.iter())
+            .filter_map(|i| i.expires)
+            .filter(|e| *e > now)
+            .min()
+    }
+
+    fn wake_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(self.signal.clone())
     }
 
     fn on_idle(&mut self, budget: Duration) {
@@ -482,6 +504,7 @@ struct Args {
     idle: Arc<Mutex<IdlePool>>,
     slots: Arc<IdleSlots>,
     reuse_max_idle: usize,
+    signal: Arc<tokio::sync::Notify>,
     metrics: Option<Arc<Metrics>>,
     warm: Option<Arc<WarmTargets>>,
 }
@@ -777,6 +800,7 @@ async fn run_task(a: Args) -> Outcome {
         idle,
         slots,
         reuse_max_idle,
+        signal,
         metrics,
         warm,
     } = a;
@@ -997,6 +1021,7 @@ async fn run_task(a: Args) -> Outcome {
         reuse,
         idle_ttl,
         reuse_max_idle,
+        signal,
         unregister,
         warm,
         min_run_time,
@@ -1307,6 +1332,8 @@ struct Driver {
     reuse: bool,
     idle_ttl: Duration,
     reuse_max_idle: usize,
+    /// [`Executor::wake_signal`]: notified when an instance is stashed with its own expiry.
+    signal: Arc<tokio::sync::Notify>,
     unregister: Unregister,
     /// Warm targets (the floor) and the admission backlog (`WarmTargets::waiting`).
     warm: Option<Arc<WarmTargets>>,
@@ -1339,6 +1366,7 @@ impl Driver {
             reuse,
             idle_ttl,
             reuse_max_idle,
+            signal,
             unregister,
             warm,
             min_run_time,
@@ -1524,6 +1552,8 @@ impl Driver {
                     };
                     if parked.stash(store, guest, uses, env) {
                         keepalive(&metrics, outcome, 1);
+                        // A parked Machine re-reads `next_deadline` (this expiry may be the next).
+                        signal.notify_one();
                     }
                 }
                 None => {

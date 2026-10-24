@@ -207,8 +207,25 @@ async fn machine_loop(core: Arc<SchedInner>, m: Arc<Machine>) {
         // (flag, per-kind count and P status). A parked spinner blocks every `wakep` and the
         // lost-wakeup guard, so its LRQ-queued work would never be picked up: undo it.
         core.mark_idle(&m);
-        m.notify.notified().await;
+        park(&m, &mrt).await;
         m.parked.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Sleep until the Machine is notified, an executor signals deferred work, or the executors'
+/// earliest timed housekeeping is due (a kept instance expires on an idle Machine). The loop then
+/// continues normally: `between_tasks` trims and disposes.
+async fn park(m: &Machine, mrt: &MachineRt) {
+    let signals = mrt.wake_signals();
+    let signal = |i: usize| signals.get(i).cloned();
+    let (s0, s1, s2) = (signal(0), signal(1), signal(2));
+    let deadline = mrt.next_deadline().map(tokio::time::Instant::from_std);
+    tokio::select! {
+        () = m.notify.notified() => {}
+        () = async { s0.as_ref().expect("guarded").notified().await }, if s0.is_some() => {}
+        () = async { s1.as_ref().expect("guarded").notified().await }, if s1.is_some() => {}
+        () = async { s2.as_ref().expect("guarded").notified().await }, if s2.is_some() => {}
+        () = async { tokio::time::sleep_until(deadline.expect("guarded")).await }, if deadline.is_some() => {}
     }
 }
 
@@ -310,5 +327,165 @@ fn sysmon_main(core: Arc<SchedInner>) {
             break;
         }
         core.sysmon_run(&mut st);
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use parking_lot::Mutex;
+    use rt_types::{Outcome, Reply, TaskId, TaskKind, TaskSpec};
+
+    use crate::config::KindRange;
+    use crate::executor::{ExecCx, Executor, Interrupt, Interrupter, TaskFuture, UnitSource};
+    use crate::{SchedConfig, Scheduler, SystemClock};
+
+    struct NoInterrupts;
+
+    impl Interrupter for NoInterrupts {
+        fn interrupt(&self, _task: TaskId, _what: Interrupt) {}
+    }
+
+    /// Shared state of the timed executor: the deadline it reports, when it housekept.
+    #[derive(Default)]
+    struct State {
+        deadline: Option<Instant>,
+        housekept: Vec<Instant>,
+        signal: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    /// Reports `State::deadline` (cleared by housekeeping once due, like a trimmed expiry).
+    struct Timed(Arc<Mutex<State>>);
+
+    impl Timed {
+        fn housekeep(&self) {
+            let mut s = self.0.lock();
+            let now = Instant::now();
+            s.housekept.push(now);
+            if s.deadline.is_some_and(|d| d <= now) {
+                s.deadline = None;
+            }
+        }
+    }
+
+    impl Executor for Timed {
+        const KIND: TaskKind = TaskKind::DENO;
+        type Prepared = ();
+
+        fn start(&mut self, _spec: TaskSpec, _prepared: Arc<()>, _cx: ExecCx) -> TaskFuture {
+            Box::pin(async { Outcome::Ok(Reply::ok()) })
+        }
+        fn interrupter(&self) -> Arc<dyn Interrupter> {
+            Arc::new(NoInterrupts)
+        }
+        fn on_idle(&mut self, _budget: Duration) {
+            self.housekeep();
+        }
+        fn between_tasks(&mut self, _budget: Duration) {
+            self.housekeep();
+        }
+        fn next_deadline(&self) -> Option<Instant> {
+            self.0.lock().deadline
+        }
+        fn wake_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+            self.0.lock().signal.clone()
+        }
+    }
+
+    fn sched(state: &Arc<Mutex<State>>) -> Scheduler {
+        let cfg = SchedConfig {
+            processors: 1,
+            deno: KindRange { min: 1, max: 1 },
+            wasm: KindRange { min: 0, max: 0 },
+            build_processors: 0,
+            spare_machines: 0,
+            ..SchedConfig::default()
+        };
+        let st = state.clone();
+        Scheduler::builder(
+            cfg,
+            Arc::new(SystemClock::new()),
+            rt_testkit::TestGovernor::with_mb(256),
+        )
+        .executor(move || Timed(st.clone()), Arc::new(UnitSource), 0)
+        .build()
+        .expect("real scheduler builds")
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(f)
+    }
+
+    fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        cond()
+    }
+
+    /// Run one task so the Machine creates its executor, then let it park.
+    fn warm_up(s: &Scheduler, state: &Arc<Mutex<State>>) {
+        let spec = rt_testkit::SpecBuilder::deno().service(1).http_get("/").finish();
+        let h = s.submit(spec).unwrap_or_else(|e| panic!("admitted: {}", e.reason()));
+        assert!(matches!(block_on(h), Outcome::Ok(_)));
+        assert!(wait_until(Duration::from_secs(2), || !state
+            .lock()
+            .housekept
+            .is_empty()));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_parked_machine_wakes_at_the_executor_deadline_and_housekeeps() {
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(Mutex::new(State {
+            signal: Some(signal.clone()),
+            ..State::default()
+        }));
+        let s = sched(&state);
+        warm_up(&s, &state);
+        // The deadline appears while the Machine is parked (a task kept its instance); the
+        // executor's signal makes the Machine re-read it.
+        let due = Instant::now() + Duration::from_millis(200);
+        state.lock().deadline = Some(due);
+        signal.notify_one();
+        assert!(
+            wait_until(Duration::from_secs(2), || state
+                .lock()
+                .housekept
+                .iter()
+                .any(|t| *t >= due)),
+            "the idle Machine housekept at its executor's deadline"
+        );
+        assert!(state.lock().deadline.is_none());
+        block_on(s.shutdown(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn an_executor_signal_wakes_a_parked_machine() {
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(Mutex::new(State {
+            signal: Some(signal.clone()),
+            ..State::default()
+        }));
+        let s = sched(&state);
+        warm_up(&s, &state);
+        let before = state.lock().housekept.len();
+        signal.notify_one();
+        assert!(
+            wait_until(Duration::from_secs(2), || state.lock().housekept.len() > before),
+            "the signal woke the Machine to housekeep"
+        );
+        block_on(s.shutdown(Duration::from_millis(500)));
     }
 }

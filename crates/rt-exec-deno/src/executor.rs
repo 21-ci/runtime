@@ -39,8 +39,8 @@
 //! then taken from the pool instead of being created on the request path).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashMap};
 use std::future::{poll_fn, Future};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -87,6 +87,37 @@ struct Shared {
     warming: HashMap<(TenantId, ServiceId), usize>,
     /// Numbers the ids of warm-up tasks.
     warmups: u64,
+    /// Keep-alive ends of parked isolates (coalesced within [`EXPIRY_SLACK`]): what
+    /// [`Executor::next_deadline`] reports so an idle Machine wakes to expire them.
+    expiries: BTreeSet<Instant>,
+    /// [`Executor::wake_signal`]: notified when an isolate is parked or queued for disposal.
+    signal: Arc<tokio::sync::Notify>,
+}
+
+/// Expiries this close together share one wake-up (the later one): an isolate expires at most
+/// this late on an idle Machine, and the set holds at most one entry per slack of keep-alive.
+const EXPIRY_SLACK: Duration = Duration::from_millis(50);
+
+impl Shared {
+    /// Remember a keep-alive end for [`Executor::next_deadline`] and wake a parked Machine.
+    fn note_expiry(&mut self, at: Instant) {
+        if self.expiries.range(at..=at + EXPIRY_SLACK).next().is_none() {
+            self.expiries.insert(at + EXPIRY_SLACK);
+        }
+        self.signal.notify_one();
+    }
+
+    /// The next keep-alive end after `now`; past ones were handled by the housekeeping that ran
+    /// before the Machine parks (expired, or protected by the warm floor) and are forgotten.
+    fn next_expiry(&mut self, now: Instant) -> Option<Instant> {
+        while let Some(&first) = self.expiries.first() {
+            if first > now {
+                return Some(first);
+            }
+            self.expiries.pop_first();
+        }
+        None
+    }
 }
 
 /// What a warm-up needs of a service: the limits and knobs of its latest task and its artifact.
@@ -221,6 +252,14 @@ impl Executor for DenoExecutor {
 
     fn interrupter(&self) -> Arc<dyn Interrupter> {
         self.interrupter.clone()
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.shared.borrow_mut().next_expiry(Instant::now())
+    }
+
+    fn wake_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(self.shared.borrow().signal.clone())
     }
 
     fn on_idle(&mut self, budget: Duration) {
@@ -792,6 +831,7 @@ fn dispose_later(shared: &Rc<RefCell<Shared>>, backlog: u32, mut iso: Isolate) {
     let overflow = {
         let mut s = shared.borrow_mut();
         s.dispose.push_back(iso);
+        s.signal.notify_one();
         if s.dispose.len() > backlog as usize {
             s.dispose.pop_front()
         } else {
@@ -1420,11 +1460,12 @@ impl Driver {
         };
         let bound = warm_keep(cfg, &id).bound;
         let total = cfg.reuse_max_idle_total as usize;
-        let out = self
-            .shared
-            .borrow_mut()
-            .warm
-            .park(&id, iso, now, expires, handoff, bound, total, |i| target_of(cfg, i));
+        let out = {
+            let mut s = self.shared.borrow_mut();
+            s.note_expiry(expires);
+            s.warm
+                .park(&id, iso, now, expires, handoff, bound, total, |i| target_of(cfg, i))
+        };
         keepalive(metrics, if handoff { "handoff" } else { "kept" }, 1);
         for i in out {
             dispose_later(&self.shared, cfg.dispose_backlog, i);
