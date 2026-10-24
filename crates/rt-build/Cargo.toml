@@ -1,0 +1,46 @@
+[package]
+name = "rt-build"
+description = "Validation, TS transpile, specifier resolution, fetch, bundle, rt.lock, code cache / precompile traits (L4)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rt-types.workspace = true
+rt-mem.workspace = true
+rt-obs.workspace = true
+rt-store.workspace = true
+rt-host.workspace = true
+deno_ast.workspace = true
+wasmparser.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+url.workspace = true
+tar.workspace = true
+zip.workspace = true
+flate2.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+http.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+rt-testkit.workspace = true
+http.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
