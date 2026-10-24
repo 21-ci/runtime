@@ -254,6 +254,15 @@ pub struct CreateServiceBody {
     /// WebSocket knobs: `{"allowed_origins": [..], "warm": bool}`.
     #[schema(value_type = Option<Object>)]
     pub ws: Option<serde_json::Value>,
+    /// Pub/sub subscriptions and stream consumers: `{"subscribe": [{"subject", "group"?}],
+    /// "consume": [{"topic", "group", "start", "batch_size", "max_attempts", "on_exhausted"}]}`.
+    /// Needs the plan to allow the `pubsub` / `stream` triggers; refused for durable services.
+    #[schema(value_type = Option<Object>)]
+    pub events: Option<serde_json::Value>,
+    /// Async invocation: `{"enabled": bool, "max_attempts": 1..=10, "max_event_age_s": 60..=86400}`.
+    #[serde(rename = "async")]
+    #[schema(value_type = Option<Object>)]
+    pub async_invoke: Option<serde_json::Value>,
 }
 
 /// Top-level block merge: each provided block replaces that block.
@@ -291,6 +300,15 @@ pub struct PatchServiceBody {
     /// Replaces the `ws` block (`allowed_origins`, `warm`).
     #[schema(value_type = Option<Object>)]
     pub ws: Option<serde_json::Value>,
+    /// Pub/sub subscriptions and stream consumers: `{"subscribe": [{"subject", "group"?}],
+    /// "consume": [{"topic", "group", "start", "batch_size", "max_attempts", "on_exhausted"}]}`.
+    /// Needs the plan to allow the `pubsub` / `stream` triggers; refused for durable services.
+    #[schema(value_type = Option<Object>)]
+    pub events: Option<serde_json::Value>,
+    /// Async invocation: `{"enabled": bool, "max_attempts": 1..=10, "max_event_age_s": 60..=86400}`.
+    #[serde(rename = "async")]
+    #[schema(value_type = Option<Object>)]
+    pub async_invoke: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -353,6 +371,10 @@ pub struct AdmissionView {
     pub last_change: Option<LimitChangeView>,
     /// Milliseconds since the service last started or finished a task.
     pub idle_ms: u64,
+    /// Predicted slot time (ms) of an interactive task (HTTP, calls, pub/sub); `null` before samples.
+    pub pred_ms: Option<f64>,
+    /// Predicted slot time (ms) of a background task (queue, stream, schedules); `null` before samples.
+    pub pred_background_ms: Option<f64>,
 }
 
 /// One move of a service's concurrency limit (`admission.last_change`).
@@ -413,6 +435,14 @@ pub struct ServiceView {
     #[serde(skip_serializing_if = "serde_json::Value::is_null")]
     #[schema(value_type = Object)]
     pub ws: serde_json::Value,
+    /// The `events` block; omitted while it has no subscription or consumer.
+    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
+    #[schema(value_type = Object)]
+    pub events: serde_json::Value,
+    /// The `async` block; omitted while no knob is set.
+    #[serde(rename = "async", skip_serializing_if = "serde_json::Value::is_null")]
+    #[schema(value_type = Object)]
+    pub async_invoke: serde_json::Value,
     pub status: ServiceStatus,
     /// Each value with its source: `{"cpu_ms": {"value": 1000, "source": "profile:balanced"}}`.
     #[schema(value_type = Object)]

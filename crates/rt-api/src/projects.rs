@@ -211,6 +211,15 @@ pub(crate) async fn projects_patch(
     }
     if let Some(e) = &b.environments {
         check_environments(e)?;
+        // Topics live in an environment too: dropping one that still has topics is refused.
+        for gone in cur.environments.iter().filter(|x| !e.contains(x)) {
+            if s.streams.count_topics_in(cur.tenant_id, cur.id, Some(gone)).await? > 0 {
+                return Err(ApiError::new(
+                    "environment_in_use",
+                    format!("environment `{gone}` still has topics: delete them first"),
+                ));
+            }
+        }
     }
     let updated = s
         .meta
@@ -246,6 +255,12 @@ pub(crate) async fn projects_delete(
     a.require_scope(Scope::ServicesWrite)?;
     require_unrestricted(&a)?;
     let cur = load(&s, &a, &p).await?;
+    if s.streams.count_topics_in(cur.tenant_id, cur.id, None).await? > 0 {
+        return Err(ApiError::new(
+            "project_not_empty",
+            format!("project `{}` still has topics: delete them first", cur.slug),
+        ));
+    }
     s.meta.delete_project(cur.tenant_id, &cur.slug).await?;
     audit(
         &s,
