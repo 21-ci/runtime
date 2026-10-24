@@ -1707,6 +1707,12 @@ impl MetaStore for SqliteMetaStore {
             if let Some(v) = patch.ws {
                 config.ws = v;
             }
+            if let Some(v) = patch.events {
+                config.events = v;
+            }
+            if let Some(v) = patch.async_invoke {
+                config.async_invoke = v;
+            }
             if patch.environment.as_deref().is_some_and(|e| !rt_types::valid_environment(e)) {
                 return Err(StoreError::Invalid("environment must match ^[a-z][a-z0-9-]{0,31}$".into()));
             }
