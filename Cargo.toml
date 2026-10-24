@@ -16,6 +16,7 @@ members = [
   "crates/rt-exec-wasm",
   "crates/rt-triggers",
   "crates/rt-api",
+  "crates/rt-server",
 ]
 
 [workspace.package]

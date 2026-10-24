@@ -1,0 +1,73 @@
+[package]
+name = "rt-server"
+description = "Binary rt: role selection, wiring, startup, signals, drain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "rt_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rt"
+path = "src/main.rs"
+
+[dependencies]
+rt-types.workspace = true
+rt-config.workspace = true
+rt-mem.workspace = true
+rt-obs.workspace = true
+rt-sec.workspace = true
+rt-sched.workspace = true
+rt-store.workspace = true
+rt-cache.workspace = true
+rt-host.workspace = true
+rt-build.workspace = true
+rt-exec-deno.workspace = true
+rt-exec-wasm.workspace = true
+rt-triggers.workspace = true
+rt-api.workspace = true
+clap.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+async-trait.workspace = true
+zeroize.workspace = true
+mimalloc.workspace = true
+arc-swap.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+futures-util.workspace = true
+chrono.workspace = true
+ipnet.workspace = true
+bytes.workspace = true
+http.workspace = true
+rand.workspace = true
+hex.workspace = true
+url.workspace = true
+axum.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+rt-testkit.workspace = true
+tokio-tungstenite = { workspace = true, features = ["connect"] }
+base64.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+zip.workspace = true
