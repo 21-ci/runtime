@@ -5,6 +5,7 @@ members = [
   "crates/rt-config",
   "crates/rt-obs",
   "crates/rt-mem",
+  "crates/rt-sec",
 ]
 
 [workspace.package]
