@@ -21,7 +21,9 @@ use rt_sec::{
     AuditEvent, AuditSink, DefaultAuthenticator, KeyHasher, KeyLookup, LocalQuotaEnforcer, LocalSecrets, MasterKey,
     PlanSource, QuotaEnforcer, SecretsBackend, SystemClock as WallSystemClock,
 };
-use rt_store::{DataConfig, LocalArtifactStore, LocalServiceData, MetaStore, SqliteMetaStore, SqliteQueueStore};
+use rt_store::{
+    DataConfig, LocalArtifactStore, LocalServiceData, MetaStore, SqliteMetaStore, SqliteQueueStore, SqliteStreamStore,
+};
 use rt_testkit::{MockBuildExecutor, MockDenoExecutor, MockPreparedSource, MockWasmExecutor, ScriptBook};
 use rt_triggers::{HubConfig, RouteTable, SocketHub};
 use rt_types::{
@@ -277,6 +279,8 @@ pub async fn node() -> TestNode {
         queue: queue.clone(),
         delayed: queue.clone(),
         data,
+        streams: SqliteStreamStore::open_in_memory().expect("streams"),
+        invocations: queue.clone(),
         scheduler,
         routes: RouteTable::new(None),
         auth,

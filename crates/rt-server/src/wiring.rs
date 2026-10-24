@@ -49,7 +49,7 @@ use rt_sec::{
 };
 use rt_store::{
     ArtifactStore, DataConfig, LocalArtifactStore, LocalServiceData, MetaStore, PageReq, QueueStore, ServiceDataStore,
-    SqliteMetaStore, SqliteQueueStore,
+    SqliteMetaStore, SqliteQueueStore, SqliteStreamStore, StreamStore,
 };
 use rt_triggers::{
     CallDispatcher, DelayedEngine, DelayedEngineConfig, HubConfig, QueueEngine, QueueEngineConfig, RouteTable,
@@ -107,6 +107,13 @@ async fn save_cache_freq(meta: &dyn MetaStore, deno: &PreparedCache<DenoLoader>,
 async fn purge_queue_rows(queue: &SqliteQueueStore, svc: ServiceId) {
     if let Err(e) = queue.purge_service(svc).await {
         tracing::warn!(error = %e, service = %svc, "purging the queue rows of a deleted service failed");
+    }
+}
+
+/// Drop the stream cursors and dead letters of a deleted service (topics belong to the namespace).
+async fn purge_stream_rows(streams: &dyn StreamStore, svc: ServiceId) {
+    if let Err(e) = streams.purge_service(svc).await {
+        tracing::warn!(error = %e, service = %svc, "purging the stream rows of a deleted service failed");
     }
 }
 
@@ -390,6 +397,8 @@ struct NodeImpl {
     queue_engine: Arc<QueueEngine>,
     /// queue.db: a deleted service's messages, dead letters and one-off schedules go with it.
     queue_db: Arc<SqliteQueueStore>,
+    /// streams.db: a deleted service's cursors and dead letters go with it.
+    streams: Arc<dyn StreamStore>,
     sched_services: Mutex<HashMap<ScheduleId, ServiceId>>,
     build_tx: mpsc::UnboundedSender<BuildJob>,
     deno_cache: Arc<PreparedCache<DenoLoader>>,
@@ -607,6 +616,8 @@ impl NodeInfo for NodeImpl {
                 // queue.db is outside meta.db's cascade (META-010).
                 let q = self.queue_db.clone();
                 tokio::spawn(async move { purge_queue_rows(&q, svc).await });
+                let st = self.streams.clone();
+                tokio::spawn(async move { purge_stream_rows(&*st, svc).await });
             }
             ControlEvent::QueueEnqueued(svc) => self.queue_engine.notify(svc),
             ControlEvent::BuildRequested {
@@ -650,6 +661,8 @@ impl NodeInfo for NodeImpl {
                 }
                 self.sync_floors();
             }
+            // The event engines are wired later (stream engine, async engine): nothing to wake yet.
+            ControlEvent::StreamAppended(_) | ControlEvent::AsyncAccepted(_) | ControlEvent::ConsumersReset(_) => {}
         }
     }
 
@@ -1209,6 +1222,8 @@ pub async fn start_with(
         queue_db.inject_faults(f.clone());
     }
     let queue: Arc<dyn QueueStore> = queue_db.clone();
+    let streams: Arc<dyn StreamStore> =
+        SqliteStreamStore::open(&data_dir.join("streams.db")).map_err(startup("streams.db"))?;
     let artifacts: Arc<dyn ArtifactStore> =
         LocalArtifactStore::open(&data_dir.join("artifacts")).map_err(startup("artifact store"))?;
     let meta = match opts.meta_layer {
@@ -1657,6 +1672,7 @@ pub async fn start_with(
         schedules: schedule_engine.clone(),
         queue_engine: queue_engine.clone(),
         queue_db: queue_db.clone(),
+        streams: streams.clone(),
         sched_services: Mutex::new(HashMap::new()),
         build_tx,
         deno_cache: deno_cache.clone(),
@@ -1678,6 +1694,8 @@ pub async fn start_with(
         queue: queue.clone(),
         delayed: queue_db.clone(),
         data: data.clone(),
+        streams: streams.clone(),
+        invocations: queue_db.clone(),
         scheduler: scheduler.clone(),
         routes: routes.clone(),
         auth: authenticator,
@@ -2324,6 +2342,17 @@ mod tests {
         purge_queue_rows(&queue, ServiceId::from_u128(9)).await;
         assert!(
             logs.contains("purging the queue rows of a deleted service failed"),
+            "{}",
+            logs.text()
+        );
+
+        let streams = SqliteStreamStore::open_in_memory().expect("streams");
+        let sf = rt_store::Faults::new();
+        streams.inject_faults(sf.clone());
+        sf.fail_next(1, rt_store::Fault::Io);
+        purge_stream_rows(&*streams, ServiceId::from_u128(9)).await;
+        assert!(
+            logs.contains("purging the stream rows of a deleted service failed"),
             "{}",
             logs.text()
         );

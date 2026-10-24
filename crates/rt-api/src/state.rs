@@ -17,7 +17,8 @@ use rt_sched::{Clock, Scheduler};
 use rt_sec::{
     AuditSink, Authenticator, IpAllowList, KeyHasher, PlanSource, QuotaEnforcer, SecretsBackend, TrustedProxies,
 };
-use rt_store::{ArtifactStore, DelayedStore, MetaStore, QueueStore, ServiceDataStore};
+use rt_store::queue::InvocationStore;
+use rt_store::{ArtifactStore, DelayedStore, MetaStore, QueueStore, ServiceDataStore, StreamStore};
 use rt_triggers::{RouteTable, ShardedBucket, SocketHub};
 use rt_types::{
     ApiKey, Digest, HttpRequest, KeyId, RouteEntry, RuntimeKind, Schedule, ScheduleId, ServiceId, TaskSpec, TraceCtx,
@@ -54,6 +55,12 @@ pub enum ControlEvent {
     /// deleted, a version went live, a tenant changed): keep what depends on them in step, such as
     /// the `scaling.min_instances` floors (D-B2).
     RoutesRefreshed,
+    /// Records were appended to a topic: wake the stream engine.
+    StreamAppended(rt_types::TopicId),
+    /// An async invocation was accepted: wake the async engine for the service.
+    AsyncAccepted(ServiceId),
+    /// A consumer cursor of the service was reset: drop the stream engine's cached positions.
+    ConsumersReset(ServiceId),
 }
 
 /// Facts and actions only the server knows (cache, V8 build, readiness, live config apply).
@@ -89,6 +96,19 @@ pub trait NodeInfo: Send + Sync {
     fn tier(&self, entry: &RouteEntry) -> &'static str {
         let _ = entry;
         "T3"
+    }
+
+    /// `POST /v1/pubsub/publish`: deliver one message to the subscribers of `subject` in `ns`.
+    /// `Ok((receivers, dropped))`; `Err((code, message))` with a stable error code.
+    fn publish(
+        &self,
+        ns: &rt_types::Namespace,
+        subject: &str,
+        body: bytes::Bytes,
+        headers: Vec<(String, String)>,
+    ) -> Result<(u32, u32), (&'static str, String)> {
+        let _ = (ns, subject, body, headers);
+        Err(("unavailable", "pub/sub is not available on this node".to_string()))
     }
 
     /// Crate version reported by `GET /v1/node/status`.
@@ -368,6 +388,10 @@ pub struct ApiState {
     /// One-off schedules of `std:schedule` (listed by `GET /v1/services/{s}/schedules/once`).
     pub delayed: Arc<dyn DelayedStore>,
     pub data: Arc<dyn ServiceDataStore>,
+    /// `streams.db`: topics, records, consumer cursors, dead letters.
+    pub streams: Arc<dyn StreamStore>,
+    /// Async invocations (`queue.db`).
+    pub invocations: Arc<dyn InvocationStore>,
     pub scheduler: Scheduler,
     pub routes: Arc<RouteTable>,
     pub auth: Arc<dyn Authenticator>,
