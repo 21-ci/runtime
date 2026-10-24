@@ -150,7 +150,7 @@ List commands (`tenant list`, `service list`) show one page; `--limit N` sets th
 | AI assistants | [`mcp`](#mcp) |
 | services | [`service`](#service), [`push`](#push), [`versions`, `rollback`, `rebuild`, `build-logs`, `source`](#versions-rollback-rebuild-build-logs-source), [`types`](#types), [`env`](#env), [`secret`](#secret), [`host`](#host), [`data`](#data), [`sockets`, `objects`](#sockets-objects) |
 | operator SDKs | [`sdk ls`, `sdk types`](#sdk) (tenant key: what your grants allow) |
-| triggers | [`schedule`](#schedule), [`queue`](#queue), [`invoke`](#invoke) (and [`invoke --async`](#invoke---async)) |
+| triggers | [`schedule`](#schedule), [`queue`](#queue), [`invoke`](#invoke) (and [`invoke --async`](#invoke-async)) |
 | events | [`topic`](#topic), [`consumer`](#consumer), [`pubsub`](#pubsub), [`invocation`](#invocation) |
 | observability | [`logs`](#logs), [`stats`](#stats), [`events`](#events) |
 | API docs | [`openapi`, `docs`](#openapi-docs) |
