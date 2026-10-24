@@ -4,7 +4,8 @@
     "title": "21 Cloud Functions Runtime — control API",
     "description": "Self-hosted functions runtime: management API.",
     "contact": {
-      "name": "The 21 Cloud Runtime Authors"
+      "name": "Alex Sayfi",
+      "email": "alex@sayfi.uz"
     },
     "license": {
       "name": "Apache-2.0",
