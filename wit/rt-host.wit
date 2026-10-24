@@ -7,7 +7,7 @@
 //
 // Scope: kv, sql, blob, log, queue (enqueue to a service of the same tenant), call (in-process
 // call and RPC to a service of the same tenant; a component exporting `rpc`, world `rpc-service`,
-// serves RPC) and platform (operator bindings). Blob and call bodies are buffered in this revision
+// serves RPC), platform (operator bindings), pubsub and streams (events). Blob and call bodies are buffered in this revision
 // (streaming via wasi:io streams is a follow-up). All errors are stable `error { code, message }`
 // records (SEC-26: never host paths or driver text), with the codes of the Deno SDK.
 package std:host@0.1.0;
@@ -461,6 +461,119 @@ interface ws-client {
   connect: func(url: string, protocols: list<string>) -> result<connection, error>;
 }
 
+// Ephemeral pub/sub in the caller's namespace (tenant, project, environment): at most once, in
+// memory. A subscriber's `wasi:http` handler receives a delivery as `POST /__rt/pubsub`
+// (`x-rt-trigger: pubsub`, JSON body `{id, subject, body, headers, replyable, publishedAt}`); for a
+// `request` its response is the reply.
+interface pubsub {
+  // Header names: [a-z0-9][a-z0-9-]{0,63}, not starting with `x-rt-`; at most 32, 16 KiB in total.
+  type headers = list<tuple<string, string>>;
+
+  record error {
+    // validation_failed | too_large | unavailable | call_depth | rate_limited | quota_exceeded
+    // request also: no_responders | timeout | responder_failed | overloaded | queue_timeout | shed | memory | draining
+    code: string,
+    message: string,
+  }
+
+  record reply {
+    content-type: option<string>,
+    body: list<u8>,
+  }
+
+  // What a publish did: deliveries handed to subscribers, and copies dropped (fan-out cap,
+  // quota, backlog, refusals).
+  record publish-result {
+    receivers: u32,
+    dropped: u32,
+  }
+
+  // Publish `body` (<= 1 MiB) on the concrete `subject` (no wildcards, not `_rt.*`).
+  publish: func(subject: string, body: list<u8>, headers: headers) -> result<publish-result, error>;
+  // Ask one subscriber; `timeout-ms` default 5000, max 30000, never past the task deadline.
+  request: func(subject: string, body: list<u8>, headers: headers, timeout-ms: option<u32>) -> result<reply, error>;
+}
+
+// Persistent, partitioned topics (`stream` is a WIT keyword). A consumer group's batches reach the
+// `wasi:http` handler as `POST /__rt/stream` (`x-rt-trigger: stream`, JSON body `{topic, group,
+// partition, attempt, messages}`); a 2xx commits the batch, a 2xx with `x-rt-stream-fail-at:
+// <offset>` commits the records before that offset and retries from it.
+interface streams {
+  type headers = list<tuple<string, string>>;
+
+  record error {
+    // validation_failed | too_large | unavailable | not_found | stream_full | rate_limited | quota_exceeded
+    code: string,
+    message: string,
+  }
+
+  record new-entry {
+    body: list<u8>,
+    // Picks the partition (hash of the key).
+    key: option<string>,
+    headers: headers,
+    // A repeated id within the dedup window returns the first record's position (`duplicate`).
+    dedup-id: option<string>,
+  }
+
+  record appended {
+    partition: u32,
+    offset: u64,
+    duplicate: bool,
+  }
+
+  record entry {
+    partition: u32,
+    offset: u64,
+    key: option<string>,
+    headers: headers,
+    body: list<u8>,
+    timestamp-ms: s64,
+  }
+
+  variant position {
+    earliest,
+    latest,
+    offset(u64),
+    time-ms(s64),
+  }
+
+  record read-options {
+    // Out of range: validation_failed.
+    partition: u32,
+    start: position,
+    // 1..100
+    limit: u32,
+  }
+
+  record page {
+    entries: list<entry>,
+    // The offset after the last returned entry.
+    next: u64,
+    // The partition's next offset.
+    end: u64,
+  }
+
+  record partition-info {
+    partition: u32,
+    first: u64,
+    next: u64,
+  }
+
+  record topic-info {
+    name: string,
+    partitions: list<partition-info>,
+    retention-hours: u32,
+    max-mb: u64,
+    bytes: u64,
+  }
+
+  // Append 1..100 entries (<= 4 MiB in total) in one transaction.
+  append: func(topic: string, entries: list<new-entry>) -> result<list<appended>, error>;
+  read: func(topic: string, opts: read-options) -> result<page, error>;
+  info: func(topic: string) -> result<topic-info, error>;
+}
+
 // Exported by a component that handles socket events and alarms (world `socket-service`). Each
 // call is one task, one object at a time. An `err` (or a trap) fails the event: it is delivered
 // again (at least once), then given up (a message's socket closes 1011).
@@ -494,6 +607,8 @@ world guest {
   import sockets;
   import durable;
   import ws-client;
+  import pubsub;
+  import streams;
 }
 
 // A guest that also serves RPC: everything `guest` imports, plus the `rpc` export.
