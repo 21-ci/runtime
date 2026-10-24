@@ -1,0 +1,222 @@
+# Documentation site for the 21 Cloud Functions Runtime. Built from this repository:
+#
+#   make docs-build    strict build into target/site (fails on any warning)
+#   make docs-serve    live preview on http://127.0.0.1:8000
+#
+# The site pages live in docs/ next to the guides that are also read on GitHub (api.md, cli.md, config.md, deploy.md,
+# handlers.md, mcp.md). Those guides are the reference pages: the site links to them, it does not copy them.
+# Snippets (`--8<--`) include the real files of the repository (samples, WIT, defconfigs, compose files).
+site_name: 21 Cloud Functions Runtime
+site_description: >-
+  Self-hosted, multi-tenant serverless runtime. Run TypeScript in Deno isolates and
+  WebAssembly components behind one API, with built-in KV, SQL, blobs, queues and schedules.
+site_author: 21 Cloud
+site_url: https://21-ci.github.io/runtime/
+repo_url: https://github.com/21-ci/runtime
+repo_name: 21-ci/runtime
+edit_uri: edit/main/docs/
+copyright: >-
+  21 Cloud Functions Runtime is licensed under the
+  <a href="https://github.com/21-ci/runtime/blob/main/LICENSE">Apache License 2.0</a>.
+  Documentation built with <a href="https://squidfunk.github.io/mkdocs-material/">Material for MkDocs</a>.
+
+theme:
+  name: material
+  custom_dir: overrides
+  logo: assets/images/logo.svg
+  favicon: assets/images/favicon.svg
+  font:
+    text: Inter
+    code: JetBrains Mono
+  icon:
+    admonition:
+      note: material/pencil-circle
+      tip: material/lightbulb-on
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to system preference
+  features:
+    - announce.dismiss
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.path
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.tooltips
+
+plugins:
+  - search:
+      separator: '[\s\-,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
+
+# Not site pages: the repository README for docs/ (GitHub index) and the internal notes that never ship.
+exclude_docs: |
+  README.md
+
+# Generates docs/assets/openapi.json (cleaned copy of openapi/openapi.json) for the API explorer. Git-ignored.
+hooks:
+  - scripts/docs_hooks.py
+
+extra_css:
+  - assets/stylesheets/extra.css
+
+extra_javascript:
+  - assets/javascripts/api-explorer.js
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets:
+      # Paths are relative to the repository root: `--8<-- "sample/deno/hello/main.ts"`.
+      base_path: ['.']
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+
+nav:
+  - Home: index.md
+  - Get started:
+      - getting-started/index.md
+      - Install: getting-started/install.md
+      - First run: getting-started/first-run.md
+      - Your first service: getting-started/first-service.md
+  - Concepts:
+      - concepts/index.md
+      - How it works:
+          - Architecture: concepts/architecture.md
+          - Request lifecycle: concepts/request-lifecycle.md
+          - Execution and isolation: concepts/execution.md
+          - Scheduler and autoscaling: concepts/scheduler.md
+          - Caching: concepts/caching.md
+          - Storage: concepts/storage.md
+          - Failure behavior: concepts/failure-behavior.md
+          - Performance characteristics: concepts/performance.md
+      - The platform model:
+          - Tenants, plans and keys: concepts/tenants-and-plans.md
+          - Services, versions and builds: concepts/services-and-deploys.md
+          - Triggers: concepts/triggers.md
+          - Security model: concepts/security.md
+          - Multi-tenancy: concepts/multi-tenancy.md
+          - Observability: concepts/observability.md
+      - Isolation compared: concepts/isolation-compared.md
+  - Guides:
+      - guides/index.md
+      - Using a node:
+          - Get access: guides/access.md
+          - Projects and environments: guides/projects.md
+          - Deploy and roll back: guides/deploy.md
+          - Configure a service: guides/configure.md
+          - Logs, stats and usage: guides/logs-and-usage.md
+          - AI assistants (MCP): mcp.md
+      - Building services:
+          - Deno services: guides/deno.md
+          - WASM services: guides/wasm.md
+          - KV, SQL, blobs and other sub-services: guides/sub-services.md
+          - Service calls and queues: guides/calls-and-queues.md
+          - Use operator SDKs: guides/use-sdks.md
+          - Schedules: guides/schedules.md
+          - WebSockets and durable objects: guides/websockets.md
+          - Custom domains: guides/custom-domains.md
+          - Optimize your service: guides/optimize.md
+      - Languages and frameworks:
+          - languages/index.md
+          - Deno: languages/deno.md
+          - WASM: languages/wasm.md
+      - Running a node:
+          - Self-hosting: guides/self-hosting.md
+          - Deployment and operations: deploy.md
+          - Production deployment: guides/production.md
+          - Resource requirements: guides/resources.md
+          - Performance tuning: guides/performance.md
+      - For providers:
+          - Operator SDKs and bindings: guides/operator-sdks.md
+  - Tutorials:
+      - tutorials/index.md
+      - Telegram bot: tutorials/telegram-bot.md
+      - Event sign-ups: tutorials/events.md
+      - Live queue: tutorials/live-queue.md
+      - Currency rates: tutorials/cbu-rates.md
+      - Edge gateway (WASM): tutorials/edge-gateway.md
+  - Reference:
+      - reference/index.md
+      - Control and invoke API: api.md
+      - API explorer: reference/api-explorer.md
+      - CLI (21ci): cli.md
+      - Configuration (rt.toml): config.md
+      - Guest code (handlers): handlers.md
+      - Guest API (std:*): reference/guest-api.md
+      - WIT (std:host): reference/wit.md
+      - Error reasons: reference/errors.md
+      - Limits and quotas: reference/limits.md
+      - Metrics: reference/metrics.md
+  - FAQ: faq.md
+  - About:
+      - about/index.md
+      - Status and roadmap: about/status.md
+      - Changelog: about/changelog.md
