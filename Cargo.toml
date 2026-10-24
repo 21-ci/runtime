@@ -8,6 +8,7 @@ members = [
   "crates/rt-sec",
   "crates/rt-sched",
   "crates/rt-testkit",
+  "crates/rt-store",
 ]
 
 [workspace.package]

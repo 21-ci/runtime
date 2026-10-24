@@ -1,0 +1,40 @@
+[package]
+name = "rt-store"
+description = "meta.db, queue.db, artifact store, per-service KV/SQL/blob data (L2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rt-types.workspace = true
+rusqlite.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "fs", "io-util", "time"] }
+async-trait.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+tracing.workspace = true
+futures-util.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+rt-testkit.workspace = true
+rt-sec.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
