@@ -189,6 +189,16 @@ pub(crate) struct IdleInstance {
     /// Idle since (LRU order of [`IdleSlots::evict_lru`]).
     pub since: Instant,
     pub slot: SlotToken,
+    /// Its own keep-alive end (`min_run_time`): `None` follows the list's `idle_ttl` rule.
+    pub expires: Option<Instant>,
+    /// Kept only for queued work (`min_run_time = 0`): dropped once none waits.
+    pub handoff: bool,
+}
+
+/// A used instance's own keep-alive is over: its expiry passed, or it was kept for queued work
+/// and none waits any more (`waiting`: tasks of its service wait in admission).
+pub(crate) fn used_expired(inst: &IdleInstance, now: Instant, waiting: bool) -> bool {
+    inst.expires.is_some_and(|e| now >= e) || (inst.handoff && !waiting)
 }
 
 pub(crate) struct IdleList {
@@ -317,16 +327,36 @@ impl IdlePool {
 
     /// Scale down: a key without a target (`want == 0`) keeps its instances until the idle TTL
     /// passed; a key with a target drops fresh instances above it. Used instances above a target
-    /// stay (bounded by `wasm.reuse_max_idle`) until the TTL. Returns what to drop.
-    pub fn scale_down(&mut self, now: Instant, want: impl Fn(&IdleKey) -> usize) -> Vec<IdleInstance> {
+    /// stay (bounded by `wasm.reuse_max_idle`) until the TTL. A used instance with its own
+    /// keep-alive (`min_run_time`) ignores the TTL: it goes once [`used_expired`], as long as the
+    /// key stays at or above its target (the floor beats `min_run_time`). `has_waiting(service)`:
+    /// tasks of that service wait in admission. Returns what to drop.
+    pub fn scale_down(
+        &mut self,
+        now: Instant,
+        want: impl Fn(&IdleKey) -> usize,
+        has_waiting: impl Fn(ServiceId) -> bool,
+    ) -> Vec<IdleInstance> {
         let mut out = Vec::new();
         self.map.retain(|k, l| {
             let w = want(k);
+            let waiting = l.used.iter().any(|i| i.handoff) && has_waiting(k.service);
+            let mut i = 0;
+            while i < l.used.len() && l.ready() > w {
+                if used_expired(&l.used[i], now, waiting) {
+                    out.push(l.used.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
             if w == 0 {
                 if l.pending == 0 && now.saturating_duration_since(l.last_used) >= l.idle_ttl {
                     out.append(&mut l.fresh);
-                    out.append(&mut l.used);
-                    return false;
+                    let (inherit, own): (Vec<_>, Vec<_>) = std::mem::take(&mut l.used)
+                        .into_iter()
+                        .partition(|i| i.expires.is_none());
+                    out.extend(inherit);
+                    l.used = own;
                 }
             } else {
                 while l.ready() > w && !l.fresh.is_empty() {
@@ -470,6 +500,8 @@ pub(crate) fn prewarm_job(
             env,
             since: Instant::now(),
             slot,
+            expires: None,
+            handoff: false,
         })
     }))
 }

@@ -477,6 +477,8 @@ pub struct Req {
     pub idle_ttl: Option<Duration>,
     /// `limits.max_response_stream_bytes` (`None`: the default).
     pub max_stream_bytes: Option<u64>,
+    /// `scaling.min_run_time_ms` of the service (`None`: inherit).
+    pub min_run_time_ms: Option<u64>,
     /// The service version (default 1).
     pub version: u32,
     /// Request headers (as ingress would pass them on).
@@ -506,6 +508,7 @@ impl Req {
             proc: 0,
             idle_ttl: None,
             max_stream_bytes: None,
+            min_run_time_ms: None,
             version: 1,
             headers: Vec::new(),
             trigger: None,
@@ -605,6 +608,12 @@ impl Req {
 
     pub fn idle_ttl(mut self, ttl: Duration) -> Self {
         self.idle_ttl = Some(ttl);
+        self
+    }
+
+    /// `scaling.min_run_time_ms` (keep-alive after the answer; `0`: only while work waits).
+    pub fn min_run_time_ms(mut self, ms: u64) -> Self {
+        self.min_run_time_ms = Some(ms);
         self
     }
 
@@ -852,6 +861,7 @@ impl Rig {
         if let Some(ttl) = req.idle_ttl {
             knobs.idle_ttl = ttl;
         }
+        knobs.min_run_time = req.min_run_time_ms.map(Duration::from_millis);
         let mut spec = SpecBuilder::wasm()
             .tenant(req.tenant)
             .service(req.service)
