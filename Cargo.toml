@@ -3,6 +3,8 @@ resolver = "2"
 members = [
   "crates/rt-types",
   "crates/rt-config",
+  "crates/rt-obs",
+  "crates/rt-mem",
 ]
 
 [workspace.package]
