@@ -1,0 +1,37 @@
+# Private node for sample/apps/run-smokes.sh. Paths are relative to the repo root.
+[node]
+data_dir = "sample/apps/.smoke-data"
+default_profile = "balanced"
+
+[listeners]
+public = "127.0.0.1:28080"
+internal = "127.0.0.1:28082"
+allow_tcp_internal = true
+control = "127.0.0.1:28081"
+metrics = "127.0.0.1:29090"
+
+[security]
+require_v8_sandbox = false
+
+[ingress]
+max_conns_per_ip = 4096
+
+# The samples' operator binding (sample/operator-sdk): the audit service ships events to it.
+[[binding]]
+name = "acme"
+base_url = "http://127.0.0.1:3000"
+allowed_plans = ["smoke"]
+allowed_methods = ["GET", "POST"]
+allowed_paths = ["/info", "/integrations", "/services/*"]
+inject_headers = { authorization = "env:ACME_INTERNAL_TOKEN" }
+tenant_header = "x-rt-tenant"
+rate_limit = { rps = 500, burst = 1000 }
+
+[plans.smoke]
+rps = 0
+invocations_per_day = 0
+max_services = 50
+max_concurrency = 1000
+max_instances = 0              # no per-service instance cap (the built-in free plan allows 4)
+max_schedules = 20
+min_schedule_seconds = 60

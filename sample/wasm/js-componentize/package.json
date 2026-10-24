@@ -1,0 +1,16 @@
+{
+  "name": "js-componentize-example",
+  "version": "1.0.0",
+  "private": true,
+  "description": "JS handler compiled to a WASI P2 wasi:http component with @bytecodealliance/jco",
+  "scripts": {
+    "build": "bash build.sh"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@bytecodealliance/jco": "^1.35.0",
+    "@bytecodealliance/preview2-shim": "0.26.0"
+  }
+}

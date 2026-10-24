@@ -1,0 +1,31 @@
+# Operator config fragment: merge into the node's rt.toml.
+# Unknown keys fail startup, so keep to the documented keys. `SIGHUP` reloads plans and bindings.
+#
+# The SDK itself is not configured here: it is a runtime service you publish and grant with the CLI
+# (root token), and you can update, roll back or remove it without touching tenant services:
+#
+#   21ci sdk publish acme 1.0.0 sample/operator-sdk/acme-sdk
+#   21ci sdk grants set node acme --allow
+#
+# (The old `[[sdk]]` section, which bundled SDK code into every tenant service, was removed.)
+
+# --- Binding: what the acme SDK's `platform.fetch("acme", …)` may reach ---------------------------
+# Bindings are reachable only from operator SDK services (the system tenant), never from a tenant
+# service directly; the SDK calls on behalf of the calling tenant.
+[[binding]]
+name            = "acme"
+# The mock API in ./mock-platform-api (node server.js 3000). Bindings may target internal hosts.
+base_url        = "http://127.0.0.1:3000"
+# Injected server side; never visible to guest memory. `env:NAME` reads the node's environment,
+# so the token is not stored in this file. Start the mock with the same ACME_INTERNAL_TOKEN.
+inject_headers  = { authorization = "env:ACME_INTERNAL_TOKEN" }
+# The runtime sets this header to the id of the tenant that called the SDK.
+tenant_header   = "x-rt-tenant"
+# The calling tenant's plan must be one of these (`[plans.<name>]` in this config); others get
+# `403 binding_not_allowed`. Empty: every plan.
+allowed_plans   = ["pro", "business"]
+allowed_methods = ["GET", "POST"]
+# Matched after percent-decoding and normalisation; `..` segments are rejected.
+allowed_paths   = ["/info", "/integrations", "/services/*"]
+# Per calling tenant.
+rate_limit      = { rps = 50, burst = 100 }

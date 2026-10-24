@@ -1,0 +1,11 @@
+package example:hello-js;
+
+/// A component that serves HTTP. Exporting `wasi:http/incoming-handler` is the
+/// only thing the runtime requires of a `runtime: "wasm"` service (WSM-08).
+/// ComponentizeJS (StarlingMonkey) wires the global `fetch` event to it.
+///
+/// The version (0.2.10) is the one the StarlingMonkey engine shipped with
+/// @bytecodealliance/componentize-js 0.22 speaks; see wit/deps.
+world hello {
+  export wasi:http/incoming-handler@0.2.10;
+}

@@ -1,0 +1,517 @@
+// std:host — capabilities the runtime exposes to WASM guest components.
+//
+// A guest is a WASI P2 component whose world exports `wasi:http/incoming-handler`
+// (wasi:http/proxy) and may import any of the interfaces below. Denied outright: wasi:filesystem
+// (no preopens) and wasi:sockets (all addresses denied). Outbound HTTP is the standard
+// `wasi:http/outgoing-handler`, routed through the host's SSRF guard.
+//
+// Scope: kv, sql, blob, log, queue (enqueue to a service of the same tenant), call (in-process
+// call and RPC to a service of the same tenant; a component exporting `rpc`, world `rpc-service`,
+// serves RPC) and platform (operator bindings). Blob and call bodies are buffered in this revision
+// (streaming via wasi:io streams is a follow-up). All errors are stable `error { code, message }`
+// records (SEC-26: never host paths or driver text), with the codes of the Deno SDK.
+package std:host@0.1.0;
+
+interface log {
+  enum level { debug, info, warn, error }
+
+  record error {
+    code: string,
+    message: string,
+  }
+
+  // Appends a record to the service's logs, tagged with the task id.
+  log: func(level: level, message: string);
+
+  // Appends a record with structured fields: `fields-json` is a JSON object (at most 32 top-level
+  // keys and 8 KiB). A refused object fails `validation_failed` and writes no record.
+  log-fields: func(level: level, message: string, fields-json: string) -> result<_, error>;
+}
+
+interface kv {
+  variant value {
+    // JSON text (UTF-8).
+    json(string),
+    bytes(list<u8>),
+  }
+
+  record set-options {
+    ttl-seconds: option<u64>,
+  }
+
+  record list-options {
+    prefix: list<u8>,
+    cursor: option<list<u8>>,
+    // <= 1000
+    limit: u32,
+    // Descending key order: the cursor pages downwards.
+    reverse: bool,
+  }
+
+  record list-page {
+    entries: list<tuple<list<u8>, value>>,
+    next-cursor: option<list<u8>>,
+  }
+
+  record error {
+    code: string,
+    message: string,
+  }
+
+  get: func(key: list<u8>) -> result<option<value>, error>;
+  set: func(key: list<u8>, value: value, opts: set-options) -> result<_, error>;
+  delete: func(key: list<u8>) -> result<bool, error>;
+  %list: func(opts: list-options) -> result<list-page, error>;
+  // Atomically adds `delta` to the integer counter at `key` and returns the new value. A missing
+  // (or expired) key starts at 0 and gets `opts.ttl-seconds`; an existing counter keeps its
+  // expiry. The counter is stored as JSON text (`get` returns `json("<n>")`). Errors:
+  // kv_not_integer (the value is not a JSON integer in the s64 range), kv_overflow (the result
+  // leaves s64), plus the `set` codes (validation_failed, kv_key_too_large, storage_quota).
+  incr: func(key: list<u8>, delta: s64, opts: set-options) -> result<s64, error>;
+  // Atomic compare-and-swap in one step: `next` is written (`none`: deleted) only when the current
+  // value equals `expected` (same bytes and tag; `none` = absent or expired). `opts.ttl-seconds`
+  // applies to `next`. Returns whether the swap happened. Errors: the `set` codes.
+  cas: func(key: list<u8>, expected: option<value>, next: option<value>, opts: set-options) -> result<bool, error>;
+  // Sets (`ttl-seconds` some) or clears (`none`) the expiry of a live key; false when absent.
+  expire: func(key: list<u8>, opts: set-options) -> result<bool, error>;
+  // Seconds left on a live key with an expiry (rounded up); none when absent or without expiry.
+  ttl: func(key: list<u8>) -> result<option<u64>, error>;
+}
+
+interface sql {
+  variant sql-value {
+    null,
+    integer(s64),
+    real(f64),
+    text(string),
+    blob(list<u8>),
+  }
+
+  record statement {
+    sql: string,
+    args: list<sql-value>,
+  }
+
+  record sql-result {
+    columns: list<string>,
+    rows: list<list<sql-value>>,
+    rows-affected: u64,
+    last-insert-rowid: option<s64>,
+  }
+
+  record error {
+    // sql_error | sql_timeout | sql_not_authorized | storage_quota
+    code: string,
+    message: string,
+  }
+
+  execute: func(stmt: statement) -> result<sql-result, error>;
+  // All statements in one transaction; `write = false` opens it read-only.
+  batch: func(stmts: list<statement>, write: bool) -> result<list<sql-result>, error>;
+}
+
+interface blob {
+  record meta {
+    key: string,
+    size: u64,
+    content-type: option<string>,
+  }
+
+  record list-page {
+    items: list<meta>,
+    next-cursor: option<string>,
+  }
+
+  record error {
+    code: string,
+    message: string,
+  }
+
+  get: func(key: string) -> result<option<tuple<meta, list<u8>>>, error>;
+  head: func(key: string) -> result<option<meta>, error>;
+  put: func(key: string, content-type: option<string>, data: list<u8>) -> result<meta, error>;
+  delete: func(key: string) -> result<bool, error>;
+  %list: func(prefix: string, cursor: option<string>, limit: u32) -> result<list-page, error>;
+}
+
+interface queue {
+  record send-options {
+    // Deliver no earlier than this many seconds from now (<= 7 days).
+    delay-seconds: option<u64>,
+    // The same id within 24 h is delivered once.
+    dedup-id: option<string>,
+  }
+
+  record error {
+    // not_found | forbidden | trigger_not_allowed | queue_full | rejected codes
+    code: string,
+    message: string,
+  }
+
+  // Enqueue `body` (<= 1 MB) for the service `slug` of the same tenant; returns the message id.
+  enqueue: func(slug: string, body: list<u8>, opts: send-options) -> result<string, error>;
+}
+
+interface call {
+  // Header values are bytes, as in `wasi:http/types` fields.
+  type headers = list<tuple<string, list<u8>>>;
+
+  record request {
+    method: string,
+    // Only the path and query reach the target (`/s/{slug}` is the target's own prefix).
+    path-with-query: string,
+    headers: headers,
+    body: list<u8>,
+  }
+
+  record response {
+    status: u16,
+    headers: headers,
+    // Buffered, at most `limits.max_response_buffered_bytes`.
+    body: list<u8>,
+  }
+
+  record error {
+    // not_found | cross_tenant_call | forbidden | call_not_allowed | trigger_not_allowed |
+    // call_failed | invalid_request | response_too_large | rejected codes
+    code: string,
+    message: string,
+  }
+
+  // In-process call to the service `slug` of the same tenant (no HTTP hop). The target's
+  // `call.allowed_callers` / environment and the plan's triggers decide; the child's wall limit
+  // is min(own, the caller's remaining time). A failing child is a 5xx `response`, not an error;
+  // past call depth 15 the response is `508` with `x-rt-reason: call_depth`.
+  call: func(slug: string, req: request) -> result<response, error>;
+
+  // RPC to the service `slug` over the same path (std:services `services.call`): runs the
+  // callee's method `method` (a dot-separated path of identifiers, `invoices.create`) with the
+  // JSON argument `args-json` and returns its JSON result. The argument and the result are at
+  // most 256 KiB each. Errors: the callee's own `{code, message}` (a Deno `ServiceError`, a WASM
+  // `rpc.handle` error), or the host's: validation_failed, method_not_found, response_too_large,
+  // invalid_response, call_depth, timeout, the `call` codes above.
+  call-rpc: func(slug: string, method: string, args-json: string) -> result<string, error>;
+}
+
+// Operator SDKs (std:sdk). No SDK code is in the component: each call is
+// bound at run time to the SDK release the caller's grants select, and runs in the runtime.
+interface sdk {
+  record error {
+    // The SDK's own code, or: sdk_not_found | sdk_unavailable (removed) | sdk_not_granted |
+    // sdk_version_unavailable | method_not_found | validation_failed | call_depth | timeout | ...
+    code: string,
+    message: string,
+  }
+
+  // Calls `method` (`invoices.create`) of the SDK `name` with the JSON argument `args-json`
+  // (at most 256 KiB) and returns its JSON result (at most 256 KiB).
+  invoke: func(name: string, method: string, args-json: string) -> result<string, error>;
+}
+
+// The callee side of an RPC, exported by a component that serves `call-rpc` / `services.call`
+// (world `rpc-service`). A call to such a component runs `handle` instead of its HTTP handler.
+interface rpc {
+  // Who called, as the runtime stamped it (never from the request).
+  record caller {
+    // svc_… id of the calling service.
+    service: string,
+    // Its slug, project id and environment: none when not visible from the callee's tenant.
+    slug: option<string>,
+    project: option<string>,
+    environment: option<string>,
+    // ten_… id of the calling tenant.
+    tenant: string,
+    // An operator SDK call (`sdk.invoke`): the calling tenant's plan.
+    plan: option<string>,
+  }
+
+  record error {
+    code: string,
+    message: string,
+  }
+
+  // `method` is the method name the caller asked for; `args-json` its JSON argument (`null` when
+  // none). Answers the JSON result (at most 256 KiB) or an error the caller receives as is
+  // (`method_not_found` for an unknown method, by convention).
+  handle: func(method: string, args-json: string, caller: option<caller>) -> result<string, error>;
+}
+
+interface platform {
+  use call.{request, response};
+
+  record error {
+    // invalid_request | response_too_large | unavailable (outside a task)
+    code: string,
+    message: string,
+  }
+
+  // Calls the operator binding `binding` (`[[binding]]` in the node config) without credentials:
+  // the node injects the binding's headers upstream; the guest never sees them. Only the request's
+  // method, path + query, headers (minus authorization, cookie, x-rt-*) and body are used.
+  // Never an error for a refusal: the binding's answer is a `response` with `x-rt-reason`:
+  // 403 binding_denied (method/path not allowed, `..` traversal), 403 binding_not_allowed (the
+  // tenant's plan), 404 binding_not_found, 429 rate_limited, 502 binding_upstream.
+  fetch: func(binding: string, req: request) -> result<response, error>;
+}
+
+// The imports a guest may use in addition to `wasi:http/proxy`.
+interface secrets {
+  record error {
+    code: string,
+    message: string,
+  }
+
+  // The value of a secret of this service (never a plain env var); `none` when it is not set.
+  // Errors: validation_failed (not a secret name), unavailable / internal (the env is not readable).
+  get: func(name: string) -> result<option<string>, error>;
+}
+
+// Named mutexes of this service on this node (std:lock).
+interface lock {
+  record error {
+    code: string,
+    message: string,
+  }
+
+  // A held lock. `release` gives it up; dropping it does too, and so does the end of the task: the
+  // host releases every lock a task still holds when the task ends, is killed or hits a limit.
+  resource lease {
+    release: func();
+  }
+
+  // Waits at most `wait-ms` (0 = do not wait) for `key` and holds it for at most `lease-ms`, after
+  // which the next waiter gets it. Errors: lock_timeout (not got in time), lock_limit (a cap),
+  // validation_failed (key 1-512 bytes, wait <= 300000 ms, lease 1-900000 ms).
+  acquire: func(key: string, wait-ms: u32, lease-ms: u32) -> result<lease, error>;
+}
+
+// One-off tasks of this service, created from code (std:schedule). The due
+// schedule runs the guest's `scheduled` export with the id, the due time and the payload (at-least-once).
+interface schedule {
+  record error {
+    code: string,
+    message: string,
+  }
+
+  record entry {
+    id: string,
+    run-at-ms: s64,
+  }
+
+  record page {
+    entries: list<entry>,
+    cursor: option<string>,
+  }
+
+  // Due `seconds` from now (at most 30 days). `payload-json` is the JSON text of the payload (at most
+  // 16 KiB). `id` (1 to 128 of a-z, A-Z, 0-9, . _ - :) replaces a pending schedule of that id; without
+  // one the host generates it. Errors: validation_failed, schedule_limit (1000 pending per service).
+  after: func(seconds: u64, payload-json: string, id: option<string>) -> result<entry, error>;
+
+  // Due at `at-ms` (Unix ms), at most 30 days from now.
+  at: func(at-ms: s64, payload-json: string, id: option<string>) -> result<entry, error>;
+
+  // Removes a pending schedule; false when there is none.
+  cancel: func(id: string) -> result<bool, error>;
+
+  // Pending schedules in id order, after `after`; `cursor` is set on a full page.
+  %list: func(after: option<string>, limit: u32) -> result<page, error>;
+}
+
+// WebSockets the node holds for this service (std:sockets, docs/handlers.md "WebSockets and durable objects").
+// Every call is scoped to this service: another service's socket is `not_found`. A task that acts
+// for an object (a socket event, an alarm, a request to a durable object) sends when its handler
+// returned (after its storage writes committed); elsewhere a send leaves at once.
+// Errors: not_found, invalid_request, too_large, limit_exceeded, slow_consumer, unavailable,
+// not_upgradable.
+interface sockets {
+  record error {
+    code: string,
+    message: string,
+  }
+
+  variant payload {
+    text(string),
+    binary(list<u8>),
+  }
+
+  record socket-info {
+    // ws_...
+    id: string,
+    object: string,
+    tags: list<string>,
+    protocol: option<string>,
+    created-at-ms: s64,
+    last-message-at-ms: option<s64>,
+    auto-response-at-ms: option<s64>,
+    buffered-amount: u64,
+    remote-ip: option<string>,
+  }
+
+  record accept-options {
+    // At most 10 tags of 1 to 256 bytes.
+    tags: list<string>,
+    // At most 16 KiB; read back with `get-attachment` in later events.
+    attachment: option<list<u8>>,
+    // The subprotocol to answer with (one the client offered).
+    protocol: option<string>,
+  }
+
+  record accepted {
+    id: string,
+    ticket: string,
+  }
+
+  // Accepts the WebSocket upgrade the task's request offered (an HTTP or call task only; `wasi:http`
+  // hides `Upgrade`, the runtime marks the offer with the request header `x-rt-websocket: 1`), for
+  // the task's object (`default` outside one). Answer the request with status 101: the runtime adds
+  // the ticket header and connects the client to the socket.
+  accept: func(opts: accept-options) -> result<accepted, error>;
+
+  send: func(id: string, data: payload) -> result<_, error>;
+
+  // To every socket of `object` (default: the task's object), with `tag` when set, except `except`.
+  // Returns how many sockets it reached.
+  broadcast: func(object: option<string>, tag: option<string>, data: payload, except: list<string>) -> result<u32, error>;
+
+  // Code 1000 or 3000-4999; reason at most 123 bytes.
+  close: func(id: string, code: u16, reason: string) -> result<_, error>;
+  close-all: func(object: option<string>, tag: option<string>, code: u16, reason: string) -> result<u32, error>;
+
+  // Sockets of `object` (default: the task's object, else every object), in id order after `cursor`.
+  %list: func(object: option<string>, tag: option<string>, limit: u32, cursor: option<string>) -> result<tuple<list<socket-info>, option<string>>, error>;
+  get: func(id: string) -> result<option<socket-info>, error>;
+  set-tags: func(id: string, tags: list<string>) -> result<_, error>;
+  get-attachment: func(id: string) -> result<option<list<u8>>, error>;
+  set-attachment: func(id: string, value: option<list<u8>>) -> result<_, error>;
+
+  // The object's automatic answer: a text message equal to the pair's first string is answered with
+  // the second by the runtime, without an event. `none` removes it.
+  set-auto-response: func(object: option<string>, pair: option<tuple<string, string>>) -> result<_, error>;
+}
+
+// Durable objects (std:durable): the task's object's storage and alarm,
+// and requests to objects. Writes wait until the handler returned and commit in one transaction
+// (before the task's socket sends); a handler that fails writes nothing. Values are bytes here
+// (a Deno service stores structured clones). Errors: no_object (outside an object), validation_failed,
+// kv_key_too_large (2 KiB), kv_value_too_large (1 MiB), limit_exceeded (1000 writes per task),
+// storage_quota, not_durable, and the `call` codes.
+interface durable {
+  use call.{request, response};
+
+  record error {
+    code: string,
+    message: string,
+  }
+
+  // The object this task acts for.
+  object: func() -> option<string>;
+
+  get: func(key: string) -> result<option<list<u8>>, error>;
+  put: func(key: string, value: list<u8>) -> result<_, error>;
+  // `true` when the key existed.
+  delete: func(key: string) -> result<bool, error>;
+  // Keys with `prefix`, then in `[start, end)`, at most `limit` (<= 1000), descending with `reverse`.
+  %list: func(prefix: string, start: option<string>, end: option<string>, limit: u32, reverse: bool) -> result<list<tuple<string, list<u8>>>, error>;
+  delete-all: func() -> result<_, error>;
+
+  // One alarm per object (Unix ms); it runs the `socket-handler.on-alarm` export, at least once.
+  get-alarm: func() -> result<option<s64>, error>;
+  set-alarm: func(at-ms: option<s64>) -> result<_, error>;
+
+  // A request to the object `object` of the durable service `service` (a slug; `none`: this one),
+  // in the object's turn: an object runs one request or event at a time.
+  fetch: func(service: option<string>, object: string, req: request) -> result<response, error>;
+}
+
+// Outbound WebSockets (`ws:` / `wss:`) through the host's egress guard: the same scheme, port, host
+// and address rules as `wasi:http/outgoing-handler`; a connection counts as one of the task's fetches,
+// received bytes count against the daily egress quota, and it closes when the task ends.
+// Errors: egress_denied, egress_dns, egress_timeout, egress_upstream, egress_limit, egress_quota,
+// validation_failed, invalid_state.
+interface ws-client {
+  use sockets.{payload};
+
+  record error {
+    code: string,
+    message: string,
+  }
+
+  record close-frame {
+    code: u16,
+    reason: string,
+  }
+
+  variant event {
+    message(payload),
+    // The connection ended (1006 without a close frame).
+    closed(close-frame),
+  }
+
+  resource connection {
+    // The subprotocol the server chose.
+    protocol: func() -> option<string>;
+    send: func(data: payload) -> result<_, error>;
+    // The next message or the end of the connection; `none` when nothing came within `timeout-ms`.
+    recv: func(timeout-ms: u32) -> result<option<event>, error>;
+    // Code 1000 or 3000-4999.
+    close: func(code: u16, reason: string) -> result<_, error>;
+  }
+
+  connect: func(url: string, protocols: list<string>) -> result<connection, error>;
+}
+
+// Exported by a component that handles socket events and alarms (world `socket-service`). Each
+// call is one task, one object at a time. An `err` (or a trap) fails the event: it is delivered
+// again (at least once), then given up (a message's socket closes 1011).
+interface socket-handler {
+  use sockets.{socket-info, payload};
+
+  record close-info {
+    code: u16,
+    reason: string,
+    was-clean: bool,
+  }
+
+  on-message: func(object: string, socket: socket-info, data: payload) -> result<_, string>;
+  on-close: func(object: string, socket: socket-info, info: close-info) -> result<_, string>;
+  on-error: func(object: string, socket: socket-info, code: string, message: string) -> result<_, string>;
+  on-alarm: func(object: string, scheduled-ms: s64, retry: u32) -> result<_, string>;
+}
+
+world guest {
+  import log;
+  import kv;
+  import sql;
+  import blob;
+  import queue;
+  import call;
+  import platform;
+  import secrets;
+  import lock;
+  import schedule;
+  import sdk;
+  import sockets;
+  import durable;
+  import ws-client;
+}
+
+// A guest that also serves RPC: everything `guest` imports, plus the `rpc` export.
+world rpc-service {
+  include guest;
+  export rpc;
+}
+
+// A guest that handles WebSocket events and alarms: everything `guest` imports, plus the
+// `socket-handler` export (required for a durable service).
+world socket-service {
+  include guest;
+  export socket-handler;
+}
+
+// What the runtime binds: every import and every optional export.
+world runtime-host {
+  include guest;
+  export rpc;
+  export socket-handler;
+}
