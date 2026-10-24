@@ -200,7 +200,7 @@ async fn mrt_wsm_07_floor_instances_are_kept_at_zero() {
         },
     )]));
     let mut rig = Rig::new().warm(targets);
-    let req = || Req::get("/").reuse().service(109).min_run_time_ms(0);
+    let req = || Req::get("/").reuse().service(109).min_run_time_ms(0).min_instances(1);
     assert_eq!(rig.run(&counter, req()).await.text(), "1");
     assert_eq!(rig.exec.idle_instances(), 1, "kept for the floor");
     rig.between_tasks(BUDGET).await;
@@ -252,4 +252,49 @@ async fn mrt_wsm_08_expiry_happens_on_an_idle_machine() {
     );
     assert_eq!(keepalive(&metrics, "expired"), 1);
     assert_eq!(rig.exec.next_deadline(), None, "nothing else is due");
+}
+
+/// A demand target without a `min_instances` floor keeps nothing at `min_run_time = 0`: the
+/// autoscaler's target (here 2 per P) is not a floor.
+#[tokio::test]
+async fn mrt_wsm_09_a_demand_target_without_min_instances_does_not_keep_at_zero() {
+    let metrics = Metrics::new(MetricsOptions::default()).expect("metrics");
+    let (targets, _waiting) = backlog(0);
+    let counter = prepared("counter");
+    let svc = ServiceRef {
+        tenant: TenantId::from_u128(1),
+        service: ServiceId::from_u128(110),
+        version: VersionNo(1),
+        digest: counter.key.digest,
+    };
+    targets.publish(HashMap::from([(
+        WarmKey {
+            service: svc.service,
+            key: counter.key,
+        },
+        WarmTarget {
+            service: svc,
+            per_proc: 2,
+        },
+    )]));
+    let mut rig = Rig::new().metrics(metrics.clone()).warm(targets);
+    let req = |floor| {
+        Req::get("/")
+            .reuse()
+            .service(110)
+            .min_run_time_ms(0)
+            .min_instances(floor)
+    };
+    assert_eq!(rig.run(&counter, req(0)).await.text(), "1");
+    assert_eq!(rig.exec.idle_instances(), 0, "min_instances 0: disposed");
+    assert_eq!(rig.run(&counter, req(0)).await.text(), "1", "a fresh instance");
+    assert_eq!(keepalive(&metrics, "disposed"), 2);
+    assert_eq!(keepalive(&metrics, "kept"), 0);
+    assert_eq!(rig.run(&counter, req(1)).await.text(), "1");
+    assert_eq!(rig.run(&counter, req(1)).await.text(), "2", "min_instances 1 keeps one");
+    assert_eq!(
+        rig.exec.idle_instances(),
+        1,
+        "only the floor, not the demand target of 2"
+    );
 }

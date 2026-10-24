@@ -149,6 +149,13 @@ fn target_of(cfg: &DenoExecutorConfig, id: &WarmId) -> usize {
     })
 }
 
+/// The `min_instances` floor of `id` on this P: the published target, capped by the configured
+/// `min_instances` (the target also carries the autoscaler's demand, which keeps nothing at
+/// `min_run_time = 0`).
+fn floor_of(cfg: &DenoExecutorConfig, id: &WarmId, min_instances: u32) -> usize {
+    target_of(cfg, id).min(min_instances as usize)
+}
+
 /// Tasks of `id`'s service waiting in admission (0 without a scheduler).
 fn waiting_of(cfg: &DenoExecutorConfig, id: &WarmId) -> u32 {
     cfg.warm_targets.as_ref().map_or(0, |t| t.waiting(id.service.service))
@@ -521,6 +528,7 @@ impl DenoExecutor {
             slug,
             caller: None,
             object: None,
+            reentrant: false,
         };
         let run = TaskRun {
             cfg: self.cfg.clone(),
@@ -1066,6 +1074,7 @@ async fn run_task_as(
         deadline,
         warm_id,
         min_run_time: spec.knobs.min_run_time,
+        min_instances: spec.knobs.min_instances,
         queue_timeout: spec.knobs.queue_timeout,
         limit_bytes,
         head_cpu: head_cpu.clone(),
@@ -1156,6 +1165,9 @@ struct Driver {
     warm_id: Option<WarmId>,
     /// The service's `min_run_time` (`None`: inherit `reuse_idle_ttl`), see [`Driver::park`].
     min_run_time: Option<Duration>,
+    /// The service's `scaling.min_instances`: the only floor a `min_run_time = 0` isolate is
+    /// kept for (the autoscaler's demand target does not keep it).
+    min_instances: u32,
     /// The service's `queue_timeout`: how long a handoff isolate waits at most.
     queue_timeout: Duration,
     /// `limits.memory_mb` in bytes.
@@ -1450,7 +1462,7 @@ impl Driver {
             AfterAnswer::For(t) => (now + t, false),
             AfterAnswer::Handoff { cap } => (now + cap, true),
             AfterAnswer::Dispose => {
-                if target_of(cfg, &id) <= self.shared.borrow().warm.len_of(&id) {
+                if floor_of(cfg, &id, self.min_instances) <= self.shared.borrow().warm.len_of(&id) {
                     keepalive(metrics, "disposed", 1);
                     dispose_later(&self.shared, cfg.dispose_backlog, iso);
                     return false;

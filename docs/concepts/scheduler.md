@@ -151,6 +151,16 @@ When a request arrives, admission decides whether it runs now, waits, or is refu
 | 3 | A run slot is free: the service's adaptive limit (at most `scaling.max_instances`), the tenant's plan cap (`max_concurrency`) and the node's `sched.max_inflight` (less a 1/8 reserve) | **Run now** |
 | 4 | Otherwise: room in the queues (node `sched.max_queued` / `sched.max_queued_mb`; one service and one tenant may each hold half of either; `scaling.max_queued` can only lower the service's share) | **Wait** in the service's FIFO queue, else `503 overloaded` + `Retry-After` |
 
+Service-to-service calls (`std:services`) and pub/sub `request()` reply deliveries run on behalf of a task that already
+holds a slot: they are served before the service's waiting requests and may use the 1/8 reserve. They are held by
+`scaling.max_instances`, by the tenant's call allowance (calls in flight at each call depth, at most the plan's
+`max_concurrency`) and by `sched.max_inflight`. One exception: a call or request reply that a task of the **same
+service** made (a self-call, or a `request()` on a subject the service answers itself) may run past
+`max_instances`. Its parent waits for it while holding one of the service's instances, so at `max_instances: 1` it
+could otherwise never start and would end `queue_timeout`. It still takes the tenant's call allowance at its depth, a
+`max_inflight` slot and its own memory reservation, so the overshoot is bounded by the call depth limit (15) times the
+plan cap. An indirect cycle (A calls B, B calls A) is not detected: keep `max_instances` above 1 for services in one.
+
 Then, while it waits:
 
 - A waiting request that gets no slot within its **queue timeout** ends with `503 queue_timeout` + `Retry-After`. The
@@ -264,7 +274,7 @@ set per service. Scaling is per node; there is no multi-node scaling.
 | Setting | Meaning | Default | Upper bound |
 |---|---|---|---|
 | `scaling.min_instances` | Instances kept warm. The service never scales to zero, and the concurrency limit never falls below it | 0 (scale to zero) | the plan's `max_instances` |
-| `scaling.max_instances` | Most instances running at once. Requests beyond it **wait** in the service's queue; they are not refused | the plan's `max_instances`, else the profile ceiling (256 / 1,024 / 1,024) | the plan's `max_instances` |
+| `scaling.max_instances` | Most instances running at once. Requests beyond it **wait** in the service's queue; they are not refused. Only the service's own nested calls and request replies may exceed it (see [Admission](#admission-queueing-instead-of-429)) | the plan's `max_instances`, else the profile ceiling (256 / 1,024 / 1,024) | the plan's `max_instances` |
 
 The plan's **`max_instances`** is a per-service limit the operator sets (0 = the node default; the example plans in the
 configuration use `free` 4, `pro` 32, `business` 256). A larger value on a service is clamped to it, and the service's

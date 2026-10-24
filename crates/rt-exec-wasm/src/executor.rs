@@ -833,6 +833,7 @@ async fn run_task(a: Args) -> Outcome {
     let reuse = spec.knobs.reuse_instances;
     let idle_ttl = spec.knobs.idle_ttl;
     let min_run_time = spec.knobs.min_run_time;
+    let min_instances = spec.knobs.min_instances;
     let queue_timeout = spec.knobs.queue_timeout;
     let key = IdleKey {
         tenant: svc.tenant,
@@ -1025,6 +1026,7 @@ async fn run_task(a: Args) -> Outcome {
         unregister,
         warm,
         min_run_time,
+        min_instances,
         queue_timeout,
         metrics: metrics.clone(),
     };
@@ -1338,6 +1340,8 @@ struct Driver {
     /// Warm targets (the floor) and the admission backlog (`WarmTargets::waiting`).
     warm: Option<Arc<WarmTargets>>,
     min_run_time: Option<Duration>,
+    /// `scaling.min_instances`: the only floor a `min_run_time = 0` instance is kept for.
+    min_instances: u32,
     queue_timeout: Duration,
     metrics: Option<Arc<Metrics>>,
 }
@@ -1370,6 +1374,7 @@ impl Driver {
             unregister,
             warm,
             min_run_time,
+            min_instances,
             queue_timeout,
             metrics,
         } = self;
@@ -1531,9 +1536,11 @@ impl Driver {
                 AfterAnswer::Inherit => Some((None, false, "kept")),
                 AfterAnswer::For(t) => Some((Some(now + t), false, "kept")),
                 AfterAnswer::Handoff { cap } => Some((Some(now + cap), true, "handoff")),
-                // Below the warm floor the instance stays (protected by the target, expired).
+                // Below the `min_instances` floor the instance stays (protected by the target, expired);
+                // the autoscaler's demand target alone keeps nothing.
                 AfterAnswer::Dispose => {
-                    let want = want_of(warm.as_ref().map(|w| w.snapshot()).as_deref(), &key);
+                    let want =
+                        want_of(warm.as_ref().map(|w| w.snapshot()).as_deref(), &key).min(min_instances as usize);
                     (idle.lock().ready(&key) < want).then_some((Some(now), false, "kept"))
                 }
             };

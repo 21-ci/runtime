@@ -352,3 +352,47 @@ async fn node_put(node: &impl Node, slug: &str, path: &str, body: &str) -> Strin
     assert_eq!(r.s(), 200, "{path}: {}", r.text);
     r.text
 }
+
+/// A service that calls its own `rpc` table from `fetch`.
+const SELF_CALLER: &str = r#"
+import { services } from "std:services";
+export const rpc = { async add(args: any) { return { sum: args.a + args.b }; } };
+export default {
+  async fetch(_req: Request, ctx: any): Promise<Response> {
+    return Response.json(await services.call(ctx.service.slug, "add", { a: 1, b: 2 }));
+  },
+};"#;
+
+/// RPC-11: a service at `max_instances: 1` that calls itself does not deadlock: the child call is
+/// re-entrant (its parent holds the only instance and waits for it), so it runs past the ceiling
+/// instead of waiting to `queue_timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ac_rpc_11_a_self_call_with_max_instances_1_does_not_deadlock() {
+    let node = start_node().await;
+    let t = new_tenant(&node, "pro").await;
+    let slug = uniq("selfcall");
+    let r = post(
+        &node,
+        &t.key,
+        "/v1/services",
+        json!({"slug": slug, "runtime": "deno", "scaling": {"max_instances": 1}}),
+    )
+    .await;
+    assert_eq!(r.s(), 201, "{}", r.text);
+    let svc = r.json["id"].as_str().expect("id").to_string();
+    let u = upload_ts(&node, &t.key, &svc, SELF_CALLER, "activate=1").await;
+    assert!(u.s() == 201 || u.s() == 202, "{}", u.text);
+
+    let started = std::time::Instant::now();
+    let r = tokio::time::timeout(std::time::Duration::from_secs(15), invoke(&node, &slug, "/"))
+        .await
+        .expect("the self-call answers instead of hanging");
+    assert_eq!(r.s(), 200, "{}", r.text);
+    assert_eq!(r.json, json!({"sum": 3}), "{}", r.text);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(7),
+        "{:?}",
+        started.elapsed()
+    );
+    node.shutdown().await;
+}

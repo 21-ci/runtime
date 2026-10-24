@@ -27,6 +27,15 @@
 //! artifact already hold slots. Only requests carry the tenant's plan cap (refreshed on each);
 //! a build's default knobs or a call never change it.
 //!
+//! **Re-entrant calls.** A call or a pub/sub request reply that a task of the *same* service
+//! submitted ([`TaskSpec::reentrant`]) is not held by the service ceiling: its parent waits for it
+//! while holding one of the service's slots, so at `max_instances: 1` the slot could never free
+//! (the self-call would end `queue_timeout`). Such a call may run past `max_instances`; it still
+//! takes the tenant's call allowance at its depth, a `max_inflight` slot and its own memory
+//! reservation, so the overshoot is bounded by the call depth limit × the plan cap. Calls from
+//! other services keep the ceiling as a hard cap; an indirect cycle (A calls B calls A) is not
+//! detected and still waits on A's ceiling.
+//!
 //! **Fairness.** Waiting work is ordered, not just queued:
 //!
 //! 1. Within a tenant, calls go first (FIFO among themselves); builds never wait.
@@ -200,6 +209,9 @@ pub struct AdmitRequest {
     pub wall: Duration,
     /// Estimator lane ([`admission_lane`]).
     pub lane: u8,
+    /// A [`SlotClass::Call`] submitted by a task of the same service ([`TaskSpec::reentrant`]):
+    /// not held by the service ceiling (see the module doc).
+    pub reentrant: bool,
 }
 
 impl AdmitRequest {
@@ -224,6 +236,7 @@ impl AdmitRequest {
             now_ns,
             wall: spec.limits.wall,
             lane: admission_lane(&spec.trigger),
+            reentrant: spec.reentrant && SlotClass::of(spec.kind, &spec.trigger) == SlotClass::Call,
         }
     }
 }
@@ -676,6 +689,7 @@ struct Waiting<T> {
     bytes: u64,
     class: SlotClass,
     depth: u8,
+    reentrant: bool,
     since_ns: u64,
     key: u64,
     pred_ns: u64,
@@ -704,11 +718,11 @@ impl<T> SvcQ<T> {
         self.items.first_key_value().map(|(&(k, s), _)| (1, k, s))
     }
 
-    fn head(&self) -> Option<(SlotClass, u8)> {
+    fn head(&self) -> Option<(SlotClass, u8, bool)> {
         self.calls
             .first_key_value()
             .or(self.items.first_key_value())
-            .map(|(_, x)| (x.class, x.depth))
+            .map(|(_, x)| (x.class, x.depth, x.reentrant))
     }
 
     fn pop_head(&mut self) -> Option<Waiting<T>> {
@@ -1168,7 +1182,7 @@ impl<T> Admission<T> {
         // waiting for the artifact) already holds slots.
         let line_up = req.class == SlotClass::Throttled
             && (slot.queued.load(SeqCst) > 0 || slot.tenant.queued.load(SeqCst) > 0 || self.ringed.load(SeqCst) > 0);
-        if !line_up && self.try_take(slot, req.class, req.call_depth) == Take::Ok {
+        if !line_up && self.try_take(slot, req.class, req.call_depth, req.reentrant) == Take::Ok {
             if counted {
                 slot.win.arrivals.fetch_add(1, Ordering::Relaxed);
             }
@@ -1242,6 +1256,7 @@ impl<T> Admission<T> {
             bytes: req.bytes,
             class: req.class,
             depth: req.call_depth,
+            reentrant: req.reentrant,
             since_ns: req.now_ns,
             key,
             pred_ns: pred,
@@ -1267,9 +1282,15 @@ impl<T> Admission<T> {
     /// Take the slots one task of `class` needs, all or nothing (see the module doc):
     /// - `Throttled`: the adaptive limit, the tenant cap, `max_inflight` less the call reserve;
     /// - `Call`: the service ceiling, the tenant's call allowance (= its cap), all of `max_inflight`;
-    ///   counted against the tenant cap without being held by it;
+    ///   counted against the tenant cap without being held by it. A `reentrant` call (submitted by
+    ///   a task of the same service) is not held by the ceiling: its parent waits for it holding
+    ///   one of the service's slots, so at `max_instances: 1` the ceiling would never free for it
+    ///   (a self-call or self-request would wait to `queue_timeout`). It still takes the tenant's
+    ///   call allowance at its depth and a `max_inflight` slot, and its memory reservation, so the
+    ///   overshoot is bounded by `MAX_CALL_DEPTH` × the plan cap (and `max_inflight`). An
+    ///   indirect cycle (A calls B calls A) is not seen here and still waits on A's ceiling;
     /// - `Build`: `max_inflight` counts it, nothing holds it (not the service's, not the tenant's).
-    fn try_take(&self, slot: &SvcSlot, class: SlotClass, depth: u8) -> Take {
+    fn try_take(&self, slot: &SvcSlot, class: SlotClass, depth: u8, reentrant: bool) -> Take {
         let calls = &slot.tenant.calls[usize::from(depth).min(CALL_DEPTHS - 1)];
         let max_inflight = self.max_inflight.load(SeqCst);
         match class {
@@ -1281,6 +1302,9 @@ impl<T> Admission<T> {
                 if !inc_below(&slot.running, slot.limit.load(SeqCst)) {
                     return Take::Service;
                 }
+            }
+            SlotClass::Call if reentrant => {
+                slot.running.fetch_add(1, SeqCst);
             }
             SlotClass::Call => {
                 if !inc_below(&slot.running, slot.ceiling.load(SeqCst)) {
@@ -1347,7 +1371,7 @@ impl<T> Admission<T> {
                 }
                 continue;
             };
-            let Some((class, depth)) = sq.head() else {
+            let Some((class, depth, reentrant)) = sq.head() else {
                 // LCOV_EXCL_START: an empty queue is removed with its last item
                 w.services.remove(&sid);
                 if let Some(tq) = w.tenants.get_mut(&tid) {
@@ -1356,7 +1380,7 @@ impl<T> Admission<T> {
                 continue;
                 // LCOV_EXCL_STOP
             };
-            match self.try_take(&sq.slot, class, depth) {
+            match self.try_take(&sq.slot, class, depth, reentrant) {
                 Take::Ok => {
                     let x = sq.pop_head().expect("the head was just seen");
                     let slot = sq.slot.clone();

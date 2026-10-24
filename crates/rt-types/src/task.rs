@@ -244,6 +244,10 @@ pub struct TaskSpec {
     /// The object this task acts for: a socket event or alarm, a request to a durable object, or
     /// the default object of a durable service. `None` for every other task.
     pub object: Option<ObjectRef>,
+    /// A nested task (a service call or a pub/sub request's reply delivery) submitted by a task
+    /// of the same service, which waits for it while holding one of the service's run slots: the
+    /// scheduler lets it run past `max_instances` so a self-call cannot deadlock on its parent.
+    pub reentrant: bool,
 }
 
 impl TaskSpec {
@@ -261,6 +265,7 @@ impl TaskSpec {
             slug: Arc::from(""),
             caller: None,
             object: None,
+            reentrant: false,
         }
     }
 

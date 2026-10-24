@@ -72,6 +72,8 @@ struct Ka {
     targets: Arc<WarmTargets>,
     backlog: Arc<TestBacklog>,
     metrics: Arc<Metrics>,
+    /// `scaling.min_instances` of the service the requests run as.
+    min_instances: u32,
 }
 
 async fn ka(ttl: Duration) -> Ka {
@@ -91,12 +93,17 @@ async fn ka(ttl: Duration) -> Ka {
         targets,
         backlog,
         metrics,
+        min_instances: 0,
     }
 }
 
 impl Ka {
     async fn n(&mut self, mrt: Option<Duration>) -> u64 {
-        let ran = self.h.run(svc_spec(mrt).http_get("/").finish(), &self.p).await;
+        let knobs = ServiceKnobs {
+            min_instances: self.min_instances,
+            ..knobs(mrt)
+        };
+        let ran = self.h.run(spec().knobs(knobs).http_get("/").finish(), &self.p).await;
         let n = read(ran.outcome).await.json()["n"].as_u64().expect("n");
         self.h.settle(Duration::from_millis(20)).await;
         n
@@ -209,11 +216,33 @@ fn mrt_dno_05_zero_keeps_the_warm_floor() {
     run_local(async {
         let mut k = ka(Duration::from_secs(60)).await;
         k.publish_floor(1);
+        k.min_instances = 1;
         assert_eq!(k.n(ms(0)).await, 1);
         assert_eq!(k.kept(), 1, "below the floor: kept");
         k.after(Duration::from_millis(50)).await;
         assert_eq!(k.kept(), 1, "the protected isolate does not expire");
         assert_eq!(k.n(ms(0)).await, 2, "and serves the next task");
+    });
+}
+
+/// A demand target (the autoscaler's, here 2 per P) without a `min_instances` floor keeps
+/// nothing at `min_run_time = 0`; `min_instances = 1` keeps one, not the target's 2.
+#[test]
+fn mrt_dno_10_zero_ignores_a_demand_target_without_min_instances() {
+    run_local(async {
+        let mut k = ka(Duration::from_secs(60)).await;
+        k.publish_floor(2);
+        for _ in 0..2 {
+            assert_eq!(k.n(ms(0)).await, 1, "a fresh isolate every time");
+            assert_eq!(k.kept(), 0, "min_instances 0: disposed");
+        }
+        assert_eq!(k.count("disposed"), 2.0);
+        assert_eq!(k.count("kept"), 0.0);
+        k.min_instances = 1;
+        assert_eq!(k.n(ms(0)).await, 1);
+        assert_eq!(k.kept(), 1, "below min_instances: kept");
+        assert_eq!(k.n(ms(0)).await, 2, "and reused");
+        assert_eq!(k.kept(), 1, "only the floor, not the demand target");
     });
 }
 
