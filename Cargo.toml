@@ -105,7 +105,7 @@ serde_json = { version = "1.0.149", features = ["raw_value", "preserve_order"] }
 toml = "0.9.8"
 humantime = "2.3.0"
 hex = "0.4.3"
-base64 = "0.22.1"
+base64 = "0.23.1"
 
 # --- errors / logging / metrics -------------------------------------------
 thiserror = "2.0.17"
