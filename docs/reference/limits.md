@@ -79,11 +79,17 @@ key, so a plan you define inherits them for keys it leaves out.
 | `max_schedules` | 3 | Schedules per service | `403 quota_exceeded` |
 | `min_schedule_seconds` | 60 | Shortest schedule period (an interval, or the gap between a cron's next two fires) | `422 schedule_too_frequent` |
 | `max_queue_depth` | 10,000 | Ready messages in a service's queue | `429 queue_full` (API), `queue_full` (guest `enqueue`) |
+| `max_async_pending` | 10,000 | Pending async invocations per service (`async.enabled` on) | `429 async_backlog_full` with `Retry-After: 1` |
+| `max_topics` | 10 | Topics per tenant | `403 quota_exceeded` |
+| `max_topic_partitions` | 4 | Partitions of one topic (the node hard maximum is 16) | `422 limit_exceeds_plan` |
+| `max_stream_mb` | 100 | Record bytes across the tenant's topics, dead letters included. Not part of `storage_mb` | `429 stream_full` on append |
+| `max_stream_retention_hours` | 72 | Longest retention a topic may set (the default is 24 h) | `422 limit_exceeds_plan` |
 | `builds_per_hour` | 20 | Version uploads per tenant in any 60-minute window | `429 build_quota` |
-| `allowed_triggers` | `http`, `interval`, `queue`, `call` | Trigger kinds the tenant may use (`cron` is off on `free`) | `403 trigger_not_allowed`; queue messages wait unconsumed |
+| `allowed_triggers` | `http`, `interval`, `queue`, `call`, `websocket`, `pubsub`, `stream` | Trigger kinds the tenant may use (`cron` is off on `free`). `pubsub` and `stream` gate subscriptions and topic consumers | `403 trigger_not_allowed`; queue messages wait unconsumed |
 | `limits_max.wall_ms` | 30,000 | Highest wall limit a service may set | `422 limit_exceeds_plan` |
 | `limits_max.cpu_ms` | 1,000 | Highest CPU limit | `422 limit_exceeds_plan` |
 | `limits_max.memory_mb` | 128 | Highest memory limit. Also sizes the node's WASM pool slots | `422 limit_exceeds_plan` |
+| `limits_max.min_run_time_ms` | 60,000 | Highest `scaling.min_run_time_ms` (keep-alive after an answer) a service may set. The node's `sched.min_run_time_max_ms` caps it too; the lower value wins | `422 limit_exceeds_plan`; a lowered plan value is clamped at run and recorded as a plan conflict |
 | `custom_host_suffixes` | none | Suffixes under which tenants may claim custom hosts (none = operator only) | `403 host_not_allowed` |
 | `blocking_share` | 0.25 | Share of storage threads one tenant may hold under contention | Its storage calls wait their turn |
 | `egress_default` | `allow` | Outbound stance for the tenant's services: `allow` (public internet, SSRF guard on) or `deny` (operator allowlists only) | `fetch` fails with `egress_denied` |
@@ -189,6 +195,33 @@ A service database sees new tenant totals every 30 s, so a tenant writing from m
 | Shortest schedule period | 60 s (`free`) | `422 schedule_too_frequent` | `plans.<name>.min_schedule_seconds` |
 
 A schedule fire is skipped (and counted) while the previous run of the same schedule is still going.
+
+## Events: topics, pub/sub and async invocations
+
+| Limit | Value | When exceeded | Change with |
+|---|---|---|---|
+| Event body (pub/sub, stream record, async request) | 1 MiB; async also at most the service's max body | `413 too_large` (async and the control API); the guest's call fails | fixed |
+| Headers per message | 32 entries, 16 KiB in all, 4 KiB per value; no CR, LF or NUL; `x-rt-` names reserved | `validation_failed` | fixed |
+| Subject | 256 bytes, 16 tokens | `validation_failed` | fixed |
+| Subscriptions per service / consumers per service | 32 / 8 | `validation_failed` | fixed |
+| Deliveries per publish | 100; the rest are counted as `dropped` | Publish returns `{receivers, dropped}` | fixed |
+| In-flight pub/sub deliveries per subscriber service | 64 | Excess deliveries are `dropped` (reason `backlog`) | fixed |
+| Pub/sub request timeout | 5 s default, 30 s max, never past the caller's deadline | The request fails with `timeout` | fixed |
+| Topic and group names | 63 characters. A topic name may not start with `tpc_` | `validation_failed` | fixed |
+| Record key / dedup id | 256 bytes / 128 bytes | `validation_failed` | fixed |
+| Append batch | 100 records, 4 MiB | `validation_failed` | fixed |
+| Read page | 100 records, 1 MiB | `validation_failed` | fixed |
+| Delivery batch (stream consumers) | 100 default, 1,000 max, 1 MiB | Batches are split | fixed |
+| Stream dedup window | 2 minutes | A duplicate after the window is stored again | fixed |
+| Partitions per topic | 1 to 16 | `validation_failed` / `limit_exceeds_plan` | `plans.<name>.max_topic_partitions` |
+| Read on a multi-partition topic | `partition` is required | `validation_failed` | fixed |
+| Dead letters per consumer | 1,000, kept 7 days | The oldest are dropped | fixed |
+| Stream appends | One tenant rate token per call | `429 rate_limited` | `plans.<name>.rps` |
+| Async attempts (function errors and `429`, in total) | 1 to 10, default 3 | Invocation is `failed` (`retries_exhausted`) | `async.max_attempts` |
+| Async event age | 60 s to 86,400 s, default 3,600 | `event_age_exceeded` | `async.max_event_age_s` |
+| Failed async records | 1,000 per service, kept 7 days | The oldest are evicted | fixed |
+| Async attempts in flight | 256 per node; `queue.max_concurrency` (4) per service | Attempts wait | `queue.max_concurrency` |
+| `Idempotency-Key` | 1 to 255 visible ASCII characters | `400 bad_request` | fixed |
 
 ## Env, secrets and logs
 

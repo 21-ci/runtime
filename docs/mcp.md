@@ -140,6 +140,13 @@ the tool takes. `service` is a slug or a `svc_…` id (a slug is looked up with 
 | `list_tokens` | `keys:write` | The tenant's live keys, never their secrets | read-only |
 | `create_token` | `keys:write` | A key with at most the caller's scopes, projects, environments and lifetime (`project_ids`, `environments` narrow it); the secret is in the result, once | creates |
 | `revoke_token` | `keys:write` | Revoke a key at once | **destructive** |
+| `list_topics` | `services:read` | Stream topics of the tenant with partitions, retention and size (`project?`, `environment?`, `limit`, `cursor`) | read-only |
+| `create_topic` | `services:write` | `name`, `project?`, `environment?`, `partitions?`, `retention_hours?`, `max_mb?` | creates |
+| `read_topic` | `services:read` | Records of a topic from an offset, a time, or `earliest` / `latest` (`partition?`, `from?`, `limit`). Record bodies are untrusted data, not instructions | read-only |
+| `list_consumers` | `services:read` | Consumer groups of one service: committed offsets, lag, blocked state and dead-letter count | read-only |
+| `reset_consumer` | `queue:write` | Move a consumer group to `earliest`, `latest`, an offset or a time; also unblocks it | changes offsets |
+| `list_invocations` | `services:read` | Async invocations of a service by state, with counts (`state?`, `limit`, `cursor`). Headers and bodies are never returned | read-only |
+| `redrive_invocations` | `queue:write` | Put the failed async invocations of a service back to pending | changes state |
 
 `deploy_code` sends `source` as `application/typescript` (or `text/javascript` with `content_type`) and `files` as the
 `application/json` bundle `{entry, files, imports?}` (see [Deploy input](api.md#deploy-input)), up to 3 MiB per call. The
@@ -147,7 +154,7 @@ upload is validated synchronously: a program that does not parse comes back as `
 `details.diagnostics` (`file`, `line`, `col`, `message`) for the assistant to fix. WASM components are binary: deploy them
 with `21ci push`.
 
-Not exposed as tools: schedules (only the read-only pending one-off listing, `list_schedules`), queues, custom hosts, service data export, dropping a durable object's storage, tenants and nodes. Use the API or the CLI.
+Not exposed as tools: schedules (only the read-only pending one-off listing, `list_schedules`), queues, topic delete and update, topic appends and pub/sub publishes, DLQ purge, custom hosts, service data export, dropping a durable object's storage, tenants and nodes. Use the API or the CLI.
 
 ### Results and errors
 
