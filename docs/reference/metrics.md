@@ -158,7 +158,7 @@ Only `tier="t1"` is populated for entries, bytes, hits and misses; the `t2` seri
 | `rt_stream_skipped_total` | counter | `reason` = `exhausted`, `out_of_range` | Stream records skipped by the consumer (no attempts left, or the offset is out of range) |
 | `rt_async_accepted_total` | counter | | Async invocations accepted (`202`) |
 | `rt_async_throttled_total` | counter | | Async attempts given back to admission, not counted as attempts |
-| `rt_async_finished_total` | counter | `condition` = `success`, `retries_exhausted`, `event_age_exceeded` | Async invocations that reached a final state |
+| `rt_async_finished_total` | counter | `condition` = `success`, `retries_exhausted`, `event_age_exceeded`, `unreadable` | Async invocations that reached a final state |
 | `rt_async_failed_evicted_total` | counter | | Failed async records removed to keep the 1,000-per-service cap |
 
 Metrics for topics and invocations carry no topic, subject or service labels, so their cardinality is bounded.
