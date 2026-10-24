@@ -130,6 +130,9 @@ they are thrown as an `Error` with a `.code`; in WASM the `std:host` functions r
 | `std:blob` | `blob_key_too_large`, `storage_quota`, `validation_failed`; WASM `get` also `blob_too_large` (object over the buffered limit) |
 | `std:queue` | `not_found`, `forbidden`, `queue_full`, `call_not_allowed`, `trigger_not_allowed`, `cross_tenant_call` |
 | `std:services` | `not_found`, `cross_tenant_call`, `forbidden`, `call_not_allowed`, `trigger_not_allowed`, `call_failed` |
+| `std:pubsub` (publish) | `validation_failed`, `too_large`, `unavailable`, `rate_limited`, `quota_exceeded`, `call_depth` |
+| `std:pubsub` (request) | the publish codes, plus `no_responders`, `timeout`, `responder_failed`, `overloaded`, `queue_timeout`, `shed`, `memory`, `draining` |
+| `std:stream` | `validation_failed`, `too_large`, `unavailable`, `not_found`, `stream_full` (appends also `rate_limited`, `quota_exceeded`) |
 | `std:platform` (returned as a `Response`, never thrown) | `403 binding_denied`, `403 binding_not_allowed`, `404 binding_not_found`, `429 rate_limited`, `502 binding_upstream` |
 | Environment | `env_unavailable` (reading `Deno.env` when the env could not be fetched) |
 | Request body | `request_too_large` (reading past `limits.max_body_bytes`) |
