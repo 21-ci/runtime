@@ -17,6 +17,7 @@ members = [
   "crates/rt-triggers",
   "crates/rt-api",
   "crates/rt-server",
+  "crates/rt-cli",
 ]
 
 [workspace.package]
