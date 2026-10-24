@@ -1,0 +1,63 @@
+# systemd unit for the rt node (installed by the deb/rpm packages as /usr/lib/systemd/system/rt.service).
+#
+#   sudoedit /etc/default/rt          # RT_ROOT_TOKEN, RT_MASTER_KEY   (rpm: /etc/sysconfig/rt)
+#   sudo systemctl enable --now rt
+#
+# Local changes go in a drop-in (`systemctl edit rt`), not in this file. Config: /etc/rt/rt.toml. Data: /var/lib/rt.
+
+[Unit]
+Description=21 Cloud Functions Runtime node (rt)
+Documentation=https://21-ci.github.io/runtime/ man:rt(1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=rt
+Group=rt
+EnvironmentFile=-/etc/default/rt
+EnvironmentFile=-/etc/sysconfig/rt
+ExecStart=/usr/bin/rt --config /etc/rt/rt.toml serve
+# SIGHUP reloads [plans] and the route tables (docs: configuration); everything else needs a restart.
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=40
+Restart=on-failure
+RestartSec=2s
+
+StateDirectory=rt
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/rt
+LimitNOFILE=65536
+LimitCORE=0
+
+# Hardening. rt needs: its state dir, outbound network (guest egress, npm/jsr fetches at build time), JIT memory (V8
+# and wasmtime: no MemoryDenyWriteExecute), and many threads.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+# @resources stays allowed: rt sets RLIMIT_CORE=0 itself and pins threads when sched.pin_threads is on.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount @swap @reboot @obsolete
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

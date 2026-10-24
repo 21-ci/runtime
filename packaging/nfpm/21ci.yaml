@@ -1,0 +1,65 @@
+# nfpm config for the `21ci` CLI: deb, rpm and apk. The binary is the static musl build, so one package per arch
+# works on every distribution.
+#
+#   VERSION=1.2.3 ARCH=amd64 BIN_DIR=dist/bin/x86_64-unknown-linux-musl COMPLETIONS_DIR=dist/completions \
+#     nfpm package -f packaging/nfpm/21ci.yaml -p apk -t dist/pkg/
+#
+# Env: VERSION, ARCH (amd64 | arm64), BIN_DIR (holds `21ci`), COMPLETIONS_DIR (21ci.bash, _21ci, 21ci.fish from
+# `21ci completion <shell>`), NFPM_GPG_KEY_FILE (rpm, + NFPM_RPM_PASSPHRASE), APK_KEY_FILE (apk, unencrypted RSA key).
+
+name: 21ci
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+section: devel
+priority: optional
+maintainer: 21 Cloud Runtime Maintainers <packages@REPLACE-WITH-PROJECT-DOMAIN>
+vendor: 21 Cloud
+homepage: https://github.com/21-ci/runtime
+license: Apache-2.0
+description: |-
+  21ci: command line client for the 21 Cloud Functions Runtime control API.
+  Deploy services, manage tenants, keys, schedules and queues, stream logs and generate typed RPC clients.
+
+contents:
+  - src: ${BIN_DIR}/21ci
+    dst: /usr/bin/21ci
+    file_info:
+      mode: 0755
+  - src: ${COMPLETIONS_DIR}/21ci.bash
+    dst: /usr/share/bash-completion/completions/21ci
+  - src: ${COMPLETIONS_DIR}/_21ci
+    dst: /usr/share/zsh/site-functions/_21ci
+  - src: ${COMPLETIONS_DIR}/21ci.fish
+    dst: /usr/share/fish/vendor_completions.d/21ci.fish
+  - src: LICENSE
+    dst: /usr/share/doc/21ci/LICENSE
+  - src: NOTICE
+    dst: /usr/share/doc/21ci/NOTICE
+
+overrides:
+  deb:
+    recommends:
+      - ca-certificates
+  rpm:
+    recommends:
+      - ca-certificates
+  apk:
+    depends:
+      - ca-certificates
+
+rpm:
+  group: Development/Tools
+  compression: zstd
+  signature:
+    key_file: ${NFPM_GPG_KEY_FILE}
+
+deb:
+  compression: zstd
+
+apk:
+  signature:
+    key_file: ${APK_KEY_FILE}
+    # The signature is named .SIGN.RSA.21cloud.rsa.pub: users install the public key as /etc/apk/keys/21cloud.rsa.pub.
+    key_name: 21cloud

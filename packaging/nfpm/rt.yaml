@@ -1,0 +1,102 @@
+# nfpm (https://nfpm.goreleaser.com) config for the `rt` node: deb and rpm.
+#
+#   VERSION=1.2.3 ARCH=amd64 BIN_DIR=dist/bin/x86_64-unknown-linux-gnu \
+#     nfpm package -f packaging/nfpm/rt.yaml -p deb -t dist/pkg/
+#
+# Env: VERSION (no leading v), ARCH (amd64 | arm64; nfpm maps it per format), BIN_DIR (holds `rt`),
+# NFPM_GPG_KEY_FILE (+ NFPM_RPM_PASSPHRASE) to sign the rpm. Run from the repository root.
+#
+# No apk: rt links the prebuilt V8, which needs glibc. On Alpine run the container image instead.
+
+name: rt
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+section: net
+priority: optional
+maintainer: 21 Cloud Runtime Maintainers <packages@REPLACE-WITH-PROJECT-DOMAIN>
+vendor: 21 Cloud
+homepage: https://github.com/21-ci/runtime
+license: Apache-2.0
+description: |-
+  21 Cloud Functions Runtime node.
+  Self-hosted, multi-tenant functions runtime: TypeScript/JavaScript in Deno isolates and WASM components in
+  wasmtime, with HTTP routes, schedules, queues, KV/SQL/blob storage and WebSockets. One process, one data directory.
+
+contents:
+  - src: ${BIN_DIR}/rt
+    dst: /usr/bin/rt
+    file_info:
+      mode: 0755
+
+  - src: packaging/systemd/rt.service
+    dst: /usr/lib/systemd/system/rt.service
+    file_info:
+      mode: 0644
+
+  - src: deploy/rt.toml
+    dst: /etc/rt/rt.toml
+    type: config|noreplace
+    file_info:
+      mode: 0640
+      owner: root
+      group: rt
+
+  # Secrets for the unit (RT_ROOT_TOKEN, RT_MASTER_KEY): /etc/default on Debian, /etc/sysconfig on Red Hat.
+  - src: packaging/systemd/rt.env
+    dst: /etc/default/rt
+    type: config|noreplace
+    packager: deb
+    file_info:
+      mode: 0600
+  - src: packaging/systemd/rt.env
+    dst: /etc/sysconfig/rt
+    type: config|noreplace
+    packager: rpm
+    file_info:
+      mode: 0600
+
+  - dst: /var/lib/rt
+    type: dir
+    file_info:
+      mode: 0750
+      owner: rt
+      group: rt
+
+  - src: config/defconfigs
+    dst: /usr/share/rt/defconfigs
+  - src: LICENSE
+    dst: /usr/share/doc/rt/LICENSE
+  - src: NOTICE
+    dst: /usr/share/doc/rt/NOTICE
+  - src: README.md
+    dst: /usr/share/doc/rt/README.md
+
+scripts:
+  preinstall: packaging/scripts/rt-preinstall.sh
+  postinstall: packaging/scripts/rt-postinstall.sh
+  preremove: packaging/scripts/rt-preremove.sh
+  postremove: packaging/scripts/rt-postremove.sh
+
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.35)
+      - adduser
+    recommends:
+      - ca-certificates
+  rpm:
+    depends:
+      - glibc >= 2.34
+      - shadow-utils
+      - ca-certificates
+
+rpm:
+  group: System Environment/Daemons
+  compression: zstd
+  signature:
+    key_file: ${NFPM_GPG_KEY_FILE}
+
+deb:
+  compression: zstd
