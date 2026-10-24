@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 200" width="880" height="200" role="img" aria-label="21 Cloud Functions Runtime: self-hosted, multi-tenant functions on Deno isolates and WASM components">
+  <title>21 Cloud Functions Runtime</title>
+  <style>
+    .bg { fill: #f7f8fb; }
+    .fg { fill: #0f172a; }
+    .muted { fill: #475569; }
+    .chip { fill: #e8edf7; }
+    .chiptext { fill: #1e3a8a; }
+    text { font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .fg { fill: #f0f6fc; }
+      .muted { fill: #9aa7b8; }
+      .chip { fill: #1c2433; }
+      .chiptext { fill: #a5c3ff; }
+    }
+  </style>
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f7cff"/>
+      <stop offset="1" stop-color="#14b8a6"/>
+    </linearGradient>
+  </defs>
+  <rect class="bg" width="880" height="200" rx="16"/>
+  <g transform="translate(48 52)">
+    <rect width="96" height="96" rx="22" fill="url(#g)"/>
+    <rect x="20" y="24" width="56" height="12" rx="6" fill="#fff" fill-opacity="0.35"/>
+    <rect x="20" y="42" width="56" height="12" rx="6" fill="#fff"/>
+    <rect x="20" y="60" width="36" height="12" rx="6" fill="#fff" fill-opacity="0.35"/>
+    <circle cx="67" cy="66" r="6" fill="#fff"/>
+  </g>
+  <text class="fg" x="176" y="94" font-size="40" font-weight="700">21 Cloud Functions Runtime</text>
+  <text class="muted" x="176" y="128" font-size="19">Deno isolates and WASM components, multi-tenant, self-hosted</text>
+  <g font-size="14" font-weight="600">
+    <rect class="chip" x="176" y="146" width="92" height="26" rx="13"/>
+    <text class="chiptext" x="222" y="164" text-anchor="middle">TypeScript</text>
+    <rect class="chip" x="276" y="146" width="128" height="26" rx="13"/>
+    <text class="chiptext" x="340" y="164" text-anchor="middle">WASI P2 / WASM</text>
+    <rect class="chip" x="412" y="146" width="150" height="26" rx="13"/>
+    <text class="chiptext" x="487" y="164" text-anchor="middle">KV · SQL · blob · queue</text>
+    <rect class="chip" x="570" y="146" width="104" height="26" rx="13"/>
+    <text class="chiptext" x="622" y="164" text-anchor="middle">WebSockets</text>
+    <rect class="chip" x="682" y="146" width="96" height="26" rx="13"/>
+    <text class="chiptext" x="730" y="164" text-anchor="middle">Apache-2.0</text>
+  </g>
+</svg>

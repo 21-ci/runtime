@@ -1,0 +1,252 @@
+# Security checks on every push and PR. Findings go to GitHub code scanning (SARIF); HIGH/CRITICAL findings fail.
+#
+#   dependencies  cargo-deny (advisories, licenses, bans, sources: deny.toml) and cargo-audit (same ignore list)
+#   codeql        Rust, JavaScript/TypeScript (js/, samples) and the workflows themselves
+#   secrets       gitleaks over the full history
+#   semgrep       Rust, JavaScript, secrets and GitHub Actions rules
+#   workflows     zizmor (workflow security) and actionlint (syntax, shellcheck on run: blocks)
+#   lint          hadolint (Dockerfiles), shellcheck (scripts)
+#   trivy         `trivy fs` (vulnerabilities, secrets) and `trivy config` (Dockerfiles, compose, Kubernetes)
+#
+# Image, tarball, package and SBOM scans run in ci.yml (image), release.yml (before publishing) and nightly.yml.
+name: Security
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  dependencies:
+    name: cargo-deny + cargo-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --workspace
+          command-arguments: advisories licenses bans sources
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-audit@0.22.2
+      - name: cargo audit (ignores come from deny.toml, each with its reason)
+        run: |
+          ignores=$(python3 -c 'import tomllib; print(" ".join("--ignore " + i["id"] for i in tomllib.load(open("deny.toml","rb"))["advisories"].get("ignore", [])))')
+          # shellcheck disable=SC2086
+          cargo audit --deny warnings $ignores
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, javascript-typescript, actions]
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:${{ matrix.language }}
+
+  secrets:
+    name: gitleaks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The gitleaks binary, built from its tagged module (Go checksum database verified), not gitleaks-action:
+      # that action needs a paid license for organisations.
+      - name: Install gitleaks v8.30.1
+        run: GOBIN="$RUNNER_TEMP/bin" go install github.com/zricethezav/gitleaks/v8@v8.30.1
+      - name: gitleaks (full history)
+        run: |
+          "$RUNNER_TEMP/bin/gitleaks" git --redact --no-banner \
+            --report-format sarif --report-path gitleaks.sarif .
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check semgrep==1.182.1
+      - name: semgrep scan (blocks on ERROR severity)
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          semgrep scan --metrics=off \
+            --config p/rust --config p/javascript --config p/typescript --config p/secrets --config p/github-actions \
+            --exclude target --exclude fixtures/wasm/out --exclude 'sample/**/package-lock.json' \
+            --sarif-output=semgrep.sarif --severity ERROR --error
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always() && hashFiles('semgrep.sarif') != ''
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  workflows:
+    name: zizmor + actionlint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
+        with:
+          version: 1.31.1
+          min-severity: medium
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: actionlint@1.7.12
+      - run: actionlint -color
+
+  lint:
+    name: hadolint + shellcheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+          format: sarif
+          output-file: hadolint-rt.sarif
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        if: always()
+        with:
+          dockerfile: Dockerfile.21ci
+          failure-threshold: warning
+          format: sarif
+          output-file: hadolint-21ci.sarif
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always()
+        with:
+          sarif_file: .
+          category: hadolint
+      - name: shellcheck (packaging, scripts, samples, e2e)
+        run: |
+          # packaging/ is POSIX sh and must be clean at every severity; the rest blocks on errors.
+          shellcheck -s sh packaging/install.sh packaging/repo/*.sh packaging/scripts/*.sh packaging/homebrew/render.sh
+          git ls-files -z '*.sh' | xargs -0 shellcheck -S error
+
+  trivy:
+    name: trivy fs + config
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: trivy fs (vulnerabilities, secrets) -> SARIF
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.76.1
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          skip-dirs: target,fixtures/wasm/out
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-fs.sarif
+      - name: trivy config (Dockerfiles, compose, Kubernetes) -> SARIF
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.76.1
+          skip-setup-trivy: true
+          scan-type: config
+          scan-ref: .
+          skip-dirs: target
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-config.sarif
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always()
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+      - name: Gate on HIGH/CRITICAL (fixable)
+        run: |
+          trivy fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --ignore-unfixed \
+            --ignorefile .trivyignore --skip-dirs target --skip-dirs fixtures/wasm/out --exit-code 1 .

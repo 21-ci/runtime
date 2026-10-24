@@ -1,0 +1,174 @@
+# Nightly re-scan: new CVEs and RustSec advisories surface without a push. Scans the latest released images (both
+# platforms), the latest release's SBOMs and the dependency tree on main; results go to code scanning, and a failure
+# opens (or comments on) one tracking issue labelled `security`.
+name: Nightly security scan
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: nightly-security
+  cancel-in-progress: true
+
+env:
+  TRIVY_VERSION: v0.76.1
+
+jobs:
+  images:
+    name: image ${{ matrix.image }} (${{ matrix.platform }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [rt, 21ci]
+        platform: [amd64, arm64]
+    env:
+      REF: ghcr.io/21-ci/${{ matrix.image }}:latest
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: exists
+        name: Is there a release image yet?
+        run: |
+          if docker manifest inspect "$REF" >/dev/null 2>&1; then echo "yes=true" >> "$GITHUB_OUTPUT"; else
+            echo "::notice::$REF does not exist yet (no release): nothing to scan"; echo "yes=false" >> "$GITHUB_OUTPUT"; fi
+      - name: trivy image -> SARIF
+        if: steps.exists.outputs.yes == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/${{ matrix.platform }}
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          image-ref: ${{ env.REF }}
+          scanners: vuln,secret
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy.sarif
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always() && hashFiles('trivy.sarif') != ''
+        with:
+          sarif_file: trivy.sarif
+          category: nightly-image-${{ matrix.image }}-${{ matrix.platform }}
+      - uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        if: steps.exists.outputs.yes == 'true'
+        id: grype
+      - name: Gate (HIGH/CRITICAL with a fix)
+        if: steps.exists.outputs.yes == 'true'
+        env:
+          GRYPE: ${{ steps.grype.outputs.cmd }}
+          PLATFORM: linux/${{ matrix.platform }}
+        run: |
+          fail=0
+          trivy image --quiet --platform "$PLATFORM" --scanners vuln,secret --severity HIGH,CRITICAL --ignore-unfixed \
+            --ignorefile .trivyignore --exit-code 1 "$REF" || fail=1
+          "$GRYPE" "registry:$REF" --platform "$PLATFORM" --only-fixed --fail-on high -q || fail=1
+          exit "$fail"
+
+  sboms:
+    name: release SBOMs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: dl
+        name: SBOMs of the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p sboms
+          if gh release download -R "$GITHUB_REPOSITORY" -p '*.spdx.json' -D sboms 2>/dev/null; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no release yet"; echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        if: steps.dl.outputs.found == 'true'
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+      - uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        if: steps.dl.outputs.found == 'true'
+        id: grype
+      - name: trivy sbom + grype sbom (HIGH/CRITICAL with a fix)
+        if: steps.dl.outputs.found == 'true'
+        env:
+          GRYPE: ${{ steps.grype.outputs.cmd }}
+        run: |
+          fail=0
+          for s in sboms/*.spdx.json; do
+            echo "::group::$s"
+            trivy sbom --quiet --severity HIGH,CRITICAL --ignore-unfixed --ignorefile .trivyignore --exit-code 1 "$s" || fail=1
+            "$GRYPE" "sbom:$s" --only-fixed --fail-on high -q || fail=1
+            echo "::endgroup::"
+          done
+          exit "$fail"
+
+  dependencies:
+    name: cargo-deny + cargo-audit (main)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --workspace
+          command-arguments: advisories
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-audit@0.22.2
+      - name: cargo audit
+        run: |
+          ignores=$(python3 -c 'import tomllib; print(" ".join("--ignore " + i["id"] for i in tomllib.load(open("deny.toml","rb"))["advisories"].get("ignore", [])))')
+          # shellcheck disable=SC2086
+          cargo audit --deny warnings $ignores
+
+  report:
+    name: tracking issue
+    needs: [images, sboms, dependencies]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Nightly security scan failed"
+          num=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --label security --search "in:title \"$title\"" \
+            --json number -q '.[0].number')
+          if [ -n "$num" ]; then
+            gh issue comment "$num" -R "$GITHUB_REPOSITORY" --body "Still failing: $RUN_URL"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --label security \
+              --body "The nightly scan found a fixable HIGH/CRITICAL vulnerability or advisory: $RUN_URL. Details are in code scanning. Ship a patch release (or a reviewed .trivyignore / deny.toml exception)."
+          fi

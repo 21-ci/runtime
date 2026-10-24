@@ -1,0 +1,70 @@
+name: Bug report
+description: Something in rt, 21ci, a std:* module or the docs does not work as documented.
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Security bugs do not belong here**: follow [SECURITY.md](https://github.com/21-ci/runtime/security/policy).
+        Remove tokens, master keys and tenant data from anything you paste.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `rt --version` and/or `21ci --version`, or the image tag / commit.
+      placeholder: rt 0.1.0, 21ci 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How do you run it?
+      options:
+        - Docker / compose image (ghcr.io/21-ci/rt)
+        - Homebrew
+        - apt / rpm / apk package
+        - install.sh / release tarball
+        - Built from source
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Deno executor / std:* modules (JS)
+        - WASM executor / std:host WIT
+        - Triggers (HTTP, schedules, queues, WebSockets)
+        - Storage (KV, SQL, blob, durable objects)
+        - Control API / MCP
+        - 21ci CLI
+        - Config / profiles
+        - Packaging / install
+        - Docs
+        - Other
+  - type: input
+    id: os
+    attributes:
+      label: OS and architecture
+      placeholder: Ubuntu 24.04 x86_64, macOS 15 arm64, ...
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest service code, config (`rt --print-config`, secrets removed) and commands that show it.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Node logs (`RT_LOG=debug`), the `x-rt-reason` header of a failed invoke, or the control API error body.
+      render: text

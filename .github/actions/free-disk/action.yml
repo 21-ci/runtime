@@ -1,0 +1,16 @@
+name: Free disk space
+description: >-
+  Remove preinstalled SDKs the build never uses (Android, .NET, GHC, CodeQL bundles, Swift) from a Linux runner.
+  V8 + wasmtime test builds need 25+ GB; a stock ubuntu runner has about 14 GB free.
+runs:
+  using: composite
+  steps:
+    - name: Free disk space
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        df -h /
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+          /usr/share/swift /usr/local/share/powershell /usr/local/share/chromium /opt/hostedtoolcache/CodeQL || true
+        sudo docker image prune --all --force >/dev/null 2>&1 || true
+        df -h /

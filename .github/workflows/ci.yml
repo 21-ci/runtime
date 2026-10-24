@@ -1,0 +1,370 @@
+# CI: formatting, lints, tests split by crate, WASM fixtures, sample smokes, coverage, the docs build and a container
+# smoke test. The final job `CI result` is the single required status check of the `main` ruleset.
+name: CI
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUST_BACKTRACE: short
+  # Debug info triples the size of the V8/wasmtime test builds and CI never needs it.
+  CARGO_PROFILE_DEV_DEBUG: "false"
+  CARGO_PROFILE_TEST_DEBUG: "false"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install --no-self-update
+      - run: cargo fmt --all -- --check
+
+  dco:
+    name: DCO sign-off
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Every commit carries Signed-off-by (CONTRIBUTING.md, DCO)
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          missing=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            author=$(git log -1 --format='%ae' "$c")
+            if ! git log -1 --format='%B' "$c" | grep -qiE "^Signed-off-by: .+ <${author}>\$"; then
+              echo "::error::commit $c has no 'Signed-off-by:' matching its author <$author> (git commit -s)"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: clippy
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  fixtures:
+    name: WASM fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: wasm32-wasip2
+          cache-key: fixtures
+      - run: scripts/build-fixtures.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wasm-fixtures
+          path: fixtures/wasm/out/*.wasm
+          if-no-files-found: error
+          retention-days: 3
+
+  test:
+    name: test (${{ matrix.crate }})
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - rt-types
+          - rt-config
+          - rt-mem
+          - rt-obs
+          - rt-sec
+          - rt-sched
+          - rt-store
+          - rt-cache
+          - rt-host
+          - rt-build
+          - rt-exec-deno
+          - rt-exec-wasm
+          - rt-triggers
+          - rt-api
+          - rt-server
+          - rt-testkit
+          - rt-cli
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: wasm32-wasip2
+          cache-key: test-${{ matrix.crate }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wasm-fixtures
+          path: fixtures/wasm/out
+      - name: cargo test -p ${{ matrix.crate }}
+        env:
+          CRATE: ${{ matrix.crate }}
+        run: cargo test -p "$CRATE" --locked --no-fail-fast
+      # Tests that move tens of MiB (`#[ignore = "disk"]`, named `disk_…`) run here, on the Linux
+      # runner, not on every developer machine.
+      - name: cargo test -p rt-server (ignored disk tests)
+        if: matrix.crate == 'rt-server'
+        run: cargo test -p rt-server --locked --test api -- --ignored disk_
+
+  tools:
+    name: config tooling (python)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: make test-config
+
+  smokes:
+    name: sample smokes
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: wasm32-wasip2
+          cache-key: smokes
+      - name: Build rt and 21ci
+        run: cargo build --locked -p rt-server --bin rt -p rt-cli --bin 21ci
+      - name: Run the sample-app smokes (node, jq and curl are preinstalled)
+        run: sample/apps/run-smokes.sh target/debug/rt
+      - name: Node logs
+        if: failure()
+        run: tail -n 200 sample/apps/.smoke-data/*.log || true
+
+  coverage:
+    name: coverage (≥ 90 % lines per module)
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: wasm32-wasip2
+          cache-key: coverage
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check coverage==7.17.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wasm-fixtures
+          path: fixtures/wasm/out
+      - name: scripts/coverage.sh --fail-under 90 --floor tools=45 --exclusions
+        run: scripts/coverage.sh --fail-under 90 --floor tools=45 --exclusions --prune
+      - name: Coverage table
+        if: always()
+        run: cat target/coverage/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: lcov
+          path: |
+            target/coverage/lcov.info
+            target/coverage/summary.md
+          retention-days: 14
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        if: always() && hashFiles('target/coverage/lcov.info') != ''
+        with:
+          files: target/coverage/lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  docs:
+    name: docs site (mkdocs --strict)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Build the docs site
+        env:
+          NO_MKDOCS_2_WARNING: "1"
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m mkdocs build --strict -d target/site
+
+  image:
+    name: container image (build, scan, smoke)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: image
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-auditable@0.7.7
+      - name: Release build of rt and 21ci (cargo-auditable embeds the dependency list for scanners)
+        run: |
+          cargo auditable build --release --locked -p rt-server --bin rt -p rt-cli --bin 21ci
+          mkdir -p dist/docker/amd64
+          cp target/release/rt target/release/21ci dist/docker/amd64/
+          rustc --edition 2021 -C opt-level=s -C strip=symbols -o dist/docker/amd64/rt-healthcheck packaging/docker/healthcheck.rs
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build rt image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          build-args: BIN_STAGE=prebuilt
+          tags: rt:ci
+          load: true
+          push: false
+      - name: Build 21ci image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.21ci
+          platforms: linux/amd64
+          build-args: BIN_STAGE=prebuilt
+          tags: 21ci:ci
+          load: true
+          push: false
+      - name: Smoke test (read-only root fs, no capabilities, healthy within 60 s)
+        run: |
+          docker run -d --name rt-ci --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
+            -e RT_ROOT_TOKEN="$(openssl rand -hex 32)" -e RT_MASTER_KEY="$(openssl rand -hex 32)" \
+            -p 127.0.0.1:9090:9090 -v rt-ci-data:/data rt:ci
+          for _ in $(seq 60); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' rt-ci)" = healthy ] && break
+            sleep 1
+          done
+          docker inspect -f '{{.State.Health.Status}}' rt-ci | grep -qx healthy
+          curl -fsS http://127.0.0.1:9090/readyz
+          docker run --rm 21ci:ci --version
+      - name: Container logs
+        if: failure()
+        run: docker logs rt-ci || true
+      - name: Trivy (rt image, HIGH/CRITICAL fixable)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.76.1
+          image-ref: rt:ci
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          exit-code: "1"
+      - name: Grype (rt image)
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: rt:ci
+          severity-cutoff: high
+          only-fixed: true
+          fail-build: true
+          output-format: table
+
+  ci-result:
+    name: CI result
+    if: always()
+    needs: [fmt, dco, clippy, fixtures, test, tools, smokes, coverage, docs, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: All required jobs passed (skipped counts as passed only for DCO outside pull requests)
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad=$(echo "$RESULTS" | jq -r '[to_entries[] | select(.value.result != "success" and .value.result != "skipped")] | length')
+          [ "$bad" -eq 0 ]

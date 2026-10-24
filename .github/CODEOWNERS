@@ -1,0 +1,16 @@
+# Code owners review every PR to the paths below (main requires one approving owner review).
+# @21-ci/maintainers is the GitHub team of maintainers (GOVERNANCE.md); create it in the org before enabling the ruleset.
+
+*                         @21-ci/maintainers
+
+# Trust boundaries: security-sensitive code needs a security-aware reviewer.
+/crates/rt-sec/           @21-ci/security
+/crates/rt-host/          @21-ci/security
+/crates/rt-build/         @21-ci/security
+/SECURITY.md              @21-ci/security
+
+# Release and supply chain
+/.github/                 @21-ci/maintainers @21-ci/security
+/packaging/               @21-ci/maintainers @21-ci/security
+/Dockerfile*              @21-ci/maintainers @21-ci/security
+/deny.toml                @21-ci/security

@@ -1,0 +1,132 @@
+# GitHub Pages: the docs site, the installer and the signed apt/rpm/apk repositories, in one deployment.
+#
+# One repository has one Pages site, so every deploy rebuilds all of it: the MkDocs site from docs/, install.sh, and
+# the package repositories from the packages of the last three stable releases (release.yml dispatches this workflow
+# after each release). Layout: https://21-ci.github.io/runtime/{,install.sh,packages/{apt,rpm,apk,gpg.key}}
+#
+# Secrets: PKG_GPG_PRIVATE_KEY, PKG_GPG_PASSPHRASE (apt/rpm metadata), APK_RSA_PRIVATE_KEY (APKINDEX).
+name: Docs and package repositories
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "requirements.txt"
+      - "overrides/**"
+      - "scripts/docs_hooks.py"
+      - "openapi/openapi.json"
+      - "sample/**"          # included by the pages (--8<--)
+      - "config/**"
+      - "wit/**"
+      - "bench/**"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - ".env.example"
+      - "packaging/install.sh"
+      - "packaging/repo/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  PAGES_URL: https://21-ci.github.io/runtime
+  KEEP_RELEASES: "3"
+
+jobs:
+  build:
+    name: build site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Docs (MkDocs, strict)
+        env:
+          NO_MKDOCS_2_WARNING: "1"
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m mkdocs build --strict -d "$PWD/site"
+          cp packaging/install.sh site/install.sh
+      - name: Packages of the last stable releases
+        id: pkgs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p pkgs
+          tags=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases -L "$KEEP_RELEASES" \
+            --json tagName -q '.[].tagName')
+          for t in $tags; do
+            gh release download "$t" -R "$GITHUB_REPOSITORY" -p '*.deb' -p '*.rpm' -p '*.apk' -D pkgs --skip-existing
+          done
+          count=$(find pkgs -type f | wc -l)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "releases: ${tags:-none}; packages: $count"
+      - name: Signing keys
+        if: steps.pkgs.outputs.count != '0'
+        env:
+          PKG_GPG_PRIVATE_KEY: ${{ secrets.PKG_GPG_PRIVATE_KEY }}
+          APK_RSA_PRIVATE_KEY: ${{ secrets.APK_RSA_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/keys"
+          printf '%s\n' "$PKG_GPG_PRIVATE_KEY" | gpg --batch --import
+          printf '%s\n' "$APK_RSA_PRIVATE_KEY" > "$RUNNER_TEMP/keys/21cloud.rsa"
+          chmod 0644 "$RUNNER_TEMP/keys/21cloud.rsa"   # readable by the container's root; the runner is ephemeral
+          fpr=$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr:/ { print $10; exit }')
+          echo "PKG_GPG_KEY_ID=$fpr" >> "$GITHUB_ENV"
+      - name: apt, rpm and apk repositories
+        if: steps.pkgs.outputs.count != '0'
+        env:
+          PKG_GPG_PASSPHRASE: ${{ secrets.PKG_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends apt-utils createrepo-c
+          mkdir -p site/packages
+          packaging/repo/apt.sh pkgs site/packages/apt
+          packaging/repo/rpm.sh pkgs site/packages/rpm "$PAGES_URL/packages/rpm"
+          docker run --rm --network bridge -v "$PWD:/w" -v "$RUNNER_TEMP/keys:/keys:ro" -w /w \
+            -e APK_KEY_FILE=/keys/21cloud.rsa \
+            alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f \
+            sh packaging/repo/apk.sh pkgs site/packages/apk
+          sudo chown -R "$(id -u):$(id -g)" site/packages
+          gpg --batch --armor --export "$PKG_GPG_KEY_ID" > site/packages/gpg.key
+          cp packaging/repo/index.html site/packages/index.html
+          du -sh site site/packages
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
