@@ -1,0 +1,263 @@
+/* 21 Cloud Functions Runtime docs: brand and page components on top of Material. */
+
+:root {
+  --rt-indigo: #4f46e5;
+  --rt-indigo-dark: #3730a3;
+  --rt-cyan: #06b6d4;
+  --rt-grad: linear-gradient(135deg, #0e7490 0%, #4338ca 55%, #6d28d9 100%);
+}
+
+/* ---- Palette (primary: custom / accent: custom) ---------------------------------------- */
+
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: #4338ca;
+  --md-primary-fg-color--light: #6366f1;
+  --md-primary-fg-color--dark: #312e81;
+  --md-accent-fg-color: #0891b2;
+  --md-accent-fg-color--transparent: rgba(8, 145, 178, 0.1);
+  --md-typeset-a-color: #4338ca;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-hue: 235;
+  --md-primary-fg-color: #312e81;
+  --md-primary-fg-color--light: #4f46e5;
+  --md-primary-fg-color--dark: #1e1b4b;
+  --md-accent-fg-color: #22d3ee;
+  --md-accent-fg-color--transparent: rgba(34, 211, 238, 0.1);
+  --md-typeset-a-color: #a5b4fc;
+}
+
+.md-header {
+  background: var(--rt-grad);
+}
+
+.md-tabs {
+  background: linear-gradient(135deg, #155e75 0%, #3730a3 55%, #5b21b6 100%);
+}
+
+[data-md-color-scheme="slate"] .md-header,
+[data-md-color-scheme="slate"] .md-tabs {
+  background: linear-gradient(135deg, #083344 0%, #1e1b4b 60%, #2e1065 100%);
+}
+
+.md-header__title {
+  font-weight: 600;
+}
+
+/* ---- Typography tweaks ------------------------------------------------------------------ */
+
+.md-typeset h1 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.md-typeset h2 {
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.md-typeset table:not([class]) {
+  font-size: 0.72rem;
+}
+
+.md-typeset table:not([class]) th {
+  white-space: nowrap;
+}
+
+.md-typeset table:not([class]) td code {
+  word-break: normal;
+}
+
+/* ---- Home hero -------------------------------------------------------------------------- */
+
+.rt-hero {
+  position: relative;
+  margin: 0 0 2rem;
+  padding: 3rem 2.4rem 2.6rem;
+  border-radius: 1rem;
+  color: #fff;
+  background: var(--rt-grad);
+  overflow: hidden;
+}
+
+.rt-hero::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at 85% 20%, rgba(34, 211, 238, 0.35), transparent 40%),
+    radial-gradient(circle at 10% 90%, rgba(167, 139, 250, 0.35), transparent 45%);
+  pointer-events: none;
+}
+
+.rt-hero > * {
+  position: relative;
+  z-index: 1;
+}
+
+.md-typeset .rt-hero h1 {
+  margin: 0 0 0.6rem;
+  color: #fff;
+  font-size: 2.4rem;
+  line-height: 1.15;
+  max-width: 22em;
+}
+
+.rt-hero .rt-hero__lead {
+  margin: 0 0 1.6rem;
+  font-size: 0.95rem;
+  line-height: 1.6;
+  max-width: 44em;
+  opacity: 0.92;
+}
+
+.md-typeset .rt-hero .md-button {
+  margin: 0 0.5rem 0.5rem 0;
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.7);
+}
+
+.md-typeset .rt-hero .md-button--primary {
+  color: #312e81;
+  background: #fff;
+  border-color: #fff;
+}
+
+.md-typeset .rt-hero .md-button:hover {
+  color: #312e81;
+  background: #e0f2fe;
+  border-color: #e0f2fe;
+}
+
+.rt-hero code {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.15);
+}
+
+@media screen and (max-width: 44.9375em) {
+  .rt-hero {
+    margin: 0 -0.4rem 1.5rem;
+    padding: 2rem 1.2rem;
+  }
+  .md-typeset .rt-hero h1 {
+    font-size: 1.7rem;
+  }
+}
+
+/* ---- Stats row ---------------------------------------------------------------------------- */
+
+.rt-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  gap: 0.8rem;
+  margin: 1.5rem 0;
+}
+
+.rt-stat {
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 0.6rem;
+  background: var(--md-code-bg-color);
+}
+
+.rt-stat strong {
+  display: block;
+  font-size: 1.35rem;
+  line-height: 1.2;
+  color: var(--md-primary-fg-color);
+}
+
+[data-md-color-scheme="slate"] .rt-stat strong {
+  color: var(--md-accent-fg-color);
+}
+
+.rt-stat span {
+  font-size: 0.68rem;
+  color: var(--md-default-fg-color--light);
+}
+
+/* ---- Cards -------------------------------------------------------------------------------- */
+
+.md-typeset .grid.cards > ul > li,
+.md-typeset .grid > .card {
+  border-radius: 0.6rem;
+}
+
+.md-typeset .grid.cards > ul > li:hover {
+  border-color: var(--md-accent-fg-color);
+}
+
+/* ---- Small inline tags (config reference) ------------------------------------------------ */
+
+.rt-tag {
+  display: inline-block;
+  margin: 0.2rem 0.25rem 0 0;
+  padding: 0 0.45em;
+  border-radius: 0.8em;
+  font-size: 0.62rem;
+  line-height: 1.6;
+  white-space: nowrap;
+  color: var(--md-default-fg-color--light);
+  background: var(--md-default-fg-color--lightest);
+}
+
+.rt-tag .twemoji svg {
+  width: 0.8em;
+  height: 0.8em;
+}
+
+/* Status badges usable in prose: <span class="rt-badge rt-badge--planned">planned</span> */
+.rt-badge {
+  display: inline-block;
+  padding: 0 0.5em;
+  border-radius: 0.3em;
+  font-size: 0.65rem;
+  font-weight: 600;
+  line-height: 1.7;
+  vertical-align: middle;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.rt-badge--deno { color: #fff; background: #0f766e; }
+.rt-badge--wasm { color: #fff; background: #6d28d9; }
+.rt-badge--planned { color: #92400e; background: #fef3c7; }
+.rt-badge--operator { color: #fff; background: #334155; }
+
+/* ---- API explorer ------------------------------------------------------------------------- */
+
+.rt-api-explorer {
+  min-height: 70vh;
+  margin: 0 -0.8rem;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 0.6rem;
+  overflow: hidden;
+}
+
+.rt-api-explorer__loading {
+  padding: 2rem;
+  color: var(--md-default-fg-color--light);
+}
+
+/* Give Scalar room: its own sidebar replaces Material's on that page. */
+.rt-wide .md-content__inner {
+  max-width: none;
+}
+
+.md-main:has(#scalar-api) .md-grid {
+  max-width: 90rem;
+}
+
+/* ---- Announcement bar ------------------------------------------------------------------- */
+
+.md-banner a,
+.md-banner a:focus {
+  color: #a5f3fc;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+.md-banner a:hover {
+  color: #fff;
+}
