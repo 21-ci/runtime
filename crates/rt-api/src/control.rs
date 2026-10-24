@@ -3098,6 +3098,8 @@ pub fn api_doc() -> utoipa::openapi::OpenApi {
     doc.merge(crate::topics::Doc::openapi());
     doc.merge(crate::consumers::Doc::openapi());
     doc.merge(crate::invocations::Doc::openapi());
+    // the event modules' operations get the common errors too: the modifier on `ApiDoc` ran before the merge
+    utoipa::Modify::modify(&CommonErrors, &mut doc);
     doc
 }
 
