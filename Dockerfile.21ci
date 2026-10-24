@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1.7
+#
+# 21ci, the command line client of the control API, as a small image for CI pipelines.
+#
+#   docker build -f Dockerfile.21ci -t 21ci:dev .
+#   docker run --rm -e RT_API=https://rt-control.example.com -e RT_KEY=rtk_... -v "$PWD":/work 21ci:dev push . --service hello --wait
+#
+# 21ci has no V8 or wasmtime in its dependency tree, so it builds in a few minutes. Release images copy the
+# prebuilt binary instead (BIN_STAGE=prebuilt, dist/docker/<arch>/21ci).
+
+ARG RUST_IMAGE=rust:1.95-trixie@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3
+ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821cf63ffcec87d3d94265a093ad30da232039af962dd8f4edf
+ARG BIN_STAGE=builder
+
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /src
+ENV CARGO_INCREMENTAL=0 \
+    CARGO_NET_RETRY=5 \
+    CARGO_TERM_COLOR=never
+COPY . .
+RUN rm -f rust-toolchain.toml
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/target-21ci,sharing=locked \
+    CARGO_TARGET_DIR=/src/target-21ci cargo build --release --locked -p rt-cli --bin 21ci \
+ && install -D -m 0755 /src/target-21ci/release/21ci /out/21ci
+
+FROM scratch AS prebuilt
+ARG TARGETARCH
+COPY --chmod=0755 dist/docker/${TARGETARCH}/21ci /out/21ci
+
+FROM ${BIN_STAGE} AS bin
+
+FROM ${RUNTIME_IMAGE} AS runtime
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.title="21ci" \
+      org.opencontainers.image.description="21ci: command line client for the 21 Cloud Functions Runtime control API" \
+      org.opencontainers.image.source="https://github.com/21-ci/runtime" \
+      org.opencontainers.image.documentation="https://21-ci.github.io/runtime/" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.vendor="21 Cloud" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}"
+
+COPY --from=bin /out/21ci /usr/local/bin/21ci
+
+# distroless `nonroot` user (65532); contexts live in $HOME/.config/21ci/config.toml unless RT_* env is used.
+USER 65532:65532
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/21ci"]
+CMD ["--help"]

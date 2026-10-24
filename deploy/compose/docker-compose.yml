@@ -1,0 +1,87 @@
+# Production single node: rt behind Caddy (automatic HTTPS).
+#
+#   cd deploy/compose
+#   cp ../../.env.example .env        # replace both secrets: openssl rand -hex 32; set RT_DOMAIN and ACME_EMAIL
+#   docker compose up -d
+#   docker compose logs -f rt
+#
+# Only Caddy publishes ports to the world (80/443). The control API (8081) and metrics (9090) are published on the
+# host's loopback only: reach them over SSH or a VPN, never expose them (they have no network ACL of their own).
+name: rt-prod
+
+services:
+  rt:
+    image: ${RT_IMAGE:-ghcr.io/21-ci/rt:latest}
+    init: true
+    restart: unless-stopped
+    read_only: true                     # only /data (volume) is written
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    ports:
+      - "127.0.0.1:${RT_CONTROL_PORT:-8081}:8081"   # control API: /v1/..., /docs
+      - "127.0.0.1:${RT_METRICS_PORT:-9090}:9090"   # /metrics /healthz /readyz
+    environment:
+      RT_ROOT_TOKEN: "${RT_ROOT_TOKEN:?set RT_ROOT_TOKEN in .env (openssl rand -hex 32)}"
+      RT_MASTER_KEY: "${RT_MASTER_KEY:?set RT_MASTER_KEY in .env (64 hex chars: openssl rand -hex 32)}"
+      RT_LOG: ${RT_LOG:-info}
+      # Caddy's address on the `edge` network below: its X-Forwarded-For is trusted, nobody else's.
+      RT__INGRESS__TRUSTED_PROXIES: '["172.30.80.0/24"]'
+      # {slug}.<domain> routing; needs a wildcard certificate (Caddy DNS challenge), otherwise leave it empty.
+      RT__ROUTING__BASE_DOMAIN: ${RT_BASE_DOMAIN:-}
+    volumes:
+      - rt-data:/data
+      # Optional node config (keys: ../rt.toml, config/defconfigs/). Listener binds and data_dir come from the image env.
+      # - ./rt.toml:/etc/rt/rt.toml:ro
+    networks:
+      edge:
+        ipv4_address: 172.30.80.10
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    stop_grace_period: 30s
+    # Size the node; sched.processors and memory.budget_mb follow these cgroup limits.
+    # cpus: 4
+    # mem_limit: 2g
+
+  caddy:
+    image: caddy:2.11-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
+    restart: unless-stopped
+    depends_on:
+      rt:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"                    # HTTP/3
+    environment:
+      RT_DOMAIN: ${RT_DOMAIN:?set RT_DOMAIN in .env, e.g. fn.example.com}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      edge:
+        ipv4_address: 172.30.80.2
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 172.30.80.0/24
+
+volumes:
+  rt-data:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,145 @@
+# One rt node on Kubernetes: StatefulSet (1 replica, one PVC), Services, NetworkPolicy.
+#
+#   kubectl create namespace rt
+#   kubectl -n rt create secret generic rt-secrets \
+#     --from-literal=root-token="$(openssl rand -hex 32)" --from-literal=master-key="$(openssl rand -hex 32)"
+#   kubectl -n rt apply -f deploy/kubernetes/rt.yaml
+#
+# rt is a single-node runtime (no clustering in v1): keep replicas at 1. Expose `rt-public` through your Ingress /
+# Gateway (TLS there). `rt-control` stays ClusterIP; reach it with `kubectl port-forward svc/rt-control 8081`.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rt-config
+  labels: { app.kubernetes.io/name: rt }
+data:
+  # Mounted at /etc/rt/rt.toml (the image reads $RT_DATA/rt.toml = /etc/rt/rt.toml). Binds and data_dir come from
+  # the image env. Every key: config/defconfigs/balanced.toml.
+  rt.toml: |
+    [node]
+    default_profile = "balanced"
+
+    [ingress]
+    # The pod CIDR of your ingress controller; only these peers may set X-Forwarded-For.
+    trusted_proxies = ["10.0.0.0/8"]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rt
+  labels: { app.kubernetes.io/name: rt }
+spec:
+  serviceName: rt-control
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: rt }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: rt }
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: rt
+          image: ghcr.io/21-ci/rt:latest     # pin a version (and digest) in production
+          args: ["serve"]
+          ports:
+            - { name: public, containerPort: 8080 }
+            - { name: control, containerPort: 8081 }
+            - { name: metrics, containerPort: 9090 }
+          env:
+            - name: RT_ROOT_TOKEN_FILE
+              value: /run/secrets/rt/root-token
+            - name: RT_MASTER_KEY_FILE
+              value: /run/secrets/rt/master-key
+            - name: RT_LOG
+              value: info
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits: { memory: 2Gi }            # memory.budget_mb follows the cgroup limit (85 %)
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: metrics }
+            periodSeconds: 5
+          startupProbe:
+            httpGet: { path: /healthz, port: metrics }
+            periodSeconds: 2
+            failureThreshold: 30
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: config, mountPath: /etc/rt/rt.toml, subPath: rt.toml, readOnly: true }
+            - { name: secrets, mountPath: /run/secrets/rt, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap: { name: rt-config }
+        - name: secrets
+          secret: { secretName: rt-secrets, defaultMode: 0400 }
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 64Mi }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests: { storage: 20Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rt-public
+  labels: { app.kubernetes.io/name: rt }
+spec:
+  selector: { app.kubernetes.io/name: rt }
+  ports:
+    - { name: http, port: 80, targetPort: public }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rt-control
+  labels: { app.kubernetes.io/name: rt }
+spec:
+  selector: { app.kubernetes.io/name: rt }
+  ports:
+    - { name: control, port: 8081, targetPort: control }
+    - { name: metrics, port: 9090, targetPort: metrics }
+---
+# Ingress to the public port from anywhere in the cluster (your ingress controller); control and metrics only from
+# pods labelled rt-admin=true (operators, Prometheus). Egress is open: guests reach the internet through rt's own
+# SSRF guard; tighten it here if your cluster has internal services.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rt
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: rt }
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - { port: 8080 }
+    - from:
+        - podSelector:
+            matchLabels: { rt-admin: "true" }
+          namespaceSelector: {}
+      ports:
+        - { port: 8081 }
+        - { port: 9090 }

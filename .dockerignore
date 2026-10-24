@@ -1,0 +1,47 @@
+# Docker build context filter. The builder stage needs: Cargo.toml/lock, .cargo/, crates/, js/, wit/,
+# config/ (and openapi/ once it exists). Everything below is build output, VCS state, or local secrets.
+
+# Build output (the image builds in its own cache-mounted target dir)
+target/
+target-*/
+**/target/
+
+# JS tooling output
+**/node_modules/
+sample/**/dist/
+sample/**/target/
+
+# Generated WASM fixtures (built by scripts/build-fixtures.sh, not needed in the image)
+fixtures/wasm/out/
+
+# Release output: only the per-arch binaries the `prebuilt` stage copies (Dockerfile, Dockerfile.21ci)
+dist/*
+!dist/docker/
+
+# Local data, benchmark output, docs site build
+data-*/
+bench/data/
+bench/out/
+site/
+docs/site/
+.venv/
+
+# VCS and editor/OS noise
+.git/
+.gitignore
+.DS_Store
+.idea/
+.vscode/
+.pytest_cache/
+**/__pycache__/
+*.pyc
+
+# Local state and secrets: never ship these into an image layer
+.env
+.env.*
+!.env.example
+data/
+rt.toml
+.config.old
+*.cwasm
+*.log
