@@ -317,6 +317,160 @@ fn limited_body(body: AxBody, limit: u64) -> Body {
     Body::from_stream(stream)
 }
 
+/// `Idempotency-Key` of an async request.
+const IDEMPOTENCY_KEY: &str = "idempotency-key";
+/// Largest body an async request may carry (also bounded by the service's max body).
+const ASYNC_BODY_MAX: u64 = 1024 * 1024;
+
+/// How a request asks to run (docs/api.md "Async invocation").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AsyncMode {
+    /// Run now and answer (no header, or `X-Rt-Invocation-Type: RequestResponse`).
+    Sync,
+    /// `Prefer: respond-async`: async when the service allows it, else sync.
+    Preferred,
+    /// `X-Rt-Invocation-Type: Event`: async or refused.
+    Required,
+}
+
+/// The mode the raw request headers ask for; `Err` = an unknown `X-Rt-Invocation-Type`.
+fn async_mode(h: &HeaderMap) -> Result<AsyncMode, ()> {
+    if let Some(v) = h.get("x-rt-invocation-type") {
+        let v = v.to_str().map_err(|_| ())?.trim();
+        if v.eq_ignore_ascii_case("event") {
+            return Ok(AsyncMode::Required);
+        }
+        if v.eq_ignore_ascii_case("requestresponse") {
+            return Ok(AsyncMode::Sync);
+        }
+        return Err(());
+    }
+    let preferred = h
+        .get_all(header::HeaderName::from_static("prefer"))
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|p| {
+            let token = p.split(';').next().unwrap_or("");
+            let name = token.split('=').next().unwrap_or("").trim();
+            name.eq_ignore_ascii_case("respond-async")
+        });
+    Ok(if preferred {
+        AsyncMode::Preferred
+    } else {
+        AsyncMode::Sync
+    })
+}
+
+/// 1..=255 visible ASCII characters.
+fn valid_idempotency_key(k: &str) -> bool {
+    (1..=255).contains(&k.len()) && k.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// Lowercase hex sha256 of `method \n uri \n body`: what an idempotency key is bound to.
+fn request_hash(method: &str, uri: &str, body: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut h = Sha256::new();
+    h.update(method.as_bytes());
+    h.update(b"\n");
+    h.update(uri.as_bytes());
+    h.update(b"\n");
+    h.update(body);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What the accept branch needs besides the request.
+struct AsyncAccept {
+    tenant: rt_types::TenantId,
+    service: rt_types::ServiceId,
+    max_attempts: u16,
+    max_age: std::time::Duration,
+    idempotency_key: Option<String>,
+    preferred: bool,
+    cap: u64,
+}
+
+/// Persist the request (headers and body sealed) for the async engine and answer `202`.
+/// Method, URI and the JSON `[[name, value]]` headers of an HTTP payload.
+fn stored_request(payload: &rt_types::Payload) -> Option<(String, String, Vec<u8>)> {
+    let rt_types::Payload::Http(r) = payload else {
+        return None;
+    };
+    // The headers are already hygiene-processed; runtime invocation headers are the engine's.
+    let headers: Vec<(&str, String)> = r
+        .headers
+        .iter()
+        .filter(|(n, _)| !n.as_str().starts_with("x-rt-invocation-"))
+        .map(|(n, v)| (n.as_str(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
+        .collect();
+    let json = serde_json::to_vec(&headers).ok()?;
+    Some((r.method.as_str().to_string(), r.uri.to_string(), json))
+}
+
+async fn accept_async(s: &ApiState, a: AsyncAccept, request: (String, String, Vec<u8>), body: AxBody) -> Response {
+    let (method, uri, headers_json) = request;
+    let Ok(bytes) = axum::body::to_bytes(body, usize::try_from(a.cap).unwrap_or(usize::MAX)).await else {
+        return plain_error(413, "too_large");
+    };
+    let id = rt_types::InvocationId::new();
+    let aad = |part| rt_types::events::invocation_aad(a.service, id, part);
+    let new = rt_store::queue::NewInvocation {
+        id,
+        service: a.service,
+        request_hash: request_hash(&method, &uri, &bytes),
+        method,
+        uri,
+        sealed_headers: s.secrets.seal(&aad(b'h'), &headers_json).to_bytes(),
+        sealed_body: s.secrets.seal(&aad(b'b'), &bytes).to_bytes(),
+        body_bytes: bytes.len() as u64,
+        max_age: a.max_age,
+        max_attempts: a.max_attempts,
+        idempotency_key: a.idempotency_key,
+    };
+    let max_pending = s.plans.plan_arc(a.tenant).max_async_pending;
+    let (id, state, replay) = match s.invocations.accept(new, max_pending).await {
+        Ok(rt_store::queue::Accepted::New(id)) => {
+            s.node.notify(crate::state::ControlEvent::AsyncAccepted(a.service));
+            (id, rt_store::queue::InvocationState::Pending, false)
+        }
+        Ok(rt_store::queue::Accepted::Replay { id, state }) => (id, state, true),
+        Err(rt_store::StoreError::Conflict("async_backlog_full")) => {
+            return limited(429, "async_backlog_full", std::time::Duration::from_secs(1))
+        }
+        Err(rt_store::StoreError::Conflict("idempotency_mismatch")) => return plain_error(409, "idempotency_mismatch"),
+        Err(e) => {
+            tracing::warn!(error = %e, "async: accept failed");
+            return plain_error(503, "unavailable");
+        }
+    };
+    accepted_response(id, state.as_str(), a.preferred, replay)
+}
+
+/// `202 {"id","state"}` with `x-rt-invocation-id` (+ `preference-applied`, replay marker).
+fn accepted_response(id: rt_types::InvocationId, state: &str, preferred: bool, replay: bool) -> Response {
+    let body = serde_json::json!({"id": id.to_string(), "state": state}).to_string();
+    let mut resp = Response::new(AxBody::from(body));
+    *resp.status_mut() = StatusCode::ACCEPTED;
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Ok(v) = HeaderValue::from_str(&id.to_string()) {
+        h.insert(HeaderName::from_static("x-rt-invocation-id"), v);
+    }
+    if preferred {
+        h.insert(
+            HeaderName::from_static("preference-applied"),
+            HeaderValue::from_static("respond-async"),
+        );
+    }
+    if replay {
+        h.insert(
+            HeaderName::from_static("x-rt-idempotent-replay"),
+            HeaderValue::from_static("true"),
+        );
+    }
+    resp
+}
+
 /// `Sec-WebSocket-Protocol` values of a request, in order.
 fn ws_protocols(h: &HeaderMap) -> Vec<String> {
     h.get_all(header::SEC_WEBSOCKET_PROTOCOL)
@@ -372,6 +526,9 @@ async fn invoke(State(s): State<ApiState>, Extension(listener): Extension<Listen
     crate::auth::seed_peer(&mut parts, &s);
     let internal = listener == Listener::Internal;
     let upgrade = rt_triggers::is_upgrade_request(&parts.method, &parts.headers);
+    // Read before header hygiene: `x-rt-invocation-type` is a client `x-rt-*` header and goes.
+    let mode = async_mode(&parts.headers);
+    let idempotency_key = parts.headers.get(IDEMPOTENCY_KEY).cloned();
 
     // 1. route
     let host = parts
@@ -500,6 +657,10 @@ async fn invoke(State(s): State<ApiState>, Extension(listener): Extension<Listen
         return quota_response(&e);
     }
 
+    let Ok(mode) = mode else {
+        return plain_error(400, "bad_request");
+    };
+
     // 5. header hygiene
     let mut headers = guest_headers(&parts.headers, internal, strip_authorization, &route.base_path, client);
     keep_guest_authorization(&mut headers, |v| is_key_bearer(v) || is_root_bearer(v, &*s.auth));
@@ -544,14 +705,53 @@ async fn invoke(State(s): State<ApiState>, Extension(listener): Extension<Listen
         return route_stale();
     };
     let limit = spec.limits.max_request_body_bytes;
-    if let Some(len) = parts
+    let content_length = parts
         .headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        if len > limit {
-            return plain_error(413, "too_large");
+        .and_then(|v| v.parse::<u64>().ok());
+    if content_length.is_some_and(|len| len > limit) {
+        return plain_error(413, "too_large");
+    }
+    if mode != AsyncMode::Sync {
+        let svc = s.service_table.load().get(&entry.service).cloned();
+        let allowed = !upgrade
+            && spec.object.is_none()
+            && svc
+                .as_ref()
+                .is_some_and(|v| v.config.async_invoke.enabled() && !v.config.durable);
+        let cap = limit.min(ASYNC_BODY_MAX);
+        let known_over = content_length.is_some_and(|len| len > cap);
+        match (mode, allowed, known_over) {
+            (AsyncMode::Required, false, _) => return plain_error(403, "async_not_allowed"),
+            (AsyncMode::Required, true, true) => return plain_error(413, "too_large"),
+            (_, true, false) => {
+                let Some(svc) = svc else { return route_stale() };
+                let key = match idempotency_key
+                    .as_ref()
+                    .map(|v| v.to_str().ok().filter(|k| valid_idempotency_key(k)))
+                {
+                    None => None,
+                    Some(Some(k)) => Some(k.to_string()),
+                    Some(None) => return plain_error(400, "bad_request"),
+                };
+                let accept = AsyncAccept {
+                    tenant: entry.tenant,
+                    service: entry.service,
+                    max_attempts: svc.config.async_invoke.max_attempts(),
+                    max_age: svc.config.async_invoke.max_event_age(),
+                    idempotency_key: key,
+                    preferred: mode == AsyncMode::Preferred,
+                    cap,
+                };
+                let Some(request) = stored_request(&spec.payload) else {
+                    return route_stale();
+                };
+                drop(spec);
+                return accept_async(&s, accept, request, body).await;
+            }
+            // `Prefer` is only a preference: not possible here, so the request runs now.
+            _ => {}
         }
     }
     if let rt_types::Payload::Http(r) = &mut spec.payload {
@@ -1060,5 +1260,74 @@ mod tests {
             h.get("sec-websocket-protocol").is_none(),
             "still never reaches the guest"
         );
+    }
+
+    /// `Prefer: respond-async` is found in any `Prefer` value and list, any case, with
+    /// parameters; `X-Rt-Invocation-Type` wins and takes only `Event` / `RequestResponse`.
+    #[test]
+    fn ac_async_api_01_async_mode_reads_prefer_and_invocation_type() {
+        let m = |pairs: &[(&str, &str)]| async_mode(&client_headers(pairs));
+        assert_eq!(m(&[]), Ok(AsyncMode::Sync));
+        assert_eq!(m(&[("prefer", "respond-async")]), Ok(AsyncMode::Preferred));
+        assert_eq!(
+            m(&[("prefer", "return=minimal, Respond-Async; wait=5")]),
+            Ok(AsyncMode::Preferred)
+        );
+        assert_eq!(
+            m(&[("prefer", "wait=5"), ("prefer", "RESPOND-ASYNC")]),
+            Ok(AsyncMode::Preferred)
+        );
+        assert_eq!(m(&[("prefer", "respond-asynchronously")]), Ok(AsyncMode::Sync));
+        assert_eq!(m(&[("x-rt-invocation-type", "Event")]), Ok(AsyncMode::Required));
+        assert_eq!(m(&[("x-rt-invocation-type", "event")]), Ok(AsyncMode::Required));
+        assert_eq!(
+            m(&[("x-rt-invocation-type", "RequestResponse"), ("prefer", "respond-async")]),
+            Ok(AsyncMode::Sync)
+        );
+        assert_eq!(m(&[("x-rt-invocation-type", "DryRun")]), Err(()));
+    }
+
+    /// Idempotency keys are 1..=255 visible ASCII characters.
+    #[test]
+    fn ac_async_api_02_idempotency_key_validation() {
+        assert!(valid_idempotency_key("order-42"));
+        assert!(valid_idempotency_key(&"k".repeat(255)));
+        assert!(!valid_idempotency_key(""));
+        assert!(!valid_idempotency_key(&"k".repeat(256)));
+        assert!(!valid_idempotency_key("has space"));
+        assert!(!valid_idempotency_key("tab\there"));
+        assert!(!valid_idempotency_key("caf\u{e9}"));
+    }
+
+    /// The request hash is a stable lowercase sha256 over method, URI and body.
+    #[test]
+    fn ac_async_api_03_request_hash_is_stable() {
+        let a = request_hash("POST", "/hook?x=1", b"{}");
+        assert_eq!(a, request_hash("POST", "/hook?x=1", b"{}"));
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_ne!(a, request_hash("PUT", "/hook?x=1", b"{}"));
+        assert_ne!(a, request_hash("POST", "/hook", b"{}"));
+        assert_ne!(a, request_hash("POST", "/hook?x=1", b"{ }"));
+        // sha256("GET\n/\n")
+        assert_eq!(
+            request_hash("GET", "/", b""),
+            "139fb16fdd19069e75f6f3dd0e619a89fb157dab65e8722c66e6b3fd43f7900c"
+        );
+    }
+
+    /// The `202` names the record and says which preference was applied.
+    #[test]
+    fn ac_async_api_04_accepted_response_headers() {
+        let id = rt_types::InvocationId::new();
+        let r = accepted_response(id, "pending", true, true);
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        let h = r.headers();
+        assert_eq!(get(h, "x-rt-invocation-id"), Some(id.to_string().as_str()));
+        assert_eq!(get(h, "preference-applied"), Some("respond-async"));
+        assert_eq!(get(h, "x-rt-idempotent-replay"), Some("true"));
+        let r = accepted_response(id, "pending", false, false);
+        assert!(r.headers().get("preference-applied").is_none());
+        assert!(r.headers().get("x-rt-idempotent-replay").is_none());
     }
 }
