@@ -530,6 +530,8 @@ fn guest_request(spec: &mut TaskSpec, task: TaskId, deadline_ms: i64) -> http::R
                 .collect();
             json_post("/__rt/queue", serde_json::json!({ "messages": items }))
         }
+        Payload::Pubsub(m) => json_post("/__rt/pubsub", m.guest_json()),
+        Payload::Stream(b) => json_post("/__rt/stream", b.guest_json()),
         // Socket events reach a component through its `socket-handler` export, never this path
         // (an HTTP-only component gets none: the hub only runs events of components that export it).
         Payload::Socket(_) | Payload::None => (
@@ -1874,5 +1876,87 @@ mod guest_request_tests {
     async fn a_request_that_names_its_host_keeps_it() {
         let (parts, _) = synth(Trigger::Http, http_with(&[("host", "api.example.com")])).await;
         assert_eq!(header(&parts, "host"), "api.example.com");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rt_types::events::{PubsubMessage, StreamBatch, StreamRecord};
+    use rt_types::{Digest, MsgId, RuntimeKind, ServiceId, ServiceRef, TaskKind, TenantId, VersionNo};
+
+    fn spec(trigger: Trigger, payload: Payload) -> TaskSpec {
+        let svc = ServiceRef {
+            tenant: TenantId::from_u128(1),
+            service: ServiceId::from_u128(2),
+            version: VersionNo(1),
+            digest: Digest::of(b"x"),
+        };
+        TaskSpec::new(TaskKind::Exec(RuntimeKind::Wasm), svc, trigger).with_payload(payload)
+    }
+
+    fn body_json(req: http::Request<Body>) -> serde_json::Value {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let buf = rt.block_on(req.into_body().collect(u64::MAX)).unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    /// Pub/sub and stream tasks reach a component as JSON `POST`s to `/__rt/pubsub` and
+    /// `/__rt/stream` with `x-rt-trigger` set and the guest JSON as the body.
+    #[test]
+    fn guest_request_maps_pubsub_and_stream_to_synthetic_posts() {
+        let msg = PubsubMessage {
+            id: MsgId::from_u128(3),
+            subject: "a.b".into(),
+            body: bytes::Bytes::from_static(b"\"hi\""),
+            headers: vec![],
+            replyable: false,
+            published_at_ms: 9,
+        };
+        let mut s = spec(
+            Trigger::Pubsub {
+                subject: "a.b".into(),
+                depth: 1,
+                reply: false,
+            },
+            Payload::Pubsub(msg.clone()),
+        );
+        let req = guest_request(&mut s, TaskId(1), 0);
+        assert_eq!((req.method(), req.uri().path()), (&http::Method::POST, "/__rt/pubsub"));
+        assert_eq!(req.headers()["x-rt-trigger"], "pubsub");
+        assert_eq!(req.headers()[http::header::CONTENT_TYPE], "application/json");
+        assert_eq!(body_json(req), msg.guest_json());
+
+        let batch = StreamBatch {
+            topic: "orders".into(),
+            group: "default".into(),
+            partition: 0,
+            attempt: 1,
+            records: vec![StreamRecord {
+                partition: 0,
+                offset: 3,
+                key: None,
+                headers: vec![("h".into(), "v".into())],
+                body: bytes::Bytes::from_static(b"{}"),
+                ts_ms: 1,
+            }],
+        };
+        let mut s = spec(
+            Trigger::Stream {
+                topic: "orders".into(),
+                partition: 0,
+                attempt: 1,
+            },
+            Payload::Stream(batch),
+        );
+        let req = guest_request(&mut s, TaskId(2), 0);
+        assert_eq!((req.method(), req.uri().path()), (&http::Method::POST, "/__rt/stream"));
+        assert_eq!(req.headers()["x-rt-trigger"], "stream");
+        let v = body_json(req);
+        assert_eq!(
+            (v["topic"].clone(), v["messages"][0]["offset"].clone()),
+            (serde_json::json!("orders"), serde_json::json!(3))
+        );
+        assert_eq!(v["messages"][0]["headers"], serde_json::json!({"h": "v"}));
     }
 }
