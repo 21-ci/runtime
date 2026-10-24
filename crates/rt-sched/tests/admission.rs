@@ -14,13 +14,14 @@ use common::*;
 use rt_mem::{MemoryGovernor, Pressure};
 use rt_sched::admission::{
     Admission, AdmissionLimits, AdmissionTicket, AdmitContext, AdmitRequest, Admitted, NodeSignals, SlotClass,
+    QUEUED_TASK_OVERHEAD, TENANT_QUANTUM,
 };
 use rt_sched::trace::TraceEvent;
 use rt_sched::TaskState;
 use rt_testkit::{cpu, ids, io, script, MockEvent, Script, SimRuntime, SimTask, SpecBuilder};
 use rt_types::{
-    BuildFailReason, BuildFailure, DegradationMode, Outcome, RejectReason, ScalingKnobs, ServiceKnobs, TaskId,
-    TaskKind, TaskSpec, Trigger,
+    BuildFailReason, BuildFailure, DegradationMode, MsgId, Outcome, Payload, PubsubMessage, RejectReason, ScalingKnobs,
+    ServiceKnobs, StreamBatch, StreamRecord, TaskId, TaskKind, TaskSpec, Trigger,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -75,10 +76,19 @@ impl Adm {
     }
 
     fn admit_cx(&mut self, spec: &TaskSpec, cx: AdmitContext) -> Result<Admitted<u32>, RejectReason> {
+        self.admit_req(&req(spec), cx)
+    }
+
+    /// Admit at scheduler time `now_ns`.
+    fn admit_at(&mut self, spec: &TaskSpec, now_ns: u64) -> Result<Admitted<u32>, RejectReason> {
+        self.admit_req(&req_at(spec, now_ns), NORMAL)
+    }
+
+    fn admit_req(&mut self, r: &AdmitRequest, cx: AdmitContext) -> Result<Admitted<u32>, RejectReason> {
         self.next += 1;
         let n = self.next;
         let mut ticket = None;
-        let r = self.a.admit(&req(spec), cx, |t| {
+        let r = self.a.admit(r, cx, |t| {
             ticket = Some(t.clone());
             n
         });
@@ -101,6 +111,24 @@ impl Adm {
         t.queued = false;
         self.a.release(&t, 1, None)
     }
+
+    /// Item `n` finishes at `now_ns` after holding its slot for `sample`.
+    fn finish_with(&mut self, n: u32, now_ns: u64, sample: Option<Duration>) -> Vec<u32> {
+        let mut t = self.tickets.remove(&n).expect("a ticket for every admitted item");
+        t.queued = false;
+        self.a.release_with(&t, now_ns, sample, sample)
+    }
+
+    /// Run one task of `spec` on the fast path and feed its estimator `sample`.
+    fn learn(&mut self, spec: &TaskSpec, sample: Duration) {
+        let a = self.admit(spec).unwrap();
+        assert!(a.run.is_some(), "learning needs a free slot");
+        assert!(self.finish_with(self.next, 1, Some(sample)).is_empty());
+    }
+}
+
+fn req_at(spec: &TaskSpec, now_ns: u64) -> AdmitRequest {
+    AdmitRequest::from_spec(spec, None, MIB, now_ns)
 }
 
 /// The item may run now: admitted straight to a slot, or queued and granted at once (it found
@@ -339,19 +367,22 @@ fn a_cancelled_waiter_is_never_granted_and_its_room_is_returned() {
     assert_eq!(a.a.queued(), (0, 0));
 }
 
-/// When slots free, tenants take turns, and the services of a tenant take turns, one task each.
+/// When slots free, tenants take turns; the services of one tenant are served by deadline key,
+/// which for equal predictions is arrival order (rule 3.6.5, changed on purpose from per-service
+/// round robin).
 #[test]
-fn freed_slots_are_shared_round_robin_across_tenants_then_services() {
-    let mut a = Adm::new(AdmissionLimits {
-        max_inflight: 1,
-        max_queued: 100,
-        max_queued_bytes: 1 << 30,
-    });
+fn freed_slots_alternate_tenants_and_serve_a_tenants_services_by_deadline() {
+    let mut a = Adm::new(wide(1));
     assert!(runs(&a.admit(&task(9, 9, knobs(BIG, 0, 0))).unwrap()));
     let mut owner: BTreeMap<u32, (u128, u128)> = BTreeMap::new();
     // tenant 1 floods two services, tenant 2 one service; all wait for the single slot
-    for (tenant, service) in [(1, 11), (1, 11), (1, 11), (1, 12), (1, 12), (2, 21), (2, 21), (2, 21)] {
-        assert!(waits(&a.admit(&task(tenant, service, knobs(BIG, 0, 0))).unwrap()));
+    for (i, (tenant, service)) in [(1, 11), (1, 11), (1, 11), (1, 12), (1, 12), (2, 21), (2, 21), (2, 21)]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(waits(
+            &a.admit_at(&task(tenant, service, knobs(BIG, 0, 0)), i as u64).unwrap()
+        ));
         owner.insert(a.next, (tenant, service));
     }
     let mut running = 1;
@@ -367,11 +398,488 @@ fn freed_slots_are_shared_round_robin_across_tenants_then_services() {
     assert_eq!(tenants[..6], [1, 2, 1, 2, 1, 2], "tenants alternate: {order:?}");
     let t1_services: Vec<u128> = order.iter().filter(|(t, _)| *t == 1).map(|(_, s)| *s).collect();
     assert_eq!(
-        t1_services[..4],
-        [11, 12, 11, 12],
-        "services of a tenant alternate: {order:?}"
+        t1_services,
+        [11, 11, 11, 12, 12],
+        "a tenant's services in arrival order: {order:?}"
     );
     assert_eq!((a.a.running(), a.a.queued()), (0, (0, 0)));
+}
+
+const fn nms(n: u64) -> u64 {
+    n * 1_000_000
+}
+
+fn wide(max_inflight: u32) -> AdmissionLimits {
+    AdmissionLimits {
+        max_inflight,
+        max_queued: 100,
+        max_queued_bytes: 1 << 30,
+    }
+}
+
+/// Runs a blocker of tenant 9 on the only slot; returns its item.
+fn block(a: &mut Adm) -> u32 {
+    assert!(runs(&a.admit(&task(9, 9, knobs(BIG, 0, 0))).unwrap()));
+    a.next
+}
+
+/// Admit at `now_ns`, assert it waits; returns the item.
+fn wait_at(a: &mut Adm, spec: &TaskSpec, now_ns: u64) -> u32 {
+    assert!(waits(&a.admit_at(spec, now_ns).unwrap()));
+    a.next
+}
+
+/// Fair-002: with one slot, a tenant's service predicted at 5 ms goes before its service predicted
+/// at 2 s that arrived earlier.
+#[test]
+fn fair_002_a_tenants_short_service_goes_before_its_long_one() {
+    let mut a = Adm::new(wide(1));
+    let short = task(1, 11, knobs(BIG, 0, 0));
+    let long = task(1, 12, knobs(BIG, 0, 0));
+    a.learn(&long, Duration::from_secs(2));
+    a.learn(&short, Duration::from_millis(5));
+    let b = block(&mut a);
+    let l = wait_at(&mut a, &long, nms(0));
+    let s = wait_at(&mut a, &short, nms(1));
+    assert_eq!(a.finish(b), vec![s], "the short job first");
+    assert_eq!(a.finish(s), vec![l]);
+    assert!(a.finish(l).is_empty());
+}
+
+/// Fair-003: a long job (p = 20 s, k = 4, Q = 5 s) gets `Q/2` of delay credit: a short arrival at
+/// +2.4 s goes before it, one at +2.6 s after it.
+#[test]
+fn fair_003_a_long_job_is_overtaken_only_by_arrivals_within_half_the_queue_timeout() {
+    let mut a = Adm::new(wide(1));
+    let short = task(1, 11, knobs(BIG, 0, 0));
+    let long = task(1, 12, knobs(BIG, 0, 0));
+    assert_eq!(short.knobs.queue_timeout, Duration::from_secs(5));
+    a.learn(&long, Duration::from_secs(20));
+    a.learn(&short, Duration::from_millis(5));
+    let b = block(&mut a);
+    let l = wait_at(&mut a, &long, 0);
+    let s1 = wait_at(&mut a, &short, nms(2400));
+    let s2 = wait_at(&mut a, &short, nms(2600));
+    assert_eq!(a.tickets[&l].wait.unwrap().0, nms(2500), "key = arrival + Q/2");
+    assert_eq!(a.finish_with(b, nms(2410), None), vec![s1]);
+    assert_eq!(a.a.aged_grants(), 0, "the short one is granted before its key");
+    assert_eq!(a.finish_with(s1, nms(3000), None), vec![l]);
+    assert_eq!(a.a.aged_grants(), 1, "the long one waited past its key");
+    assert_eq!(a.finish_with(l, nms(3000), None), vec![s2]);
+    assert!(a.finish(s2).is_empty());
+}
+
+/// Fair-004: `aging_factor = 0` serves a tenant in arrival order whatever the predictions.
+#[test]
+fn fair_004_aging_zero_serves_a_tenant_in_arrival_order() {
+    let mut a = Adm::new(wide(1));
+    a.a = Admission::new(wide(1)).with_aging(0);
+    let short = task(1, 11, knobs(BIG, 0, 0));
+    let long = task(1, 12, knobs(BIG, 0, 0));
+    a.learn(&long, Duration::from_secs(2));
+    a.learn(&short, Duration::from_millis(5));
+    let b = block(&mut a);
+    let l = wait_at(&mut a, &long, nms(0));
+    let s = wait_at(&mut a, &short, nms(1));
+    assert_eq!(a.finish(b), vec![l], "arrival order");
+    assert_eq!(a.finish(l), vec![s]);
+}
+
+/// Fair-005: two always-backlogged tenants, one with 5 ms tasks and one with 500 ms tasks, get
+/// equal slot time (within `TENANT_QUANTUM + p_max`), not equal task counts.
+#[test]
+fn fair_005_tenants_share_slot_time_not_task_count() {
+    let mut a = Adm::new(wide(1));
+    let specs = [task(1, 11, knobs(BIG, 0, 0)), task(2, 21, knobs(BIG, 0, 0))];
+    let cost = [Duration::from_millis(5), Duration::from_millis(500)];
+    a.learn(&specs[0], cost[0]);
+    a.learn(&specs[1], cost[1]);
+    let mut running = block(&mut a);
+    let mut owner: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut now = nms(10);
+    for _ in 0..2 {
+        for (t, spec) in specs.iter().enumerate() {
+            owner.insert(wait_at(&mut a, spec, now), t);
+        }
+    }
+    let mut sample = cost[0];
+    let mut slot = [Duration::ZERO; 2];
+    let mut count = [0u32; 2];
+    for _ in 0..1000 {
+        let g = a.finish_with(running, now, Some(sample));
+        assert_eq!(g.len(), 1);
+        running = g[0];
+        let t = owner[&running];
+        sample = cost[t];
+        slot[t] += sample;
+        count[t] += 1;
+        now += dns(sample);
+        owner.insert(wait_at(&mut a, &specs[t], now), t);
+        let diff = slot[0].abs_diff(slot[1]);
+        assert!(
+            diff <= TENANT_QUANTUM + cost[1],
+            "slot time {slot:?} after {count:?} grants"
+        );
+    }
+    assert!(
+        count[0] > 50 * count[1],
+        "the short tenant runs many more tasks: {count:?}"
+    );
+}
+
+fn dns(d: Duration) -> u64 {
+    d.as_nanos() as u64
+}
+
+/// Fair-006: a tenant that was idle while another ran comes back at most `TENANT_QUANTUM` behind:
+/// it gets at most `quantum / p + 1` grants before the busy tenant's next one.
+#[test]
+fn fair_006_an_idle_tenant_comes_back_at_most_one_quantum_behind() {
+    let mut a = Adm::new(wide(1));
+    let p = Duration::from_millis(5);
+    let (fa, fb) = (task(1, 11, knobs(BIG, 0, 0)), task(2, 21, knobs(BIG, 0, 0)));
+    a.learn(&fa, p);
+    a.learn(&fb, p);
+    let mut running = block(&mut a);
+    let mut owner: BTreeMap<u32, u128> = BTreeMap::new();
+    let mut now = nms(1);
+    for _ in 0..3 {
+        owner.insert(wait_at(&mut a, &fa, now), 1);
+    }
+    for _ in 0..100 {
+        let g = a.finish_with(running, now, Some(p));
+        running = g[0];
+        assert_eq!(owner[&running], 1, "only tenant 1 waits");
+        now += dns(p);
+        owner.insert(wait_at(&mut a, &fa, now), 1);
+    }
+    for _ in 0..20 {
+        owner.insert(wait_at(&mut a, &fb, now), 2);
+    }
+    let mut run_b = 0u64;
+    loop {
+        let g = a.finish_with(running, now, Some(p));
+        running = g[0];
+        now += dns(p);
+        if owner[&running] == 1 {
+            break;
+        }
+        run_b += 1;
+    }
+    let bound = dns(TENANT_QUANTUM) / dns(p) + 1;
+    assert!(
+        (1..=bound).contains(&run_b),
+        "{run_b} grants of the returning tenant, bound {bound}"
+    );
+}
+
+/// Fair-007: a tenant's waiting calls go before its waiting requests, FIFO among themselves.
+#[test]
+fn fair_007_calls_go_before_items_of_their_tenant_in_fifo_order() {
+    let mut a = Adm::new(wide(1));
+    assert!(runs(&a.admit(&task(1, 10, knobs(BIG, 0, 0))).unwrap()));
+    let b = a.next;
+    let item = wait_at(&mut a, &task(1, 11, knobs(BIG, 0, 0)), nms(1));
+    let c1 = wait_at(&mut a, &call(1, 12, knobs(BIG, 0, 0)), nms(2));
+    let c2 = wait_at(&mut a, &call(1, 13, knobs(BIG, 0, 0)), nms(3));
+    assert_eq!(a.tickets[&c1].class, SlotClass::Call);
+    assert_eq!(a.finish(b), vec![c1]);
+    assert_eq!(a.finish(c1), vec![c2]);
+    assert_eq!(a.finish(c2), vec![item]);
+}
+
+/// Fair-008: a task predicted at 5 ms that held its slot for 500 ms is charged 500 ms: the other
+/// tenant then gets about 100 grants of 5 ms before the mispredicted tenant's next one.
+#[test]
+fn fair_008_a_mispredicted_task_is_charged_its_actual_time() {
+    let mut a = Adm::new(wide(1));
+    let p = Duration::from_millis(5);
+    let (fa, fb) = (task(1, 11, knobs(BIG, 0, 0)), task(2, 21, knobs(BIG, 0, 0)));
+    a.learn(&fa, p);
+    a.learn(&fb, p);
+    let b = block(&mut a);
+    let mut owner: BTreeMap<u32, u128> = BTreeMap::new();
+    for _ in 0..3 {
+        owner.insert(wait_at(&mut a, &fa, nms(1)), 1);
+        owner.insert(wait_at(&mut a, &fb, nms(1)), 2);
+    }
+    let g = a.finish_with(b, nms(2), Some(p));
+    assert_eq!(owner[&g[0]], 1, "tenant 1 listed first");
+    let mut running = a.finish_with(g[0], nms(502), Some(Duration::from_millis(500)))[0];
+    let mut now = nms(502);
+    let mut run_b = 0;
+    while owner[&running] == 2 {
+        run_b += 1;
+        owner.insert(wait_at(&mut a, &fb, now), 2);
+        now += dns(p);
+        running = a.finish_with(running, now, Some(p))[0];
+    }
+    assert!((95..=101).contains(&run_b), "{run_b} grants of the other tenant");
+}
+
+/// Fair-009: tenants with equal work alternate one grant each.
+#[test]
+fn fair_009_equal_tenants_alternate() {
+    let mut a = Adm::new(wide(1));
+    let mut running = block(&mut a);
+    let mut owner: BTreeMap<u32, u128> = BTreeMap::new();
+    for i in 0..4 {
+        owner.insert(wait_at(&mut a, &task(1, 11, knobs(BIG, 0, 0)), i), 1);
+        owner.insert(wait_at(&mut a, &task(2, 21, knobs(BIG, 0, 0)), i), 2);
+    }
+    let mut order = Vec::new();
+    for _ in 0..8 {
+        running = a.finish(running)[0];
+        order.push(owner[&running]);
+    }
+    assert_eq!(order, [1, 2, 1, 2, 1, 2, 1, 2]);
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+    /// Fair-010: within one tenant, items are granted in deadline-key order: no item is
+    /// overtaken by one with a later key, and each key is `wait_key(arrival, pred, 4, Q)`.
+    #[test]
+    fn fair_010_prop_no_item_is_overtaken_by_a_later_deadline(
+        preds in proptest::collection::vec(1u64..3_000, 3),
+        arrivals in proptest::collection::vec((0usize..3, 0u64..2_000), 1..40),
+    ) {
+        let mut a = Adm::new(wide(1));
+        let specs: Vec<TaskSpec> = (0..3).map(|i| task(1, 11 + i as u128, knobs(BIG, 0, 0))).collect();
+        for (s, p) in specs.iter().zip(&preds) {
+            a.learn(s, Duration::from_millis(*p));
+        }
+        let mut running = block(&mut a);
+        let mut now = 0;
+        let mut keys = BTreeMap::new();
+        for (svc, gap) in &arrivals {
+            now += nms(*gap);
+            let n = wait_at(&mut a, &specs[*svc], now);
+            let want = rt_sched::admission::wait_key(now, nms(preds[*svc]), 4, Duration::from_secs(5));
+            let t = &a.tickets[&n];
+            proptest::prop_assert_eq!(t.wait.unwrap().0, want);
+            keys.insert(n, t.wait.unwrap());
+        }
+        let mut last = (0, 0);
+        for _ in 0..arrivals.len() {
+            running = a.finish(running)[0];
+            proptest::prop_assert!(keys[&running] >= last, "granted out of key order");
+            last = keys[&running];
+        }
+        proptest::prop_assert!(a.finish(running).is_empty());
+    }
+}
+
+fn scaling(a: &Adm, service: u128) -> rt_sched::ServiceScaling {
+    a.a.service_scaling(ids::service(service), 0).expect("state")
+}
+
+/// Pred-001: the estimate is the first sample, then moves 1/8 towards each new one; a new
+/// version of the service starts without an estimate.
+#[test]
+fn pred_001_the_estimate_follows_slot_hold_time_and_resets_on_a_new_version() {
+    let mut a = Adm::new(wide(4));
+    let s = task(1, 11, knobs(BIG, 0, 0));
+    a.learn(&s, Duration::from_millis(10));
+    assert_eq!(scaling(&a, 11).pred, [Some(Duration::from_millis(10)), None]);
+    a.learn(&s, Duration::from_millis(18));
+    assert_eq!(scaling(&a, 11).pred[0], Some(Duration::from_millis(11)));
+    let mut r = s.service;
+    r.version = rt_types::VersionNo(r.version.0 + 1);
+    let v2 = SpecBuilder::deno().service_ref(r).knobs(knobs(BIG, 0, 0)).finish();
+    let x = a.admit(&v2).unwrap();
+    assert!(x.run.is_some());
+    assert_eq!(scaling(&a, 11).pred, [None, None], "a new version resets");
+    // Builds and samples-less releases never move it.
+    a.finish_with(a.next, 1, None);
+    let b = a.admit(&build_of(1, 11)).unwrap();
+    assert!(b.run.is_some());
+    a.finish_with(a.next, 1, Some(Duration::from_secs(1)));
+    assert_eq!(scaling(&a, 11).pred, [None, None]);
+}
+
+/// Pred-002: a wall kill feeds the wall limit as the sample; a queued task's prediction is never
+/// above its wall limit.
+#[test]
+fn pred_002_a_wall_kill_feeds_the_wall_limit() {
+    let mut a = Adm::new(wide(1));
+    let s = SpecBuilder::deno()
+        .tenant(1)
+        .service(11)
+        .knobs(knobs(BIG, 0, 0))
+        .wall_limit(100)
+        .finish();
+    a.learn(&s, Duration::from_millis(100));
+    assert_eq!(scaling(&a, 11).pred[0], Some(Duration::from_millis(100)));
+    a.learn(&s, Duration::from_secs(10));
+    assert!(scaling(&a, 11).pred[0].unwrap() > Duration::from_secs(1));
+    let _b = block(&mut a);
+    let n = wait_at(&mut a, &s, 0);
+    assert_eq!(a.tickets[&n].pred_ns, nms(100), "bounded by the wall limit");
+}
+
+/// Cancel-001: a timed-out waiter leaves the ordered queue (head or not, by its key or found by
+/// search), and the next head moves up.
+#[test]
+fn cancel_001_a_timed_out_waiter_leaves_the_ordered_queue_and_the_next_head_moves_up() {
+    let mut a = Adm::new(wide(1));
+    let b = block(&mut a);
+    let s = task(1, 11, knobs(BIG, 0, 0));
+    let x1 = wait_at(&mut a, &s, 0);
+    let x2 = wait_at(&mut a, &s, 1);
+    let x3 = wait_at(&mut a, &s, 2);
+    let x4 = wait_at(&mut a, &s, 3);
+    let c = wait_at(&mut a, &call(1, 12, knobs(BIG, 0, 0)), 4);
+    assert_eq!(a.a.waiting(ids::service(11)), 4);
+    assert!(a.a.cancel(&a.tickets[&x1].clone(), true, |n| *n == x1), "the head");
+    assert!(a.a.cancel(&a.tickets[&x3].clone(), false, |n| *n == x3), "not the head");
+    let mut keyless = a.tickets[&x4].clone();
+    keyless.wait = None;
+    assert!(a.a.cancel(&keyless, false, |n| *n == x4), "found without its key");
+    assert!(!a.a.cancel(&keyless, false, |n| *n == x4), "only once");
+    let mut keyless_call = a.tickets[&c].clone();
+    keyless_call.wait = None;
+    assert!(
+        a.a.cancel(&keyless_call, false, |n| *n == c),
+        "a call found without its key"
+    );
+    assert!(!a.a.cancel(&a.tickets[&c].clone(), false, |n| *n == c));
+    assert_eq!(a.a.queued().0, 1);
+    assert_eq!(a.a.waiting(ids::service(11)), 1);
+    assert_eq!(a.finish(b), vec![x2]);
+    assert_eq!(a.a.queued(), (0, 0));
+    assert_eq!(a.a.waiting(ids::service(77)), 0, "no state");
+}
+
+/// Fair-011: interactive and background work of one service keep separate estimates.
+#[test]
+fn fair_011_lanes_keep_separate_estimates() {
+    let mut a = Adm::new(wide(1));
+    let http = task(1, 11, knobs(BIG, 0, 0));
+    let queue = SpecBuilder::deno()
+        .tenant(1)
+        .service(11)
+        .knobs(knobs(BIG, 0, 0))
+        .trigger(Trigger::Queue {
+            batch: Vec::new(),
+            attempt: 1,
+        })
+        .finish();
+    assert_eq!(req(&queue).lane, 1);
+    a.learn(&http, Duration::from_millis(5));
+    a.learn(&queue, Duration::from_secs(2));
+    assert_eq!(
+        scaling(&a, 11).pred,
+        [Some(Duration::from_millis(5)), Some(Duration::from_secs(2))]
+    );
+    let _b = block(&mut a);
+    let h = wait_at(&mut a, &http, 0);
+    let q = wait_at(&mut a, &queue, 0);
+    assert_eq!(a.tickets[&h].pred_ns, nms(5));
+    assert_eq!(a.tickets[&q].pred_ns, nms(2000));
+}
+
+/// A pub/sub request (`reply`) is a call: its requester holds a slot.
+#[test]
+fn adm_pubsub_reply_takes_the_call_class() {
+    let t = |reply| Trigger::Pubsub {
+        subject: "a.b".into(),
+        depth: 1,
+        reply,
+    };
+    assert_eq!(SlotClass::of(TaskKind::DENO, &t(true)), SlotClass::Call);
+    assert_eq!(SlotClass::of(TaskKind::DENO, &t(false)), SlotClass::Throttled);
+}
+
+/// Pub/sub and stream payload bytes count toward the queue byte bounds.
+#[test]
+fn adm_stream_and_pubsub_payload_bytes_count_toward_max_queued_mb() {
+    let msg = |len: usize| {
+        SpecBuilder::deno()
+            .tenant(1)
+            .service(11)
+            .knobs(knobs(BIG, 0, 0))
+            .trigger(Trigger::Pubsub {
+                subject: "a".into(),
+                depth: 1,
+                reply: false,
+            })
+            .payload(Payload::Pubsub(PubsubMessage {
+                id: MsgId::new(),
+                subject: "a".into(),
+                body: vec![0u8; len].into(),
+                headers: Vec::new(),
+                replyable: false,
+                published_at_ms: 0,
+            }))
+            .finish()
+    };
+    let rec = |len: usize| StreamRecord {
+        partition: 0,
+        offset: 0,
+        key: None,
+        headers: Vec::new(),
+        body: vec![0u8; len].into(),
+        ts_ms: 0,
+    };
+    let batch = |lens: &[usize]| {
+        SpecBuilder::deno()
+            .tenant(1)
+            .service(12)
+            .knobs(knobs(BIG, 0, 0))
+            .trigger(Trigger::Stream {
+                topic: "t".into(),
+                partition: 0,
+                attempt: 1,
+            })
+            .payload(Payload::Stream(StreamBatch {
+                topic: "t".into(),
+                group: "g".into(),
+                partition: 0,
+                attempt: 1,
+                records: lens.iter().map(|l| rec(*l)).collect(),
+            }))
+            .finish()
+    };
+    assert_eq!(req(&msg(1000)).bytes, QUEUED_TASK_OVERHEAD + 1000);
+    assert_eq!(req(&batch(&[100, 200])).bytes, QUEUED_TASK_OVERHEAD + 300);
+    let mut a = Adm::new(AdmissionLimits {
+        max_inflight: 1,
+        max_queued: 100,
+        max_queued_bytes: 64 * 1024,
+    });
+    let _b = block(&mut a);
+    assert_eq!(a.admit(&msg(40 * 1024)).unwrap_err(), RejectReason::Overloaded);
+    assert_eq!(
+        a.admit(&batch(&[20 * 1024, 20 * 1024])).unwrap_err(),
+        RejectReason::Overloaded
+    );
+    assert!(waits(&a.admit(&msg(1024)).unwrap()));
+    assert_eq!(a.a.queued().1, QUEUED_TASK_OVERHEAD + 1024);
+}
+
+/// A sample on a task that was granted from the wait queue when nothing else waits corrects the
+/// tenant without the waitlist (no dispatch), and a correction can lower the charge.
+#[test]
+fn a_correction_with_nothing_waiting_and_a_shorter_actual_time() {
+    let mut a = Adm::new(wide(1));
+    let fa = task(1, 11, knobs(BIG, 0, 0));
+    let fb = task(2, 21, knobs(BIG, 0, 0));
+    a.learn(&fa, Duration::from_millis(500));
+    a.learn(&fb, Duration::from_millis(5));
+    let b = block(&mut a);
+    let x = wait_at(&mut a, &fa, 0);
+    let y = wait_at(&mut a, &fb, 0);
+    assert_eq!(a.finish(b), vec![x], "tenant 1 listed first");
+    // charged 500 ms, took 1 ms (corrected under the waitlist: y waits)
+    assert_eq!(a.finish_with(x, 1, Some(Duration::from_millis(1))), vec![y]);
+    // charged 5 ms, took 6 ms (corrected with nothing waiting)
+    assert!(a.finish_with(y, 2, Some(Duration::from_millis(6))).is_empty());
+    let b = block(&mut a);
+    let y2 = wait_at(&mut a, &fb, nms(1));
+    let z = wait_at(&mut a, &fa, nms(1));
+    assert_eq!(a.finish(b), vec![z], "tenant 1 was charged only its actual time");
+    assert_eq!(a.finish(z), vec![y2]);
 }
 
 /// Calls are held by the service ceiling and the tenant's call allowance (= the plan cap), not by

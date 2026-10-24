@@ -27,19 +27,34 @@
 //! artifact already hold slots. Only requests carry the tenant's plan cap (refreshed on each);
 //! a build's default knobs or a call never change it.
 //!
-//! **Fairness.** Within a service, FIFO (calls first). When slots free, waiting services are served
-//! round robin within their tenant, and tenants round robin among themselves, one task per turn,
-//! so a tenant with many busy services gets no more than a tenant with one. A tenant held by its
-//! cap stays out of the ring until one of its tasks finishes, except for its waiting calls.
+//! **Fairness.** Waiting work is ordered, not just queued:
+//!
+//! 1. Within a tenant, calls go first (FIFO among themselves); builds never wait.
+//! 2. Between tenants, the backlogged tenant with the least *virtual slot time* goes first; ties
+//!    go to the one listed first, so equal tenants alternate. A tenant is charged its task's
+//!    predicted run time when the task is granted, corrected to the actual time when it finishes.
+//!    A tenant that was idle comes back at most [`TENANT_QUANTUM`] behind the others.
+//! 3. Within a tenant, across all its services, the earliest *deadline key* goes first:
+//!    `arrival + min(aging_factor × predicted, queue_timeout / 2)`. A task predicted short gets an
+//!    early key; a task predicted long gets at most half its queue timeout of delay credit, so it
+//!    can only be overtaken by work that arrived within that window. `aging_factor = 0` is pure
+//!    arrival order.
+//! 4. A service at its own limit, or a tenant at its plan cap, is skipped until one of its tasks
+//!    finishes (a capped tenant's waiting calls are still served); a global refusal stops the round.
+//!
+//! The prediction is an EWMA (gain 1/8) of the service version's slot hold time, kept in two
+//! lanes: interactive work (HTTP, calls, pub/sub) and background work (queue, stream, schedules),
+//! so slow batch consumers do not inflate the estimate of the service's requests. Before any
+//! sample it is [`DEFAULT_PRED`]; it is bounded by [`PRED_MIN`] and the task's wall limit.
 //!
 //! **Concurrency design.** Per-service and per-tenant state lives in sharded maps (64 shards,
 //! read-locked on the hot path) of atomics; a task that finds its slots free takes them with three
-//! compare-and-swaps and no global lock. The wait queues and the round-robin rings sit behind one
+//! compare-and-swaps and no global lock. The wait queues and the ordered sets sit behind one
 //! mutex that is only taken when something waits (slow path, releases while tasks wait). Lost
 //! wakeups are excluded Dekker-style: a waiter bumps `queued` and then tries the slots under the
 //! lock; a releaser frees its slots and then reads `queued` (all `SeqCst`).
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +62,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use rt_mem::Pressure;
+use rt_types::events::admission_lane;
 use rt_types::{
     DegradationMode, Payload, PreparedKey, RejectReason, ScalingKnobs, ServiceId, ServiceKnobs, ServiceRef, TaskKind,
     TaskSpec, TenantId, Trigger, MAX_CALL_DEPTH,
@@ -62,6 +78,49 @@ pub const QUEUED_TASK_OVERHEAD: u64 = 4 * 1024;
 /// A service's admission state (learned limit, latency baseline) is forgotten after it has been
 /// idle for its idle TTL, but never sooner than this.
 pub const SLOT_MIN_TTL: Duration = Duration::from_secs(60);
+/// Predicted slot time of a service lane without samples.
+pub const DEFAULT_PRED: Duration = Duration::from_millis(50);
+/// Smallest prediction (and sample) used.
+pub const PRED_MIN: Duration = Duration::from_millis(1);
+/// Largest sample fed to the estimator.
+pub const PRED_SAMPLE_MAX: Duration = Duration::from_secs(3600);
+/// The most virtual slot time an idle tenant can bank: it is listed again at most this far behind
+/// the virtual time of the latest grant.
+pub const TENANT_QUANTUM: Duration = Duration::from_millis(20);
+/// Default `sched.aging_factor`.
+pub const DEFAULT_AGING: u32 = 4;
+/// Estimator lanes: 0 interactive, 1 background ([`admission_lane`]).
+pub const LANES: usize = 2;
+
+const fn ns(d: Duration) -> u64 {
+    d.as_nanos() as u64
+}
+
+fn dur_ns(d: Duration) -> u64 {
+    d.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+/// Next EWMA value (gain 1/8): the first sample (`prev == 0`) is taken as is. Never 0.
+pub fn ewma_next(prev_ns: u64, sample_ns: u64) -> u64 {
+    if prev_ns == 0 {
+        return sample_ns.max(1);
+    }
+    let next = i128::from(prev_ns) + (i128::from(sample_ns) - i128::from(prev_ns)) / 8;
+    (next.max(1)).min(i128::from(u64::MAX)) as u64
+}
+
+/// The prediction for one task: the lane's EWMA (or [`DEFAULT_PRED`] without samples), bounded
+/// by [`PRED_MIN`] and the task's wall limit.
+pub fn predicted_ns(ewma_ns: u64, wall: Duration) -> u64 {
+    let v = if ewma_ns == 0 { ns(DEFAULT_PRED) } else { ewma_ns };
+    v.clamp(ns(PRED_MIN), dur_ns(wall).max(ns(PRED_MIN)))
+}
+
+/// Deadline key of a waiting request: `since + min(aging × pred, queue_timeout / 2)` (saturating).
+pub fn wait_key(since_ns: u64, pred_ns: u64, aging: u32, queue_timeout: Duration) -> u64 {
+    let credit = pred_ns.saturating_mul(u64::from(aging)).min(dur_ns(queue_timeout) / 2);
+    since_ns.saturating_add(credit)
+}
 
 /// How a task is held against the limits (see the module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +134,7 @@ impl SlotClass {
     pub fn of(kind: TaskKind, trigger: &Trigger) -> Self {
         match (kind, trigger) {
             (TaskKind::Build, _) | (_, Trigger::Build { .. }) => SlotClass::Build,
-            (_, Trigger::Call { .. }) => SlotClass::Call,
+            (_, Trigger::Call { .. }) | (_, Trigger::Pubsub { reply: true, .. }) => SlotClass::Call,
             _ => SlotClass::Throttled,
         }
     }
@@ -137,6 +196,10 @@ pub struct AdmitRequest {
     pub instance_bytes: u64,
     /// Scheduler clock, nanoseconds since start.
     pub now_ns: u64,
+    /// The task's wall limit (bounds its prediction).
+    pub wall: Duration,
+    /// Estimator lane ([`admission_lane`]).
+    pub lane: u8,
 }
 
 impl AdmitRequest {
@@ -145,6 +208,8 @@ impl AdmitRequest {
         let body = match &spec.payload {
             Payload::Http(r) => r.body.exact_len().unwrap_or(0),
             Payload::Queue(msgs) => msgs.iter().map(|m| m.body.len() as u64).sum(),
+            Payload::Pubsub(m) => m.body.len() as u64,
+            Payload::Stream(b) => b.records.iter().map(|r| r.body.len() as u64).sum(),
             _ => 0,
         };
         Self {
@@ -157,6 +222,8 @@ impl AdmitRequest {
             bytes: QUEUED_TASK_OVERHEAD.saturating_add(body),
             instance_bytes,
             now_ns,
+            wall: spec.limits.wall,
+            lane: admission_lane(&spec.trigger),
         }
     }
 }
@@ -175,6 +242,13 @@ pub struct AdmissionTicket {
     pub granted_ns: u64,
     /// Call depth of a [`SlotClass::Call`] (its tenant allowance is per depth); 0 otherwise.
     pub call_depth: u8,
+    /// Deadline key and sequence in the wait queue: `Some` once it queued (kept after the grant:
+    /// the tenant was charged `pred_ns` then, corrected at release).
+    pub wait: Option<(u64, u64)>,
+    /// Predicted slot time charged at the grant (0 on the fast path).
+    pub pred_ns: u64,
+    /// Estimator lane.
+    pub lane: u8,
     pub(crate) slot: Arc<SvcSlot>,
 }
 
@@ -236,6 +310,8 @@ pub struct ServiceScaling {
     pub rps: f64,
     /// The latest move of the limit and why (`None`: it never moved).
     pub last_change: Option<LimitChange>,
+    /// Predicted slot time per lane (0 interactive, 1 background); `None` before samples.
+    pub pred: [Option<Duration>; LANES],
 }
 
 /// One move of a service's limit: from → to, the signal that caused it and how long ago.
@@ -369,6 +445,8 @@ pub(crate) struct TenantSlot {
     queued_bytes: AtomicU64,
     /// Plan cap (0 = unlimited), refreshed by every request; never taken from a call or build.
     cap: AtomicU32,
+    /// Virtual slot time (ns of predicted, then actual, slot time granted from the wait queue).
+    vtime: AtomicU64,
 }
 
 impl TenantSlot {
@@ -380,6 +458,7 @@ impl TenantSlot {
             queued: AtomicU32::new(0),
             queued_bytes: AtomicU64::new(0),
             cap: AtomicU32::new(0),
+            vtime: AtomicU64::new(0),
         }
     }
 }
@@ -400,6 +479,8 @@ pub(crate) struct SvcSlot {
     win: Window,
     last_active_ns: AtomicU64,
     scale: Mutex<SlotScale>,
+    /// Slot-time EWMA per lane (ns, 0 = no sample), reset on a new version.
+    pred_ns: [AtomicU64; LANES],
 }
 
 impl SvcSlot {
@@ -428,6 +509,7 @@ impl SvcSlot {
                 last_ns: Some(req.now_ns),
                 ..SlotScale::default()
             }),
+            pred_ns: [AtomicU64::new(0), AtomicU64::new(0)],
         }
     }
 
@@ -447,9 +529,17 @@ impl SvcSlot {
         }
         let mut next = SvcMeta::of(req);
         next.tenant_cap = self.tenant.cap.load(Ordering::Relaxed);
-        if **self.meta.load() == next {
+        let cur = self.meta.load();
+        if **cur == next {
             return;
         }
+        if cur.service.version != next.service.version {
+            // A new version: what the old one took says nothing about it.
+            for p in &self.pred_ns {
+                p.store(0, SeqCst);
+            }
+        }
+        drop(cur);
         let (min, max) = next.bounds();
         let before = self
             .limit
@@ -492,6 +582,10 @@ impl SvcSlot {
                 to: c.to,
                 cause: c.cause,
                 ago: Duration::from_nanos(now_ns.saturating_sub(c.at_ns)),
+            }),
+            pred: std::array::from_fn(|i| match self.pred_ns[i].load(SeqCst) {
+                0 => None,
+                v => Some(Duration::from_nanos(v)),
             }),
         }
     }
@@ -570,6 +664,11 @@ enum Take {
     Global,
 }
 
+/// Position of a waiting item in its service queue: `(deadline key, seq)`.
+type ItemKey = (u64, u64);
+/// A service's head in its tenant's ready set: `(0 = call, 1 = request, key, seq)`.
+type HeadKey = (u8, u64, u64);
+
 /// A waiting item.
 #[derive(Debug)]
 struct Waiting<T> {
@@ -578,16 +677,19 @@ struct Waiting<T> {
     class: SlotClass,
     depth: u8,
     since_ns: u64,
+    key: u64,
+    pred_ns: u64,
 }
 
 #[derive(Debug)]
 struct SvcQ<T> {
     slot: Arc<SvcSlot>,
-    /// Waiting calls: served before `items` (a call's parent already holds a slot).
-    calls: VecDeque<Waiting<T>>,
-    items: VecDeque<Waiting<T>>,
-    /// Listed in its tenant's `ready` ring.
-    ready: bool,
+    /// Waiting calls: served before `items` (a call's parent already holds a slot), FIFO.
+    calls: BTreeMap<ItemKey, Waiting<T>>,
+    /// Waiting requests by deadline key.
+    items: BTreeMap<ItemKey, Waiting<T>>,
+    /// Listed in its tenant's `ready` set under this head.
+    ready: Option<HeadKey>,
 }
 
 impl<T> SvcQ<T> {
@@ -595,60 +697,138 @@ impl<T> SvcQ<T> {
         self.calls.is_empty() && self.items.is_empty()
     }
 
-    fn head_class(&self) -> Option<SlotClass> {
-        self.head().map(|(c, _)| c)
+    fn head_key(&self) -> Option<HeadKey> {
+        if let Some((&(k, s), _)) = self.calls.first_key_value() {
+            return Some((0, k, s));
+        }
+        self.items.first_key_value().map(|(&(k, s), _)| (1, k, s))
     }
 
     fn head(&self) -> Option<(SlotClass, u8)> {
-        self.calls.front().or(self.items.front()).map(|x| (x.class, x.depth))
+        self.calls
+            .first_key_value()
+            .or(self.items.first_key_value())
+            .map(|(_, x)| (x.class, x.depth))
     }
 
     fn pop_head(&mut self) -> Option<Waiting<T>> {
-        self.calls.pop_front().or_else(|| self.items.pop_front())
+        self.calls
+            .pop_first()
+            .or_else(|| self.items.pop_first())
+            .map(|(_, x)| x)
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TenantQ {
-    /// Services whose head may be dispatchable, round robin.
-    ready: VecDeque<ServiceId>,
-    /// Listed in the tenant ring.
-    ringed: bool,
+    slot: Arc<TenantSlot>,
+    /// Services whose head may be dispatchable, by head key.
+    ready: BTreeSet<(HeadKey, ServiceId)>,
+    /// Listed in `order` under `(vtime, seq)`.
+    listed: Option<(u64, u64)>,
 }
 
 /// Everything that waits, behind one mutex (the slow path).
 #[derive(Debug)]
 struct Waitlist<T> {
-    /// Tenants with a dispatchable service, round robin.
-    ring: VecDeque<TenantId>,
+    /// Tenants with a dispatchable service, by virtual time (then listing order).
+    order: BTreeSet<(u64, u64, TenantId)>,
     tenants: BTreeMap<TenantId, TenantQ>,
     services: BTreeMap<ServiceId, SvcQ<T>>,
+    /// Monotonic: item and listing sequence numbers (deterministic ties).
+    seq: u64,
+    /// The largest virtual time a grant was made at.
+    vmin: u64,
 }
 
 impl<T> Waitlist<T> {
-    /// List `sid` as dispatchable (its queue is non-empty and a slot of it may be free).
-    fn mark_ready(&mut self, sid: ServiceId) {
-        let Some(sq) = self.services.get_mut(&sid) else { return };
-        if sq.ready || sq.is_empty() {
-            return;
-        }
-        sq.ready = true;
-        let tid = sq.slot.tenant.tenant;
-        let tq = self.tenants.entry(tid).or_default();
-        tq.ready.push_back(sid);
-        if !tq.ringed {
-            tq.ringed = true;
-            self.ring.push_back(tid);
+    fn new() -> Self {
+        Self {
+            order: BTreeSet::new(),
+            tenants: BTreeMap::new(),
+            services: BTreeMap::new(),
+            seq: 0,
+            vmin: 0,
         }
     }
 
-    /// Put `tid` back in the ring (a slot of it freed).
-    fn ring_tenant(&mut self, tid: TenantId) {
-        if let Some(tq) = self.tenants.get_mut(&tid) {
-            if !tq.ringed && !tq.ready.is_empty() {
-                tq.ringed = true;
-                self.ring.push_back(tid);
+    fn next_seq(&mut self) -> u64 {
+        self.seq += 1;
+        self.seq
+    }
+
+    /// List `sid` as dispatchable (its queue is non-empty and a slot of it may be free), or move
+    /// it to its current head key when it is listed.
+    fn mark_ready(&mut self, sid: ServiceId) {
+        let Some(sq) = self.services.get_mut(&sid) else { return };
+        let Some(head) = sq.head_key() else { return };
+        if sq.ready == Some(head) {
+            return;
+        }
+        let old = sq.ready.replace(head);
+        let tslot = sq.slot.tenant.clone();
+        let tq = self.tenants.entry(tslot.tenant).or_insert_with(|| TenantQ {
+            slot: tslot,
+            ready: BTreeSet::new(),
+            listed: None,
+        });
+        if let Some(o) = old {
+            tq.ready.remove(&(o, sid));
+        }
+        tq.ready.insert((head, sid));
+    }
+
+    /// After the head of `sid` changed: move its listing (when listed), or drop the service when
+    /// its queue is empty.
+    fn rehead(&mut self, sid: ServiceId) {
+        let Some(sq) = self.services.get_mut(&sid) else { return };
+        let (tid, old) = (sq.slot.tenant.tenant, sq.ready);
+        if sq.is_empty() {
+            self.services.remove(&sid);
+            if let (Some(o), Some(tq)) = (old, self.tenants.get_mut(&tid)) {
+                tq.ready.remove(&(o, sid));
             }
+            return;
+        }
+        if old.is_some() {
+            self.mark_ready(sid);
+        }
+    }
+
+    /// Put `tid` in `order` (a slot of it freed, or it has new work): at its virtual time, but
+    /// at most [`TENANT_QUANTUM`] behind the latest grant.
+    fn ring_tenant(&mut self, tid: TenantId) {
+        let floor = self.vmin.saturating_sub(ns(TENANT_QUANTUM));
+        let seq = self.seq + 1;
+        let Some(tq) = self.tenants.get_mut(&tid) else { return };
+        if tq.listed.is_some() || tq.ready.is_empty() {
+            return;
+        }
+        let vt = tq.slot.vtime.fetch_max(floor, SeqCst).max(floor);
+        tq.listed = Some((vt, seq));
+        self.seq = seq;
+        self.order.insert((vt, seq, tid));
+    }
+
+    fn unlist_tenant(&mut self, tid: TenantId) {
+        if let Some((vt, seq)) = self.tenants.get_mut(&tid).and_then(|tq| tq.listed.take()) {
+            self.order.remove(&(vt, seq, tid));
+        }
+    }
+
+    /// Re-key a listed tenant at its current virtual time (after a charge or a correction).
+    fn rekey_tenant(&mut self, tid: TenantId) {
+        if self.tenants.get(&tid).is_some_and(|tq| tq.listed.is_some()) {
+            self.unlist_tenant(tid);
+            self.ring_tenant(tid);
+        }
+    }
+
+    /// Drop a tenant with nothing ready from `order` and the map.
+    fn drop_if_idle(&mut self, tid: TenantId) {
+        if self.tenants.get(&tid).is_some_and(|tq| tq.ready.is_empty()) {
+            self.unlist_tenant(tid);
+            self.tenants.remove(&tid);
         }
     }
 
@@ -661,12 +841,6 @@ impl<T> Waitlist<T> {
         let tids: Vec<TenantId> = self.tenants.keys().copied().collect();
         for tid in tids {
             self.ring_tenant(tid);
-        }
-    }
-
-    fn unlist(&mut self, sid: ServiceId, tid: TenantId) {
-        if let Some(tq) = self.tenants.get_mut(&tid) {
-            tq.ready.retain(|s| *s != sid);
         }
     }
 }
@@ -714,6 +888,10 @@ pub struct Admission<T> {
     services: Box<[ServiceShard]>,
     tenants: Box<[TenantShard]>,
     wait: Mutex<Waitlist<T>>,
+    /// `sched.aging_factor`: `k` of the deadline key.
+    aging: u32,
+    /// Requests granted at or past their deadline key.
+    aged_grants: AtomicU64,
 }
 
 impl<T> std::fmt::Debug for Admission<T> {
@@ -742,12 +920,29 @@ impl<T> Admission<T> {
             ringed: AtomicU32::new(0),
             services: (0..SHARDS).map(|_| RwLock::new(BTreeMap::new())).collect(),
             tenants: (0..SHARDS).map(|_| RwLock::new(BTreeMap::new())).collect(),
-            wait: Mutex::new(Waitlist {
-                ring: VecDeque::new(),
-                tenants: BTreeMap::new(),
-                services: BTreeMap::new(),
-            }),
+            wait: Mutex::new(Waitlist::new()),
+            aging: DEFAULT_AGING,
+            aged_grants: AtomicU64::new(0),
         }
+    }
+
+    /// Set `k` of the deadline key (`sched.aging_factor`; 0 = arrival order within a tenant).
+    pub fn with_aging(mut self, k: u32) -> Self {
+        self.aging = k;
+        self
+    }
+
+    /// Requests granted at or past their deadline key (a counter; the metric takes deltas).
+    pub fn aged_grants(&self) -> u64 {
+        self.aged_grants.load(Ordering::Relaxed)
+    }
+
+    /// Tasks of `service` waiting for a run slot (0 without admission state).
+    pub fn waiting(&self, service: ServiceId) -> u32 {
+        self.services[shard_of(u128::from(service.ulid()))]
+            .read()
+            .get(&service)
+            .map_or(0, |s| s.queued.load(SeqCst))
     }
 
     // -----------------------------------------------------------------------------------------
@@ -938,7 +1133,8 @@ impl<T> Admission<T> {
             .clone()
     }
 
-    fn ticket(slot: &Arc<SvcSlot>, req: &AdmitRequest, queued: bool) -> AdmissionTicket {
+    fn ticket(slot: &Arc<SvcSlot>, req: &AdmitRequest, wait: Option<(ItemKey, u64)>) -> AdmissionTicket {
+        let queued = wait.is_some();
         AdmissionTicket {
             tenant: slot.tenant.tenant,
             service: slot.service,
@@ -950,6 +1146,9 @@ impl<T> Admission<T> {
             } else {
                 0
             },
+            wait: wait.map(|(k, _)| k),
+            pred_ns: wait.map_or(0, |(_, p)| p),
+            lane: req.lane,
             slot: slot.clone(),
         }
     }
@@ -973,7 +1172,7 @@ impl<T> Admission<T> {
             if counted {
                 slot.win.arrivals.fetch_add(1, Ordering::Relaxed);
             }
-            let ticket = Self::ticket(slot, req, false);
+            let ticket = Self::ticket(slot, req, None);
             let item = make(&ticket);
             return Ok(Admitted {
                 ticket,
@@ -1015,7 +1214,15 @@ impl<T> Admission<T> {
         if counted {
             slot.win.arrivals.fetch_add(1, Ordering::Relaxed);
         }
-        let ticket = Self::ticket(slot, req, true);
+        let lane = usize::from(req.lane).min(LANES - 1);
+        let pred = predicted_ns(slot.pred_ns[lane].load(SeqCst), req.wall);
+        let key = if req.class == SlotClass::Throttled {
+            wait_key(req.now_ns, pred, self.aging, req.knobs.queue_timeout)
+        } else {
+            req.now_ns
+        };
+        let seq = w.next_seq();
+        let ticket = Self::ticket(slot, req, Some(((key, seq), pred)));
         let item = make(&ticket);
         self.queued.fetch_add(1, SeqCst);
         self.queued_bytes.fetch_add(req.bytes, SeqCst);
@@ -1026,9 +1233,9 @@ impl<T> Admission<T> {
         raise(&slot.win.peak_queued, q);
         let sq = w.services.entry(slot.service).or_insert_with(|| SvcQ {
             slot: slot.clone(),
-            calls: VecDeque::new(),
-            items: VecDeque::new(),
-            ready: false,
+            calls: BTreeMap::new(),
+            items: BTreeMap::new(),
+            ready: None,
         });
         let waiting = Waiting {
             item,
@@ -1036,11 +1243,13 @@ impl<T> Admission<T> {
             class: req.class,
             depth: req.call_depth,
             since_ns: req.now_ns,
+            key,
+            pred_ns: pred,
         };
         if req.class == SlotClass::Throttled {
-            sq.items.push_back(waiting);
+            sq.items.insert((key, seq), waiting);
         } else {
-            sq.calls.push_back(waiting);
+            sq.calls.insert((key, seq), waiting);
         }
         w.mark_ready(slot.service);
         // The service may already be listed while its tenant is out of the ring (capped): a call
@@ -1121,100 +1330,69 @@ impl<T> Admission<T> {
         Take::Ok
     }
 
-    /// Grant slots to waiting items, round robin over tenants and their services.
+    /// Grant slots to waiting items: tenants by virtual time, a tenant's services by head key.
     fn dispatch(&self, w: &mut Waitlist<T>, now_ns: u64, out: &mut Vec<T>) {
-        while let Some(&tid) = w.ring.front() {
-            let sid = match w.tenants.get_mut(&tid) {
-                None => {
-                    w.ring.pop_front();
-                    continue;
-                }
-                Some(tq) => match tq.ready.front() {
-                    Some(&sid) => sid,
-                    None => {
-                        w.ring.pop_front();
-                        w.tenants.remove(&tid);
-                        continue;
-                    }
-                },
+        while let Some(&(vt, _, tid)) = w.order.first() {
+            let Some(tq) = w.tenants.get(&tid) else {
+                w.order.pop_first();
+                continue;
+            };
+            let Some(&(hk, sid)) = tq.ready.first() else {
+                w.drop_if_idle(tid);
+                continue;
             };
             let Some(sq) = w.services.get_mut(&sid) else {
                 if let Some(tq) = w.tenants.get_mut(&tid) {
-                    tq.ready.pop_front();
+                    tq.ready.remove(&(hk, sid));
                 }
                 continue;
             };
             let Some((class, depth)) = sq.head() else {
+                // LCOV_EXCL_START: an empty queue is removed with its last item
                 w.services.remove(&sid);
                 if let Some(tq) = w.tenants.get_mut(&tid) {
-                    tq.ready.pop_front();
+                    tq.ready.remove(&(hk, sid));
                 }
                 continue;
+                // LCOV_EXCL_STOP
             };
             match self.try_take(&sq.slot, class, depth) {
                 Take::Ok => {
                     let x = sq.pop_head().expect("the head was just seen");
-                    self.unqueue(&sq.slot, x.bytes);
-                    sq.slot.win.waited.fetch_add(1, SeqCst);
-                    sq.slot.win.wait_ns.fetch_add(now_ns.saturating_sub(x.since_ns), SeqCst);
-                    let more = !sq.is_empty();
-                    if !more {
-                        w.services.remove(&sid);
+                    let slot = sq.slot.clone();
+                    self.unqueue(&slot, x.bytes);
+                    slot.win.waited.fetch_add(1, SeqCst);
+                    slot.win.wait_ns.fetch_add(now_ns.saturating_sub(x.since_ns), SeqCst);
+                    if x.class == SlotClass::Throttled && now_ns >= x.key {
+                        self.aged_grants.fetch_add(1, Ordering::Relaxed);
                     }
-                    w.ring.pop_front();
-                    if let Some(tq) = w.tenants.get_mut(&tid) {
-                        tq.ready.pop_front();
-                        if more {
-                            tq.ready.push_back(sid);
-                        }
-                        if tq.ready.is_empty() {
-                            w.tenants.remove(&tid);
-                        } else {
-                            w.ring.push_back(tid);
-                        }
-                    }
+                    w.vmin = w.vmin.max(vt);
+                    let _ = slot
+                        .tenant
+                        .vtime
+                        .fetch_update(SeqCst, SeqCst, |v| Some(v.saturating_add(x.pred_ns)));
+                    w.rehead(sid);
+                    w.rekey_tenant(tid);
+                    w.drop_if_idle(tid);
                     out.push(x.item);
                 }
                 Take::Service => {
                     // Waits for one of its own tasks to finish (or the autoscaler to grow it).
-                    sq.ready = false;
+                    sq.ready = None;
                     if let Some(tq) = w.tenants.get_mut(&tid) {
-                        tq.ready.pop_front();
+                        tq.ready.remove(&(hk, sid));
                     }
+                    w.drop_if_idle(tid);
                 }
                 Take::Tenant => {
-                    // A request held by the tenant cap must not hide a call of the same tenant
-                    // queued at another service (calls have their own allowance): try those
-                    // first, else the tenant waits for one of its tasks to finish.
-                    let alt = (class == SlotClass::Throttled)
-                        .then(|| {
-                            let tq = w.tenants.get(&tid)?;
-                            tq.ready.iter().skip(1).position(|s| {
-                                w.services
-                                    .get(s)
-                                    .and_then(SvcQ::head_class)
-                                    .is_some_and(|c| c != SlotClass::Throttled)
-                            })
-                        })
-                        .flatten();
-                    match (alt, w.tenants.get_mut(&tid)) {
-                        (Some(i), Some(tq)) => {
-                            if let Some(s) = tq.ready.remove(i + 1) {
-                                tq.ready.push_front(s);
-                            }
-                        }
-                        (_, tq) => {
-                            w.ring.pop_front();
-                            if let Some(tq) = tq {
-                                tq.ringed = false;
-                            }
-                        }
-                    }
+                    // Calls rank first in the ready set, so a request held by the tenant cap hides
+                    // no call of the tenant: it waits for one of its tasks to finish.
+                    w.unlist_tenant(tid);
                 }
                 Take::Global => break,
             }
         }
-        self.ringed.store(w.ring.len() as u32, SeqCst);
+        self.ringed.store(w.order.len() as u32, SeqCst);
     }
 
     fn unqueue(&self, slot: &SvcSlot, bytes: u64) {
@@ -1231,8 +1409,22 @@ impl<T> Admission<T> {
     // -----------------------------------------------------------------------------------------
 
     /// Give back a running ticket's slots (completion, kill). `latency` (grant → finish, without
-    /// artifact waits) feeds the autoscaler. Returns waiting items granted the freed slots.
+    /// artifact waits) feeds the autoscaler and the estimator. Returns waiting items granted the
+    /// freed slots.
     pub fn release(&self, ticket: &AdmissionTicket, now_ns: u64, latency: Option<Duration>) -> Vec<T> {
+        self.release_with(ticket, now_ns, latency, latency)
+    }
+
+    /// [`Admission::release`] with a separate estimator `sample` (the slot hold time; `None`: the
+    /// task tells nothing about its run time). A sample moves the lane's EWMA and, for a task
+    /// granted from the wait queue, corrects its tenant's charge from the prediction to it.
+    pub fn release_with(
+        &self,
+        ticket: &AdmissionTicket,
+        now_ns: u64,
+        latency: Option<Duration>,
+        sample: Option<Duration>,
+    ) -> Vec<T> {
         if ticket.queued {
             debug_assert!(false, "a queued ticket is cancelled, not released");
             return Vec::new();
@@ -1253,11 +1445,31 @@ impl<T> Admission<T> {
                 .latency_ns
                 .fetch_add(l.as_nanos().min(u128::from(u64::MAX / 4)) as u64, SeqCst);
         }
+        let mut corrected = false;
+        if let Some(sample) = sample.filter(|_| ticket.class != SlotClass::Build) {
+            let s = dur_ns(sample.clamp(PRED_MIN, PRED_SAMPLE_MAX));
+            let lane = usize::from(ticket.lane).min(LANES - 1);
+            let _ = slot.pred_ns[lane].fetch_update(SeqCst, SeqCst, |p| Some(ewma_next(p, s)));
+            if ticket.wait.is_some() && s != ticket.pred_ns {
+                let p = ticket.pred_ns;
+                let _ = slot.tenant.vtime.fetch_update(SeqCst, SeqCst, |v| {
+                    Some(if s > p {
+                        v.saturating_add(s - p)
+                    } else {
+                        v.saturating_sub(p - s)
+                    })
+                });
+                corrected = true;
+            }
+        }
         let mut out = Vec::new();
         if self.queued.load(SeqCst) == 0 {
             return out;
         }
         let mut w = self.wait.lock();
+        if corrected {
+            w.rekey_tenant(slot.tenant.tenant);
+        }
         w.mark_ready(slot.service);
         w.ring_tenant(slot.tenant.tenant);
         self.dispatch(&mut w, now_ns, &mut out);
@@ -1271,24 +1483,42 @@ impl<T> Admission<T> {
         let Some(sq) = w.services.get_mut(&ticket.service) else {
             return false;
         };
-        let x = if let Some(pos) = sq.items.iter().position(|x| is(&x.item)) {
-            sq.items.remove(pos)
-        } else if let Some(pos) = sq.calls.iter().position(|x| is(&x.item)) {
-            sq.calls.remove(pos)
+        let by_key = ticket.wait.filter(|k| {
+            let q = if ticket.class == SlotClass::Throttled {
+                &sq.items
+            } else {
+                &sq.calls
+            };
+            q.get(k).is_some_and(|x| is(&x.item))
+        });
+        let x = if let Some(k) = by_key {
+            let q = if ticket.class == SlotClass::Throttled {
+                &mut sq.items
+            } else {
+                &mut sq.calls
+            };
+            q.remove(&k)
         } else {
-            None
+            // A ticket without its key (not taken from this queue): look for the item.
+            let found = |q: &BTreeMap<ItemKey, Waiting<T>>| q.iter().find(|(_, x)| is(&x.item)).map(|(k, _)| *k);
+            if let Some(k) = found(&sq.items) {
+                sq.items.remove(&k)
+            } else if let Some(k) = found(&sq.calls) {
+                sq.calls.remove(&k)
+            } else {
+                None
+            }
         };
         let Some(x) = x else { return false };
         let slot = sq.slot.clone();
-        let empty = sq.is_empty();
         self.unqueue(&slot, x.bytes);
         if timed_out {
             slot.win.timeouts.fetch_add(1, SeqCst);
         }
-        if empty {
-            w.services.remove(&ticket.service);
-            w.unlist(ticket.service, slot.tenant.tenant);
-        }
+        let tid = slot.tenant.tenant;
+        w.rehead(ticket.service);
+        w.drop_if_idle(tid);
+        self.ringed.store(w.order.len() as u32, SeqCst);
         true
     }
 
@@ -1460,5 +1690,48 @@ mod edge_tests {
         let b = AtomicU32::new(2);
         dec(&b);
         assert_eq!(b.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn ewma_next_starts_at_the_first_sample_and_moves_an_eighth() {
+        assert_eq!(ewma_next(0, 800), 800);
+        assert_eq!(ewma_next(0, 0), 1, "never 0 (0 means no sample)");
+        assert_eq!(ewma_next(800, 1600), 900);
+        assert_eq!(ewma_next(800, 0), 700);
+        assert_eq!(ewma_next(1, 0), 1);
+        assert_eq!(ewma_next(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn predicted_is_the_prior_without_samples_and_bounded_by_one_ms_and_the_wall() {
+        let wall = Duration::from_secs(30);
+        assert_eq!(predicted_ns(0, wall), ns(DEFAULT_PRED));
+        assert_eq!(predicted_ns(10, wall), ns(PRED_MIN));
+        assert_eq!(predicted_ns(ns(Duration::from_secs(60)), wall), ns(wall));
+        assert_eq!(predicted_ns(0, Duration::from_millis(10)), 10_000_000);
+        assert_eq!(
+            predicted_ns(0, Duration::ZERO),
+            ns(PRED_MIN),
+            "a zero wall still allows PRED_MIN"
+        );
+        assert_eq!(predicted_ns(7_000_000, wall), 7_000_000);
+    }
+
+    #[test]
+    fn wait_key_adds_k_times_pred_capped_at_half_the_queue_timeout() {
+        let q = Duration::from_secs(5);
+        assert_eq!(wait_key(100, 10, 4, q), 140);
+        assert_eq!(wait_key(100, ns(Duration::from_secs(20)), 4, q), 100 + ns(q) / 2);
+    }
+
+    #[test]
+    fn wait_key_with_aging_zero_is_arrival() {
+        assert_eq!(wait_key(123, 1_000_000, 0, Duration::from_secs(5)), 123);
+    }
+
+    #[test]
+    fn wait_key_saturates() {
+        assert_eq!(wait_key(u64::MAX - 1, u64::MAX, 64, Duration::MAX), u64::MAX);
+        assert_eq!(dur_ns(Duration::MAX), u64::MAX);
     }
 }
