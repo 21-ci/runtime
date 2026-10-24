@@ -9,16 +9,21 @@ use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
 use rt_config::Config;
 use rt_host::{CallError, Request as CallRequest, TaskCtx};
-use rt_sec::{KeyLookup, PlanSource, WallClock};
+use rt_sec::{KeyLookup, PlanSource, Sealed, SecretsBackend, WallClock};
+use rt_store::queue::LeasedInvocation;
 use rt_store::{DelayedItem, Leased};
+use rt_triggers::async_engine::{AsyncTaskFactory, SEALED_UNREADABLE};
+use rt_triggers::pubsub::{PubsubTaskFactory, SubRow};
+use rt_triggers::stream_engine::{ConsumerDecl, StreamTaskFactory};
 use rt_triggers::{
     CallTaskFactory, DelayedTaskFactory, QueueTaskFactory, RouteTable, ScheduleTaskFactory, SocketLimits,
     SocketTaskFactory,
 };
+use rt_types::events::invocation_aad;
 use rt_types::{
-    ApiKey, DelayedEvent, HttpRequest, KeyId, ObjectRef, Payload, Plan, QueueMessage, RouteEntry, Schedule,
-    ScheduleKind, ScheduledEvent, Service, ServiceId, ServiceRef, SocketEvent, SocketEventKind, TaskKind, TaskSpec,
-    Tenant, TenantId, TraceCtx, Trigger, TriggerKind, UnixMs,
+    ApiKey, DelayedEvent, HttpRequest, KeyId, Namespace, ObjectRef, Payload, Plan, PubsubMessage, QueueMessage,
+    RouteEntry, Schedule, ScheduleKind, ScheduledEvent, Service, ServiceId, ServiceRef, SocketEvent, SocketEventKind,
+    StreamBatch, TaskKind, TaskSpec, Tenant, TenantId, TraceCtx, Trigger, TriggerKind, UnixMs,
 };
 
 /// Resolves a tenant's plan: config plan by name plus the tenant's overrides.
@@ -544,6 +549,188 @@ impl CallTaskFactory for Specs {
 
     fn is_durable(&self, service: ServiceId) -> bool {
         self.services.load().get(&service).is_some_and(|s| s.config.durable)
+    }
+}
+
+impl Specs {
+    /// Changes with the route table and with every swap of the service table.
+    fn events_generation(&self) -> u64 {
+        self.routes.generation() ^ (Arc::as_ptr(&*self.services.load()) as usize as u64)
+    }
+
+    /// Routable services whose plan allows `kind`, with their route.
+    fn event_services(&self, kind: TriggerKind) -> Vec<(Arc<RouteEntry>, Arc<Service>)> {
+        let ids: Vec<ServiceId> = self.services.load().keys().copied().collect();
+        ids.into_iter()
+            .filter_map(|id| self.lookup(id))
+            .filter(|(e, _)| self.plans.plan_arc(e.tenant).allows_trigger(kind))
+            .collect()
+    }
+
+    fn namespace_of(entry: &RouteEntry) -> Namespace {
+        Namespace {
+            tenant: entry.tenant,
+            project: entry.project,
+            environment: entry.environment.clone(),
+        }
+    }
+}
+
+impl PubsubTaskFactory for Specs {
+    fn generation(&self) -> u64 {
+        self.events_generation()
+    }
+
+    fn subscriptions(&self) -> Vec<SubRow> {
+        let mut out = Vec::new();
+        for (entry, svc) in self.event_services(TriggerKind::Pubsub) {
+            for s in &svc.config.events.subscribe {
+                out.push(SubRow {
+                    ns: Self::namespace_of(&entry),
+                    service: entry.service,
+                    pattern: s.subject.clone(),
+                    group: s.group.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    fn task_for(
+        &self,
+        service: ServiceId,
+        msg: PubsubMessage,
+        depth: u8,
+        wall_cap: Option<Duration>,
+    ) -> Option<TaskSpec> {
+        let (entry, svc) = self.lookup(service)?;
+        if !self.plans.plan_arc(entry.tenant).allows_trigger(TriggerKind::Pubsub) {
+            return None;
+        }
+        let trigger = Trigger::Pubsub {
+            subject: Arc::from(msg.subject.as_str()),
+            depth,
+            reply: msg.replyable,
+        };
+        let mut spec = self.spec(&entry, &svc, trigger, Payload::Pubsub(msg), None);
+        if let Some(cap) = wall_cap {
+            spec.limits.wall = spec.limits.wall.min(cap);
+        }
+        Some(spec)
+    }
+}
+
+impl StreamTaskFactory for Specs {
+    fn generation(&self) -> u64 {
+        // A deleted topic sends no control event: a 30 s epoch makes the engine re-resolve its
+        // topics (and drop the cursors of a missing one) at least that often.
+        self.events_generation() ^ (SystemWall.now_ms() as u64 / 30_000).rotate_left(32)
+    }
+
+    fn consumers(&self) -> Vec<ConsumerDecl> {
+        let mut out = Vec::new();
+        for (entry, svc) in self.event_services(TriggerKind::Stream) {
+            for c in &svc.config.events.consume {
+                out.push(ConsumerDecl {
+                    service: entry.service,
+                    ns: Self::namespace_of(&entry),
+                    topic: c.topic.clone(),
+                    group: c.group.clone(),
+                    start: c.start,
+                    batch_size: c.batch_size,
+                    max_attempts: c.max_attempts,
+                    on_exhausted: c.on_exhausted,
+                });
+            }
+        }
+        out
+    }
+
+    fn task_for(&self, service: ServiceId, batch: StreamBatch) -> Option<TaskSpec> {
+        let (entry, svc) = self.lookup(service)?;
+        if !self.plans.plan_arc(entry.tenant).allows_trigger(TriggerKind::Stream) || batch.records.is_empty() {
+            return None;
+        }
+        let trigger = Trigger::Stream {
+            topic: Arc::from(batch.topic.as_str()),
+            partition: batch.partition,
+            attempt: batch.attempt,
+        };
+        Some(self.spec(&entry, &svc, trigger, Payload::Stream(batch), None))
+    }
+}
+
+/// The async engine's tasks: the stored request (sealed in `queue.db`) opened with the node's
+/// secrets backend and run as an HTTP task.
+pub struct AsyncTasks {
+    pub specs: Arc<Specs>,
+    pub secrets: Arc<dyn SecretsBackend>,
+}
+
+impl AsyncTasks {
+    fn open(&self, inv: &LeasedInvocation, part: u8, bytes: &[u8]) -> Option<Vec<u8>> {
+        let sealed = Sealed::from_bytes(bytes).ok()?;
+        let aad = invocation_aad(inv.service, inv.id, part);
+        self.secrets.open(&aad, &sealed).ok().map(|z| z.to_vec())
+    }
+}
+
+impl AsyncTaskFactory for AsyncTasks {
+    fn task_for(&self, inv: &LeasedInvocation) -> Result<Option<TaskSpec>, &'static str> {
+        let specs = &self.specs;
+        let Some((entry, svc)) = specs.lookup(inv.service) else {
+            return Ok(None);
+        };
+        if !entry.triggers.http || !specs.plans.plan_arc(entry.tenant).allows_trigger(TriggerKind::Http) {
+            return Ok(None);
+        }
+        let headers = self.open(inv, b'h', &inv.sealed_headers).ok_or(SEALED_UNREADABLE)?;
+        let body = self.open(inv, b'b', &inv.sealed_body).ok_or(SEALED_UNREADABLE)?;
+        let pairs: Vec<(String, String)> = serde_json::from_slice(&headers).map_err(|_| SEALED_UNREADABLE)?;
+        let method = http::Method::from_bytes(inv.method.as_bytes()).map_err(|_| SEALED_UNREADABLE)?;
+        let uri = inv.uri.parse::<http::Uri>().map_err(|_| SEALED_UNREADABLE)?;
+        let mut map = http::HeaderMap::new();
+        for (k, v) in pairs {
+            if k.starts_with("x-rt-") {
+                continue;
+            }
+            if let (Ok(k), Ok(v)) = (
+                http::HeaderName::from_bytes(k.as_bytes()),
+                http::HeaderValue::from_str(&v),
+            ) {
+                map.append(k, v);
+            }
+        }
+        let set = |map: &mut http::HeaderMap, k: &'static str, v: &str| {
+            if let Ok(v) = http::HeaderValue::from_str(v) {
+                map.insert(http::HeaderName::from_static(k), v);
+            }
+        };
+        set(&mut map, "x-rt-base-path", &format!("/s/{}", entry.slug));
+        set(&mut map, "x-rt-trigger", "http");
+        set(&mut map, "x-rt-invocation-id", &inv.id.to_string());
+        set(&mut map, "x-rt-invocation-attempt", &inv.attempt.to_string());
+        let req = HttpRequest {
+            method,
+            uri,
+            headers: map,
+            remote_addr: None,
+            body: rt_types::Body::from(bytes::Bytes::from(body)),
+        };
+        let mut spec = specs.spec(&entry, &svc, Trigger::Http, Payload::Http(req), None);
+        Specs::durable_defaults(&svc, &mut spec);
+        Ok(Some(spec))
+    }
+
+    fn visibility(&self, service: ServiceId) -> Duration {
+        let specs = &self.specs;
+        let Some((entry, svc)) = specs.lookup(service) else {
+            return Duration::from_secs(60);
+        };
+        let plan = specs.plans.plan_arc(entry.tenant);
+        let eff = specs.config.load().service_effective(svc.profile, &svc.config, &plan);
+        let knobs = eff.knobs(&plan);
+        knobs.queue_timeout + eff.limits_for(&Trigger::Http).wall + Duration::from_secs(10)
     }
 }
 
