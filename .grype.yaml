@@ -1,0 +1,11 @@
+# Grype findings that are reviewed exceptions, the same ones as in .trivyignore (each with its reason).
+# Grype has no expiry field: the nightly workflow rescans, and each entry is pinned to the exact package version,
+# so it stops matching as soon as that version changes.
+ignore:
+  # hickory-resolver 0.25 only through deno_fetch (pinned by Deno); guest fetch goes through rt-host's egress guard
+  # on hickory 0.26.2, so Deno's resolver is not called. Same as deny.toml RUSTSEC-2026-0118/0119 and .trivyignore.
+  # (Alex Sayfi, 2026-10-24)
+  - vulnerability: GHSA-5j98-2g5x-46v6
+    package:
+      name: hickory-resolver
+      version: 0.25.2

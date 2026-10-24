@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use rt_config::Config;
 use rt_host::{CallError, Request as CallRequest, TaskCtx};
 use rt_sec::{KeyLookup, PlanSource, WallClock};
@@ -147,9 +147,14 @@ impl rt_build::SdkCatalog for RouteSdkCatalog {
 ///
 /// With a tenant table attached, keys of a disabled tenant are not found (they authenticate
 /// again once the tenant is re-enabled).
+///
+/// Revocation is permanent, so revoked ids are remembered: an update that was read before the
+/// revocation but delivered after it (a child minted while its parent's tree was being revoked,
+/// KEY-035) cannot bring the key back.
 #[derive(Default)]
 pub struct KeyCache {
     map: DashMap<KeyId, ApiKey>,
+    revoked: DashSet<KeyId>,
     tenants: Option<Arc<DashMap<TenantId, Tenant>>>,
 }
 
@@ -158,6 +163,7 @@ impl KeyCache {
     pub fn with_tenants(tenants: Arc<DashMap<TenantId, Tenant>>) -> Self {
         Self {
             map: DashMap::new(),
+            revoked: DashSet::new(),
             tenants: Some(tenants),
         }
     }
@@ -169,10 +175,15 @@ impl KeyCache {
     }
 
     pub fn upsert(&self, key: ApiKey) {
+        if key.revoked || self.revoked.contains(&key.id) {
+            self.revoke(key.id);
+            return;
+        }
         self.map.insert(key.id, key);
     }
 
     pub fn revoke(&self, id: KeyId) {
+        self.revoked.insert(id);
         self.map.remove(&id);
     }
 
@@ -725,6 +736,41 @@ mod tests {
         assert!(cache.find(key.id).is_some());
         cache.revoke(key.id);
         assert!(cache.is_empty() && cache.find(key.id).is_none());
+    }
+
+    /// KEY-035: the update of a key read before its revocation but delivered after it does not
+    /// bring the key back; nor does a key that arrives already revoked.
+    #[test]
+    fn a_stale_update_after_a_revocation_does_not_bring_the_key_back() {
+        let cache = KeyCache::default();
+        let key = ApiKey {
+            id: KeyId::from_u128(7),
+            tenant_id: TenantId::from_u128(1),
+            name: None,
+            scopes: rt_types::Scopes::default(),
+            project_ids: None,
+            environments: None,
+            expires_at_ms: None,
+            created_at_ms: 0,
+            last_used_at_ms: None,
+            revoked: false,
+            parent_key_id: Some(KeyId::from_u128(6)),
+            hmac: Vec::new(),
+        };
+        cache.revoke(key.id);
+        cache.upsert(key.clone());
+        assert!(
+            cache.find(key.id).is_none(),
+            "revoked first, the late upsert is ignored"
+        );
+        assert!(cache.is_empty());
+        let other = ApiKey {
+            id: KeyId::from_u128(8),
+            revoked: true,
+            ..key
+        };
+        cache.upsert(other.clone());
+        assert!(cache.find(other.id).is_none(), "a revoked key is never served");
     }
 
     // ---- task factories ------------------------------------------------------------------------
