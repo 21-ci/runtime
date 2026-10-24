@@ -7,6 +7,9 @@
 //! - Retry: exponential backoff `2 s × 2^(attempt-1)`, ±20 % jitter, max `queue.max_attempts`,
 //!   then DLQ.
 //! - Concurrency: `queue.max_concurrency` per service within the service's `max_concurrency`.
+//! - Throttle: an admission refusal or a shutdown kill is not a delivery attempt
+//!   ([`counts_as_attempt`]): the batch is released with its attempt refunded, visible again after
+//!   [`throttle_delay`] (`1 s × 2^n`, cap 60 s, n = consecutive throttled settles of the service).
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, HashMap};
@@ -20,7 +23,7 @@ use parking_lot::Mutex;
 use rand::Rng;
 use rt_sched::{Clock, Scheduler};
 use rt_store::{Leased, QueueStore, RetryResult};
-use rt_types::{MsgId, Outcome, ServiceId, Trigger};
+use rt_types::{KillReason, MsgId, Outcome, ServiceId, Trigger};
 use tokio::sync::Notify;
 
 /// Base of the retry backoff.
@@ -33,6 +36,27 @@ pub fn backoff_delay(failed_attempt: u16, jitter: f64) -> Duration {
     let base = RETRY_BASE.as_secs_f64() * f64::from(1u32 << exp);
     Duration::from_secs_f64((base * (1.0 + jitter.clamp(-0.2, 0.2))).max(0.0))
 }
+
+/// Base of the throttle backoff (a refused or shut-down batch).
+pub const THROTTLE_BASE: Duration = Duration::from_secs(1);
+/// Cap of the throttle backoff.
+pub const THROTTLE_MAX: Duration = Duration::from_secs(60);
+
+/// Whether a finished delivery used up one of the message's attempts. An admission refusal
+/// (`Rejected`) or a shutdown kill never ran the handler to an answer, so it must not push a
+/// message toward the DLQ (Q§2.4).
+pub fn counts_as_attempt(outcome: &Outcome) -> bool {
+    !matches!(outcome, Outcome::Rejected(_) | Outcome::Killed(KillReason::Shutdown))
+}
+
+/// Delay before a throttled batch is visible again: `1 s × 2^n`, capped at 60 s, where `n` is the
+/// number of throttled settles of the service in a row before this one.
+pub fn throttle_delay(n: u32) -> Duration {
+    THROTTLE_BASE.saturating_mul(1u32 << n.min(16)).min(THROTTLE_MAX)
+}
+
+/// Consecutive throttled settles per service (reset by a counted settle).
+type Throttles = Arc<Mutex<HashMap<ServiceId, u32>>>;
 
 #[derive(Clone, Debug)]
 pub struct QueueEngineConfig {
@@ -104,6 +128,7 @@ pub struct QueueEngine {
     /// Last wall limit seen per service (visibility of the next lease).
     walls: Mutex<HashMap<ServiceId, Duration>>,
     metrics: Option<Arc<rt_obs::Metrics>>,
+    throttles: Throttles,
 }
 
 impl QueueEngine {
@@ -124,10 +149,12 @@ impl QueueEngine {
             wake: Notify::new(),
             walls: Mutex::new(HashMap::new()),
             metrics: None,
+            throttles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Count dead-lettered messages into `rt_queue_dlq_total`.
+    /// Count dead-lettered messages into `rt_queue_dlq_total` and throttled batches into
+    /// `rt_queue_throttled_total`.
     pub fn with_metrics(mut self, metrics: Arc<rt_obs::Metrics>) -> Self {
         self.metrics = Some(metrics);
         self
@@ -219,26 +246,28 @@ impl QueueEngine {
             return false;
         }
         let msgs: Vec<Attempt> = batch.iter().map(|m| (m.id, m.attempt)).collect();
-        let queue = self.queue.clone();
-        let metrics = self.metrics.clone();
+        let ctx = SettleCtx {
+            queue: self.queue.clone(),
+            metrics: self.metrics.clone(),
+            throttles: self.throttles.clone(),
+            service,
+        };
 
         let spec = self.tasks.task_for(service, &batch);
         let fut: Pin<Box<dyn Future<Output = Settled> + Send>> = match spec {
             None => {
                 // The service is gone or not routable: back off; the DLQ catches it eventually.
-                Box::pin(async move { (service, settle(queue, metrics, msgs, Outcome::GuestError).await) })
+                Box::pin(async move { (service, settle(ctx, msgs, Outcome::GuestError).await) })
             }
             Some(spec) => {
                 self.walls.lock().insert(service, spec.limits.wall);
                 match self.scheduler.submit(spec) {
                     Ok(handle) => Box::pin(async move {
                         let outcome = handle.await;
-                        (service, settle(queue, metrics, msgs, outcome).await)
+                        (service, settle(ctx, msgs, outcome).await)
                     }),
                     Err(reason) => {
-                        Box::pin(
-                            async move { (service, settle(queue, metrics, msgs, Outcome::Rejected(reason)).await) },
-                        )
+                        Box::pin(async move { (service, settle(ctx, msgs, Outcome::Rejected(reason)).await) })
                     }
                 }
             }
@@ -276,14 +305,40 @@ fn retry_ids(headers: &http::HeaderMap) -> HashMap<MsgId, Option<Duration>> {
         .collect()
 }
 
-/// Ack / retry a finished batch from its `Outcome`. Returns the shortest retry delay (so the
-/// engine can wake exactly when a message becomes visible again).
-async fn settle(
+/// What a settling batch needs from its engine.
+struct SettleCtx {
     queue: Arc<dyn QueueStore>,
     metrics: Option<Arc<rt_obs::Metrics>>,
-    msgs: Vec<Attempt>,
-    outcome: Outcome,
-) -> Option<Duration> {
+    throttles: Throttles,
+    service: ServiceId,
+}
+
+/// Ack / retry / release a finished batch from its `Outcome`. Returns the shortest retry delay
+/// (so the engine can wake exactly when a message becomes visible again).
+async fn settle(ctx: SettleCtx, msgs: Vec<Attempt>, outcome: Outcome) -> Option<Duration> {
+    let SettleCtx {
+        queue,
+        metrics,
+        throttles,
+        service,
+    } = ctx;
+    if !counts_as_attempt(&outcome) {
+        let delay = {
+            let mut t = throttles.lock();
+            let n = t.entry(service).or_insert(0);
+            let d = throttle_delay(*n);
+            *n = n.saturating_add(1);
+            d
+        };
+        if let Some(m) = &metrics {
+            m.queue_throttled_total.inc();
+        }
+        if let Err(e) = queue.release_leased(&msgs, delay).await {
+            tracing::warn!(error = %e, "queue: release failed (messages will be redelivered)");
+        }
+        return Some(delay);
+    }
+    throttles.lock().remove(&service);
     // Explicit `retry({ delaySeconds })` delays; every other retry follows the backoff curve.
     let mut explicit: HashMap<MsgId, Duration> = HashMap::new();
     let (ack, retry): (Vec<Attempt>, Vec<Attempt>) = match &outcome {

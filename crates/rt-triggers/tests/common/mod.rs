@@ -143,6 +143,7 @@ struct StoreInner {
     retries: Vec<RetryRecord>,
     acked: Vec<MsgId>,
     enqueued: Vec<(ServiceId, NewMessage)>,
+    releases: Vec<RetryRecord>,
 }
 
 /// In-memory `QueueStore` on a virtual clock. Semantics follow `rt_store::queue`:
@@ -173,6 +174,11 @@ impl FakeQueueStore {
 
     pub fn retry_log(&self) -> Vec<RetryRecord> {
         self.inner.lock().retries.clone()
+    }
+
+    /// Throttle releases (`release_leased`): `result` carries the refunded attempt.
+    pub fn release_log(&self) -> Vec<RetryRecord> {
+        self.inner.lock().releases.clone()
     }
 
     pub fn acked(&self) -> Vec<MsgId> {
@@ -292,6 +298,33 @@ impl QueueStore for FakeQueueStore {
             result,
         });
         Ok(result)
+    }
+
+    async fn release_leased(&self, msgs: &[(MsgId, u16)], delay: Duration) -> Result<u64, StoreError> {
+        let now = self.now();
+        let mut g = self.inner.lock();
+        let mut n = 0;
+        for (id, attempt) in msgs {
+            let Some(m) = g
+                .msgs
+                .iter_mut()
+                .find(|m| m.id == *id && m.attempt == *attempt && m.in_flight_until_ms > 0)
+            else {
+                continue;
+            };
+            m.attempt = m.attempt.saturating_sub(1);
+            m.in_flight_until_ms = 0;
+            m.visible_at_ms = now + delay.as_millis() as i64;
+            let attempt = m.attempt;
+            g.releases.push(RetryRecord {
+                id: *id,
+                at_ms: now,
+                delay,
+                result: RetryResult::Requeued { attempt },
+            });
+            n += 1;
+        }
+        Ok(n)
     }
 
     async fn stats(&self, s: ServiceId) -> Result<QueueStats, StoreError> {
