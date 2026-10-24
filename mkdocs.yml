@@ -179,6 +179,7 @@ nav:
           - WASM services: guides/wasm.md
           - KV, SQL, blobs and other sub-services: guides/sub-services.md
           - Service calls and queues: guides/calls-and-queues.md
+          - Events, topics and async invocations: guides/events-and-streams.md
           - Use operator SDKs: guides/use-sdks.md
           - Schedules: guides/schedules.md
           - WebSockets and durable objects: guides/websockets.md

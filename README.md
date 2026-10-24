@@ -43,7 +43,7 @@ function can use without wiring up anything else.
 | | |
 |---|---|
 | **Two executors** | Deno: a fresh V8 isolate per task, frozen clock, Web APIs. WASM: a WASI 0.2 `wasi:http` component per task (Rust, JS via `jco`, any language with a component toolchain). Opt-in warm reuse for the lowest latency |
-| **Triggers** | HTTP (`/s/{slug}/…`, `{slug}.{base_domain}`, verified custom hosts), interval and cron schedules, durable queues with retries and a DLQ, service-to-service calls and typed RPC, WebSockets held by the node |
+| **Triggers** | HTTP (`/s/{slug}/…`, `{slug}.{base_domain}`, verified custom hosts), interval and cron schedules, durable queues with retries and a DLQ, pub/sub subjects with request/reply, durable topics with consumer groups, async HTTP invocations with idempotency keys, service-to-service calls and typed RPC, WebSockets held by the node |
 | **State** | KV (TTL, `incr`, `cas`), SQL on a SQLite database per service, synchronous `bun:sqlite`-style SQLite, blobs, durable objects with alarms, named locks, env and AES-GCM sealed secrets |
 | **Multi-tenancy** | tenants, plans with quotas and limits, scoped API keys, projects and environments, ingress and egress rules per service, an SSRF guard on every outbound request, audit events |
 | **Scheduler** | Go-style G-M-P scheduler: admission control, per-tenant fair queues, work stealing, CPU and wall-clock limits with preemption, a memory governor that follows the cgroup |
@@ -181,6 +181,8 @@ Deno services import `std:*` modules; WASM components get the same capabilities 
 | `std:sqlite` | synchronous SQLite with the `bun:sqlite` API |
 | `std:blob` | blob storage with streamed upload and download |
 | `std:queue` | enqueue to a service's durable queue: retries, delays, dead-letter queue |
+| `std:pubsub` | ephemeral subjects: `publish` to subscribers (fan-out, at most once), `request` to one responder |
+| `std:stream` | durable, partitioned topics: `append` with keys and dedup ids, `read` replay, consumer groups with `failAt` and dead letters |
 | `std:schedule` | one-off tasks at a time or after a delay (at-least-once) |
 | `std:lock` | named mutexes per service |
 | `std:services` | calls to other services and typed RPC (`21ci types <service>` generates the `.d.ts`) |
@@ -196,7 +198,7 @@ Reference: [docs/handlers.md](docs/handlers.md) and the [docs site](https://21-c
 
 | | |
 |---|---|
-| [sample/deno](sample/deno) | `hello`, `kv-counter`, `sql-todo`, `sqlite-sync`, `blob-upload`, `npm-zod`, `scheduled-queue`, `service-call`, `env-secrets`, `platform-sdk` |
+| [sample/deno](sample/deno) | `hello`, `kv-counter`, `sql-todo`, `sqlite-sync`, `blob-upload`, `npm-zod`, `scheduled-queue`, `streams`, `service-call`, `env-secrets`, `platform-sdk` |
 | [sample/wasm](sample/wasm) | `rust-hello` (Rust component), `js-componentize` (JavaScript via `jco`) |
 | [sample/apps](sample/apps) | complete apps with tests and smoke scripts: a Telegram bot, event registrations, an electronic queue, a chat room on durable objects, an edge gateway in Rust/WASM, a currency-rates service |
 | [sample/operator-sdk](sample/operator-sdk) | an operator SDK published as a runtime service |

@@ -10,7 +10,7 @@ returns `unavailable`. The signatures below are abridged; in the `.wit` file `li
 
 | World | Contents |
 |---|---|
-| `guest` | imports `log`, `kv`, `sql`, `blob`, `queue`, `call`, `platform`, `secrets`, `lock`, `schedule`, `sdk`, `sockets`, `durable`, `ws-client` |
+| `guest` | imports `log`, `kv`, `sql`, `blob`, `queue`, `call`, `platform`, `secrets`, `lock`, `schedule`, `sdk`, `sockets`, `durable`, `ws-client`, `pubsub`, `streams` |
 | `rpc-service` | `guest` + export `rpc` |
 | `socket-service` | `guest` + export `socket-handler` (required for a durable service) |
 | `runtime-host` | `guest` + export `rpc` + export `socket-handler` |
@@ -81,6 +81,42 @@ enqueue: func(slug: string, body: list<u8> /* <= 1 MB */, opts: send-options) ->
 ```
 
 Codes: `not_found`, `forbidden`, `trigger_not_allowed`, `queue_full`.
+
+### `pubsub` (ephemeral subjects)
+
+```wit
+record publish-result { receivers: u32, dropped: u32 }
+record reply { content-type: option<string>, body: list<u8> }
+publish: func(subject: string, body: list<u8> /* <= 1 MiB */, headers: headers) -> result<publish-result, error>;
+request: func(subject: string, body: list<u8>, headers: headers, timeout-ms: option<u32> /* default 5000, max 30000 */) -> result<reply, error>;
+```
+
+At most once, in memory: `publish` resolves after routing, `dropped` counts copies not delivered (fan-out cap 100,
+quota, backlog, refusals). Subjects are concrete (no wildcards), `[A-Za-z0-9_-]` tokens, not `_rt…`. Subscribers declare
+`events.subscribe` on the service and receive `POST /__rt/pubsub` (see [SKILL.md](../SKILL.md)); for a `request` their
+response is the reply.
+
+Codes: `validation_failed`, `too_large`, `unavailable`, `call_depth`, `rate_limited`, `quota_exceeded`, and for `request`
+also `no_responders`, `timeout`, `responder_failed`, `overloaded`, `queue_timeout`, `shed`, `memory`, `draining`.
+
+### `streams` (persistent, partitioned topics)
+
+```wit
+record new-entry { body: list<u8>, key: option<string>, headers: headers, dedup-id: option<string> }
+record appended { partition: u32, offset: u64, duplicate: bool }
+variant position { earliest, latest, offset(u64), time-ms(s64) }
+record read-options { partition: u32, start: position, limit: u32 /* 1..100 */ }
+append: func(topic: string, entries: list<new-entry> /* 1..100, <= 4 MiB, one transaction */) -> result<list<appended>, error>;
+read: func(topic: string, opts: read-options) -> result<page, error>;
+info: func(topic: string) -> result<topic-info, error>;
+```
+
+`key` picks the partition (same key, same partition, in order). A repeated `dedup-id` within 2 minutes returns the first
+position with `duplicate: true`. `read` always names a partition (out of range is `validation_failed`). Consumers declare
+`events.consume` and receive `POST /__rt/stream` batches; a `2xx` commits, a `2xx` with `x-rt-stream-fail-at: <offset>`
+commits the records before that offset.
+
+Codes: `validation_failed`, `too_large`, `not_found`, `stream_full`, `rate_limited`, `quota_exceeded`, `unavailable`.
 
 ### `call` (service-to-service, same tenant)
 

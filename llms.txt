@@ -8,6 +8,7 @@ Docs site: https://21-ci.github.io/runtime/ . Source: https://github.com/21-ci/r
 
 - [README](https://github.com/21-ci/runtime/blob/main/README.md): features, listeners, quickstart (docker compose), CLI, configuration, development, layout
 - [Guest code reference](https://github.com/21-ci/runtime/blob/main/docs/handlers.md): handler forms, `ctx`, triggers, request rules, `std:*` modules, WebSockets, durable objects, WASM contract, limits, invoke outcomes
+- [Events, topics and async invocations](https://github.com/21-ci/runtime/blob/main/docs/guides/events-and-streams.md): pub/sub subjects, durable topics and consumer groups, async HTTP invocations, which one to use
 - [Control API](https://github.com/21-ci/runtime/blob/main/docs/api.md): auth and scopes, routes, service config blocks, error codes, invoke API, plans
 - [CLI (21ci)](https://github.com/21-ci/runtime/blob/main/docs/cli.md): contexts, every command, scopes, CI usage, exit codes
 - [Configuration](https://github.com/21-ci/runtime/blob/main/docs/config.md): `rt.toml`, profiles, sections, live vs restart-required keys
@@ -34,6 +35,7 @@ Docs site: https://21-ci.github.io/runtime/ . Source: https://github.com/21-ci/r
 - [Samples index](https://github.com/21-ci/runtime/blob/main/sample/README.md): every example, scripts, upload formats
 - [Deno hello](https://github.com/21-ci/runtime/tree/main/sample/deno/hello): Form A handler and `ctx`
 - [Deno scheduled-queue](https://github.com/21-ci/runtime/tree/main/sample/deno/scheduled-queue): Form B with `fetch`, `scheduled`, `queue`
+- [Deno streams](https://github.com/21-ci/runtime/tree/main/sample/deno/streams): topics, consumer groups with `failAt`, pub/sub publish, subscribe and request/reply, async invoke
 - [Deno npm-zod](https://github.com/21-ci/runtime/tree/main/sample/deno/npm-zod): `npm:` dependency and `rt.json` import map
 - [Rust WASM hello](https://github.com/21-ci/runtime/tree/main/sample/wasm/rust-hello): minimal `wasm32-wasip2` component
 - [JS WASM component](https://github.com/21-ci/runtime/tree/main/sample/wasm/js-componentize): `jco componentize`

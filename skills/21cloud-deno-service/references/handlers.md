@@ -11,7 +11,8 @@ No types package ships with the runtime. Paste what you use:
 interface Ctx {
   taskId: string;                                         // = x-rt-task-id response header
   service: { id: string; slug: string; version: number };
-  trigger: "http" | "interval" | "cron" | "schedule" | "queue" | "call" | "websocket" | "alarm";
+  trigger: "http" | "interval" | "cron" | "schedule" | "queue" | "call" | "websocket" | "alarm" | "pubsub" | "stream";
+  invocation?: { id: string; attempt: number };           // async HTTP invocation only (`x-rt-invocation-id` / `-attempt`)
   object?: { name: string };                              // socket event, alarm, or request to a durable object
   storage?: DurableStorage;                               // that object's storage (std:durable)
   invoker?: string;                                       // x-rt-invoker, internal listener only
@@ -41,6 +42,34 @@ interface QueueMessage {
   retry(o?: { delaySeconds?: number }): void;
 }
 interface QueueBatch { messages: QueueMessage[] }
+
+// pub/sub delivery (`pubsub` trigger); `replyable` = a `request`, whose return value is the reply
+interface PubsubMessage {
+  id: string;
+  subject: string;
+  body: unknown;                  // parsed JSON, else a string
+  headers: Record<string, string>;
+  replyable: boolean;
+  publishedAt: number;            // epoch ms
+}
+
+// topic consumer batch (`stream` trigger): one partition, in offset order
+interface StreamRecord {
+  partition: number;
+  offset: number;
+  key: string | null;
+  body: unknown;
+  headers: Record<string, string>;
+  timestamp: number;
+}
+interface StreamBatch {
+  topic: string;
+  group: string;
+  partition: number;
+  attempt: number;                // deliveries of the record at the cursor, 1-based
+  messages: StreamRecord[];
+  failAt(m: StreamRecord | number): void;   // commit before m, redeliver from m (lowest call wins)
+}
 ```
 
 ## Dispatch
@@ -53,10 +82,21 @@ interface QueueBatch { messages: QueueMessage[] }
 | `queue` | `queue(batch: QueueBatch, ctx)` | `fetch` gets `POST /__rt/queue`, JSON `{messages: [{id, body, attempt}]}`; `2xx` acks all, anything else retries all |
 | `websocket` | `webSocketMessage` / `webSocketClose` / `webSocketError` | nothing runs; the event is done |
 | `alarm` | `alarm(info, ctx)` (durable class) | nothing runs; the alarm is done |
+| `pubsub` | `pubsub(msg: PubsubMessage, ctx)`; its return value answers a `request` (`undefined` -> `204`, object -> JSON, string, bytes, or a `Response`) | `fetch` gets `POST /__rt/pubsub`, JSON = the `PubsubMessage` |
+| `stream` | `stream(batch: StreamBatch, ctx)`; a normal return commits the batch, a throw retries it | `fetch` gets `POST /__rt/stream`, JSON = the `StreamBatch`; `2xx` commits, `2xx` + `x-rt-stream-fail-at: <offset>` commits before that offset |
 
 Queue semantics: messages that are not `retry()`-ed are acked when the handler returns normally. A throw fails the task
 and the whole batch is redelivered. Backoff `2 s x 2^(attempt-1)` (+-20 %), up to `queue.max_attempts` (default 5),
 then the dead-letter queue (`21ci queue dlq <svc>`). Default batch size is 10. Unordered, at least once.
+
+Stream consumers: `batch.failAt(m)` commits the records before `m` and redelivers from `m`; a normal return commits the
+whole batch. Records are delivered per partition, in order: one slow record holds back its partition, not the others.
+Delivery is at least once, so make the work idempotent (the record's `partition` + `offset` is a stable key).
+
+Pub/sub: a plain publish is delivered at most once. Use the return value only for a `request`.
+
+Async HTTP invocations (service `async.enabled`): the handler is the normal `fetch`; its response body is discarded and
+only the status counts (`5xx` / `429` retry, anything else is done). `ctx.invocation` is set on each attempt.
 
 Schedules: interval/cron schedules are created on the service (control API or `21ci schedule add`), not in code. One-off
 schedules are created in code with `std:schedule`.
