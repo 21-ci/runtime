@@ -14,16 +14,22 @@ pub enum TriggerKind {
     Call,
     /// WebSocket upgrades and their events (`std:sockets`).
     Websocket,
+    /// Pub/sub deliveries (`events.subscribe`, `std:pubsub`).
+    Pubsub,
+    /// Stream consumer batches (`events.consume`, `std:stream`).
+    Stream,
 }
 
 impl TriggerKind {
-    pub const ALL: [TriggerKind; 6] = [
+    pub const ALL: [TriggerKind; 8] = [
         TriggerKind::Http,
         TriggerKind::Interval,
         TriggerKind::Cron,
         TriggerKind::Queue,
         TriggerKind::Call,
         TriggerKind::Websocket,
+        TriggerKind::Pubsub,
+        TriggerKind::Stream,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -34,6 +40,8 @@ impl TriggerKind {
             TriggerKind::Queue => "queue",
             TriggerKind::Call => "call",
             TriggerKind::Websocket => "websocket",
+            TriggerKind::Pubsub => "pubsub",
+            TriggerKind::Stream => "stream",
         }
     }
 }
@@ -45,6 +53,8 @@ pub struct PlanLimitsMax {
     pub wall_ms: u64,
     pub cpu_ms: u64,
     pub memory_mb: u32,
+    /// Largest `scaling.min_run_time_ms` a service may set (keep-alive after the answer).
+    pub min_run_time_ms: u64,
 }
 
 impl Default for PlanLimitsMax {
@@ -53,6 +63,7 @@ impl Default for PlanLimitsMax {
             wall_ms: 30_000,
             cpu_ms: 1_000,
             memory_mb: 128,
+            min_run_time_ms: 60_000,
         }
     }
 }
@@ -107,6 +118,16 @@ pub struct Plan {
     pub max_sockets_per_object: u32,
     /// Largest WebSocket message a client may send; a larger one closes the socket with 1009.
     pub ws_max_message_bytes: u32,
+    /// Pending async invocations per service; more are refused (`429 async_backlog_full`).
+    pub max_async_pending: u64,
+    /// Stream topics per tenant.
+    pub max_topics: u32,
+    /// Partitions of one topic (at most [`crate::events::PARTITIONS_HARD_MAX`]).
+    pub max_topic_partitions: u32,
+    /// Stream record bytes across the tenant's topics (not part of `storage_mb`).
+    pub max_stream_mb: u64,
+    /// Longest retention a topic may set, in hours.
+    pub max_stream_retention_hours: u32,
 }
 
 impl Default for Plan {
@@ -130,6 +151,8 @@ impl Default for Plan {
                 TriggerKind::Queue,
                 TriggerKind::Call,
                 TriggerKind::Websocket,
+                TriggerKind::Pubsub,
+                TriggerKind::Stream,
             ],
             limits_max: PlanLimitsMax::default(),
             builds_per_hour: 20,
@@ -140,6 +163,11 @@ impl Default for Plan {
             max_sockets: 1_000,
             max_sockets_per_object: 1_000,
             ws_max_message_bytes: 1024 * 1024,
+            max_async_pending: 10_000,
+            max_topics: 10,
+            max_topic_partitions: 4,
+            max_stream_mb: 100,
+            max_stream_retention_hours: 72,
         }
     }
 }
@@ -165,11 +193,34 @@ impl Plan {
             blocking_share: 0.5,
             max_sockets: 0,
             max_sockets_per_object: 0,
+            max_async_pending: 100_000,
+            max_topics: 1_000,
+            max_topic_partitions: 16,
+            max_stream_mb: 10_240,
+            max_stream_retention_hours: 720,
+            limits_max: PlanLimitsMax {
+                min_run_time_ms: 600_000,
+                ..PlanLimitsMax::default()
+            },
             ..Self::default()
         }
     }
 
     pub fn allows_trigger(&self, t: TriggerKind) -> bool {
         self.allowed_triggers.contains(&t)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plans cap `min_run_time_ms` at 60 s by default and 10 min for the system plan.
+    #[test]
+    fn plan_limits_default_min_run_time_is_60s() {
+        assert_eq!(PlanLimitsMax::default().min_run_time_ms, 60_000);
+        assert_eq!(Plan::system().limits_max.min_run_time_ms, 600_000);
+        let p: PlanLimitsMax = serde_json::from_str(r#"{"wall_ms":1000}"#).unwrap();
+        assert_eq!(p.min_run_time_ms, 60_000);
     }
 }

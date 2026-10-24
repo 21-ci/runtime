@@ -683,7 +683,19 @@ fn runtime_and_trigger_kinds_print_their_wire_names() {
         ("deno", "wasm".to_string())
     );
     let names: Vec<&str> = TriggerKind::ALL.iter().map(|t| t.as_str()).collect();
-    assert_eq!(names, ["http", "interval", "cron", "queue", "call", "websocket"]);
+    assert_eq!(
+        names,
+        [
+            "http",
+            "interval",
+            "cron",
+            "queue",
+            "call",
+            "websocket",
+            "pubsub",
+            "stream"
+        ]
+    );
 }
 
 #[test]

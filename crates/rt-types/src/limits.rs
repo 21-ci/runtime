@@ -63,7 +63,7 @@ impl Limits {
                 max_fetches: 200,
                 ..base
             },
-            Trigger::Queue { .. } => Self {
+            Trigger::Queue { .. } | Trigger::Stream { .. } => Self {
                 wall: Duration::from_secs(300),
                 cpu: Duration::from_millis(10_000),
                 max_request_body_bytes: 1024 * 1024,
@@ -76,7 +76,11 @@ impl Limits {
                 memory_mb: 256,
                 ..base
             },
-            Trigger::Http | Trigger::Call { .. } | Trigger::Socket { .. } | Trigger::Alarm { .. } => base,
+            Trigger::Http
+            | Trigger::Call { .. }
+            | Trigger::Socket { .. }
+            | Trigger::Alarm { .. }
+            | Trigger::Pubsub { .. } => base,
         }
     }
 }
@@ -157,6 +161,10 @@ pub struct ServiceKnobs {
     /// Adaptive concurrency and warm-capacity bounds from the service's profile (D-A3).
     #[serde(default)]
     pub scaling: ScalingKnobs,
+    /// Keep-alive of a reused instance after it answered (`scaling.min_run_time_ms`): `None` =
+    /// inherit the executor's idle TTL, `Some(0)` = only while tasks of the service wait.
+    #[serde(default)]
+    pub min_run_time: Option<Duration>,
 }
 
 impl Default for ServiceKnobs {
@@ -175,6 +183,21 @@ impl Default for ServiceKnobs {
             preload: false,
             compile: CompileMode::Lazy,
             scaling: ScalingKnobs::default(),
+            min_run_time: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Knobs serialized before `min_run_time` existed still deserialize (as inherit).
+    #[test]
+    fn knobs_without_min_run_time_deserialize() {
+        let mut v = serde_json::to_value(ServiceKnobs::default()).unwrap();
+        v.as_object_mut().unwrap().remove("min_run_time");
+        let k: ServiceKnobs = serde_json::from_value(v).unwrap();
+        assert_eq!(k.min_run_time, None);
     }
 }

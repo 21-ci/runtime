@@ -1,7 +1,7 @@
 //! Identifiers.
 //!
 //! Control-plane IDs are ULIDs with a type prefix (`ten_`, `svc_`, `key_`, `sch_`, `msg_`,
-//! `evt_`, `upl_`, `prj_`), see docs/api.md. They sort by creation time, are safe in URLs and
+//! `evt_`, `upl_`, `prj_`, `tpc_`, `inv_`), see docs/api.md. They sort by creation time, are safe in URLs and
 //! round-trip through `Display`/`FromStr`/serde as the prefixed string.
 //!
 //! [`TaskId`] is a node-local monotonic `u64` (scheduler hot path); it is rendered as
@@ -138,6 +138,14 @@ prefixed_ulid!(
 prefixed_ulid!(
     /// Project (`prj_…`, decision D-B3).
     ProjectId, "prj"
+);
+prefixed_ulid!(
+    /// Stream topic (`tpc_…`).
+    TopicId, "tpc"
+);
+prefixed_ulid!(
+    /// Async invocation (`inv_…`).
+    InvocationId, "inv"
 );
 
 /// Node-local monotonic task identifier. Rendered as `task_<16 hex>`.
