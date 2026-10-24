@@ -93,7 +93,7 @@ pub trait NodeInfo: Send + Sync {
 
     /// Crate version reported by `GET /v1/node/status`.
     fn version(&self) -> String {
-        "0.1.0".to_string()
+        env!("CARGO_PKG_VERSION").to_string()
     }
 }
 

@@ -4865,7 +4865,7 @@ dependencies = [
 
 [[package]]
 name = "rt-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4911,7 +4911,7 @@ dependencies = [
 
 [[package]]
 name = "rt-build"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4941,7 +4941,7 @@ dependencies = [
 
 [[package]]
 name = "rt-cache"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "dashmap",
@@ -4962,7 +4962,7 @@ dependencies = [
 
 [[package]]
 name = "rt-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "assert_cmd",
  "base64 0.22.1",
@@ -4981,7 +4981,7 @@ dependencies = [
 
 [[package]]
 name = "rt-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "humantime",
  "proptest",
@@ -4997,7 +4997,7 @@ dependencies = [
 
 [[package]]
 name = "rt-exec-deno"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5037,7 +5037,7 @@ dependencies = [
 
 [[package]]
 name = "rt-exec-wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5075,7 +5075,7 @@ dependencies = [
 
 [[package]]
 name = "rt-host"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5115,7 +5115,7 @@ dependencies = [
 
 [[package]]
 name = "rt-mem"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "parking_lot",
@@ -5130,7 +5130,7 @@ dependencies = [
 
 [[package]]
 name = "rt-obs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "dashmap",
@@ -5151,7 +5151,7 @@ dependencies = [
 
 [[package]]
 name = "rt-sched"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "crossbeam-deque",
@@ -5178,7 +5178,7 @@ dependencies = [
 
 [[package]]
 name = "rt-sec"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "dashmap",
@@ -5205,7 +5205,7 @@ dependencies = [
 
 [[package]]
 name = "rt-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5255,7 +5255,7 @@ dependencies = [
 
 [[package]]
 name = "rt-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5280,7 +5280,7 @@ dependencies = [
 
 [[package]]
 name = "rt-testkit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -5308,7 +5308,7 @@ dependencies = [
 
 [[package]]
 name = "rt-triggers"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -5342,7 +5342,7 @@ dependencies = [
 
 [[package]]
 name = "rt-types"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
