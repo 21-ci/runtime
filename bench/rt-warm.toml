@@ -1,0 +1,30 @@
+# Private benchmark node (bench/bench.sh). Paths are relative to the repo root.
+[node]
+data_dir = "bench/data"
+
+[listeners]
+public = "127.0.0.1:18080"
+internal = "127.0.0.1:18082"   # loopback TCP (a non-loopback internal listener is refused)
+allow_tcp_internal = true      # private bench node: TCP internal listener opted in
+control = "127.0.0.1:18081"
+metrics = "127.0.0.1:19090"
+
+[security]
+require_v8_sandbox = false
+
+[ingress]
+max_conns_per_ip = 4096
+
+[plans.bench]
+rps = 0
+invocations_per_day = 0
+max_concurrency = 100000
+max_instances = 0              # no per-service instance cap (the built-in free plan allows 4)
+max_services = 100
+
+[wasm]
+reuse_instances = true
+
+[deno]
+isolate_pool_per_p = 4
+reuse_isolates = true

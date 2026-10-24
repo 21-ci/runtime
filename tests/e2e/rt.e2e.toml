@@ -1,0 +1,25 @@
+# Node configuration for the black-box E2E suite (scripts/e2e.sh mounts it at /etc/rt/rt.toml).
+#
+# The built-in `free` plan is deliberately strict (3 schedules, one every 60 s at most, no cron).
+# The E2E scripts create their tenants on `pro` (tests/e2e/lib.sh: RT_E2E_PLAN) so that a schedule
+# fires every 10 s and the whole suite runs in a few minutes. Everything else stays at the
+# built-in defaults (profile `balanced`); the listener addresses and the V8 sandbox flag come
+# from the image's RT__* environment, which wins over this file (docs/config.md).
+
+[plans.pro]
+max_services         = 50
+max_concurrency      = 50
+max_instances        = 0     # no per-service instance cap (the built-in free plan allows 4)
+rps                  = 500
+invocations_per_day  = 1_000_000
+storage_mb           = 500
+egress_mb_per_day    = 10_000
+max_schedules        = 10
+min_schedule_seconds = 10
+max_queue_depth      = 10_000
+max_pinned_mb        = 0
+allowed_triggers     = ["http", "interval", "cron", "queue", "call"]
+limits_max           = { wall_ms = 60_000, cpu_ms = 5_000, memory_mb = 256 }
+builds_per_hour      = 200
+custom_host_suffixes = []
+blocking_share       = 0.5
