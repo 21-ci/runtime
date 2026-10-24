@@ -157,7 +157,7 @@ flate2 = "1.1.5"
 wasmtime = { version = "48.0.7", features = ["component-model", "async", "pooling-allocator"] }
 wasmtime-wasi = "48.0.7"
 wasmtime-wasi-http = "48.0.7"
-wasmparser = "0.248.0"
+wasmparser = "0.262.0"
 
 # --- Deno (ONE release: v2.9.7, 2026-09-17; versions copied from its Cargo.toml) ---
 deno_core = "=0.412.0"
