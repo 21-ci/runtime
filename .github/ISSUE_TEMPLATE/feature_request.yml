@@ -1,0 +1,38 @@
+name: Feature request
+description: Propose a new capability or a change in behavior.
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Large changes (a new `std:*` module, a breaking API or config change, a new trust boundary) follow the
+        proposal process in [GOVERNANCE.md](https://github.com/21-ci/runtime/blob/main/GOVERNANCE.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what stops you today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: The behavior, API or config you would like. Code sketches welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and limits
+      description: Does this cross a tenant boundary, add egress, or need a new limit or quota?
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Contribution
+      options:
+        - label: I would like to implement this.

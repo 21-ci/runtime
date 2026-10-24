@@ -1,0 +1,62 @@
+# release-please keeps a release PR open on main (and on release/x.y branches) that bumps the workspace version in
+# Cargo.toml and updates CHANGELOG.md from the Conventional Commits since the last tag. Merging it creates the vX.Y.Z
+# tag and the GitHub Release; the tag push runs release.yml.
+#
+# It runs with a GitHub App token, not GITHUB_TOKEN: events made with GITHUB_TOKEN do not start workflows, so with it
+# neither CI on the release PR nor release.yml on the tag would run. Secrets: RELEASE_APP_ID, RELEASE_APP_PRIVATE_KEY
+# (an org-owned GitHub App with contents: write and pull-requests: write on this repository; .github/BRANCHING.md).
+name: release-please
+
+on:
+  push:
+    branches: [main, "release/**"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - id: rp
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.app.outputs.token }}
+          target-branch: ${{ github.ref_name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      # release-please bumps Cargo.toml but cannot edit Cargo.lock; `cargo build --locked` needs both in step.
+      - name: Sync Cargo.lock on the release PR
+        if: steps.rp.outputs.prs_created == 'true' || steps.rp.outputs.pr != ''
+        env:
+          PR_JSON: ${{ steps.rp.outputs.pr }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          branch=$(printf '%s' "$PR_JSON" | jq -r '.headBranchName // empty')
+          [ -n "$branch" ] || { echo "no release PR branch"; exit 0; }
+          git clone --quiet --depth 1 --branch "$branch" \
+            "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" rp
+          cd rp
+          rustup toolchain install --no-self-update
+          cargo update --workspace
+          if git diff --quiet -- Cargo.lock; then echo "Cargo.lock already in step"; exit 0; fi
+          git config user.name "release-please[bot]"
+          git config user.email "55107282+release-please[bot]@users.noreply.github.com"
+          git commit -q -m "chore: sync Cargo.lock with the release version" -- Cargo.lock
+          git push -q origin "HEAD:$branch"

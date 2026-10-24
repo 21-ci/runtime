@@ -1,0 +1,51 @@
+# Weekly dependency updates, grouped so that one PR per ecosystem lands per week.
+# Deno (deno_*) and V8 crates move together with a Deno release and are bumped by hand (Cargo.toml pins them with `=`).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)"
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "deno_*"
+      - dependency-name: "v8"
+      - dependency-name: "wasmtime*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directories:
+      - /
+      - /deploy/compose
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "build(deps)"
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "docs(deps)"
+    groups:
+      docs:
+        patterns: ["*"]

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/21-ci/runtime/security/advisories/new
+    about: Report privately through a GitHub security advisory. Never open a public issue.
+  - name: Question or idea
+    url: https://github.com/21-ci/runtime/discussions
+    about: Ask and discuss in GitHub Discussions.
+  - name: Documentation
+    url: https://21-ci.github.io/runtime/
+    about: Guides, API reference and examples.

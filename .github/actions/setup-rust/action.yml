@@ -1,0 +1,31 @@
+name: Set up Rust
+description: Install the toolchain from rust-toolchain.toml (plus extra targets) and restore the cargo cache.
+inputs:
+  targets:
+    description: Extra rustup targets, space-separated.
+    required: false
+    default: ""
+  cache-key:
+    description: Extra cache key (job or crate name), so jobs do not evict each other's caches.
+    required: false
+    default: ""
+  save-cache:
+    description: Save the cache at the end of the job (only on the default branch by default).
+    required: false
+    default: ${{ github.ref == 'refs/heads/main' }}
+runs:
+  using: composite
+  steps:
+    - name: Install toolchain (rust-toolchain.toml)
+      shell: bash
+      env:
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        rustup toolchain install --no-self-update
+        for t in $TARGETS; do rustup target add "$t"; done
+        rustc --version && cargo --version
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        key: ${{ inputs.cache-key }}
+        save-if: ${{ inputs.save-cache }}
+        cache-on-failure: "false"

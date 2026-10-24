@@ -1,0 +1,608 @@
+# Release: runs on a vX.Y.Z tag (pushed by a maintainer, or dispatched by release-please.yml at the tag ref).
+#
+#   plan        version from the tag, checked against Cargo.toml
+#   build       rt + 21ci for linux gnu (x86_64, aarch64), 21ci for linux musl, both for macOS (arm64, x86_64);
+#               cargo-auditable embeds the dependency list so scanners see the crates; reproducible tarballs
+#   artifacts   deb/rpm/apk (nfpm, signed), SBOMs (syft), scans of every unpacked tarball, package and SBOM with
+#               trivy + grype: any fixable HIGH/CRITICAL blocks the release
+#   images      multi-arch GHCR images from the release binaries (BuildKit, reproducible timestamps, SBOM + max
+#               provenance), pushed by digest, scanned per platform, only then tagged, cosign-signed and attested
+#   release     SHA256SUMS + cosign bundle + SLSA provenance, GitHub Release assets
+#   homebrew    formulae rendered into 21-ci/homebrew-tap          (stable releases only)
+#   pages       dispatches docs.yml, which rebuilds the apt/rpm/apk repositories on GitHub Pages
+#   verify      downloads what was published and verifies every checksum, signature and attestation
+#
+# Secrets: PKG_GPG_PRIVATE_KEY, PKG_GPG_PASSPHRASE, APK_RSA_PRIVATE_KEY, HOMEBREW_TAP_TOKEN (packaging/README.md). Images and blobs are signed keyless (GitHub OIDC): no signing key is stored.
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-*"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ghcr.io/21-ci
+  CERT_IDENTITY_REGEXP: ^https://github\.com/21-ci/runtime/\.github/workflows/release\.yml@refs/tags/v
+  CERT_OIDC_ISSUER: https://token.actions.githubusercontent.com
+  TRIVY_VERSION: v0.76.1
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+      source_date_epoch: ${{ steps.v.outputs.source_date_epoch }}
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: v
+        name: Version from the tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "::error::run the release on a vX.Y.Z tag (got $GITHUB_REF)"; exit 1
+          fi
+          tag=$GITHUB_REF_NAME
+          version=${tag#v}
+          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || { echo "::error::bad tag $tag"; exit 1; }
+          cargo_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')
+          if [ "${version%%-*}" != "$cargo_version" ]; then
+            echo "::error::tag $tag does not match the workspace version $cargo_version in Cargo.toml"; exit 1
+          fi
+          case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+            echo "source_date_epoch=$(git log -1 --format=%ct)"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, bins: "rt 21ci", docker_arch: amd64 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, bins: "rt 21ci", docker_arch: arm64 }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, bins: "21ci", docker_arch: amd64 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04-arm, bins: "21ci", docker_arch: arm64 }
+          - { target: aarch64-apple-darwin, os: macos-15, bins: "rt 21ci", docker_arch: "" }
+          - { target: x86_64-apple-darwin, os: macos-15, bins: "rt 21ci", docker_arch: "" }
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      SOURCE_DATE_EPOCH: ${{ needs.plan.outputs.source_date_epoch }}
+      TARGET: ${{ matrix.target }}
+      BINS: ${{ matrix.bins }}
+      DOCKER_ARCH: ${{ matrix.docker_arch }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        if: runner.os == 'Linux'
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk
+      # No build cache in releases: a cache restored from another ref could poison the binaries.
+      - name: Toolchain
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add "$TARGET"
+      - name: musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-auditable@0.7.7
+      - name: Build
+        shell: bash
+        run: |
+          for bin in $BINS; do
+            case "$bin" in rt) pkg=rt-server ;; 21ci) pkg=rt-cli ;; esac
+            cargo auditable build --release --locked --target "$TARGET" -p "$pkg" --bin "$bin"
+          done
+      - name: Package tarballs
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAR=$(command -v gtar || command -v tar)
+          mkdir -p dist/out dist/stage
+          for bin in $BINS; do
+            name="$bin-$VERSION-$TARGET"
+            stage="dist/stage/$name"
+            mkdir -p "$stage"
+            install -m 0755 "target/$TARGET/release/$bin" "$stage/$bin"
+            cp LICENSE NOTICE README.md "$stage/"
+            if [ "$bin" = rt ]; then
+              cp -R config/defconfigs "$stage/defconfigs"
+              cp deploy/rt.toml "$stage/defconfigs/production.toml"
+            fi
+            # Reproducible: sorted entries, fixed owner and mtime, gzip without a timestamp.
+            "$TAR" --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+              -C dist/stage -cf - "$name" | gzip -9n > "dist/out/$name.tar.gz"
+          done
+          ls -l dist/out
+      - name: Binaries for the images and packages
+        if: matrix.docker_arch != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="dist/docker/$DOCKER_ARCH"
+          mkdir -p "$dir"
+          case "$TARGET" in
+            *-gnu)
+              install -m 0755 "target/$TARGET/release/rt" "$dir/rt"
+              rustc --edition 2021 --target "$TARGET" -C opt-level=s -C strip=symbols \
+                -o "$dir/rt-healthcheck" packaging/docker/healthcheck.rs
+              ;;
+            *-musl)
+              install -m 0755 "target/$TARGET/release/21ci" "$dir/21ci"
+              ;;
+          esac
+      - name: Shell completions
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          mkdir -p dist/completions
+          b="target/$TARGET/release/21ci"
+          "$b" completion bash > dist/completions/21ci.bash
+          "$b" completion zsh > dist/completions/_21ci
+          "$b" completion fish > dist/completions/21ci.fish
+      - name: Smoke
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: for bin in $BINS; do "target/$TARGET/release/$bin" --version; done
+      - run: rm -rf dist/stage
+        shell: bash
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  artifacts:
+    name: packages, SBOMs, artifact scans
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Tools (nfpm from its tagged Go module, rpm2cpio)
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.48.0
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends rpm2cpio cpio
+      - name: Signing keys
+        env:
+          PKG_GPG_PRIVATE_KEY: ${{ secrets.PKG_GPG_PRIVATE_KEY }}
+          APK_RSA_PRIVATE_KEY: ${{ secrets.APK_RSA_PRIVATE_KEY }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/keys"
+          [ -n "$PKG_GPG_PRIVATE_KEY" ] || { echo "::error::secret PKG_GPG_PRIVATE_KEY is not set"; exit 1; }
+          [ -n "$APK_RSA_PRIVATE_KEY" ] || { echo "::error::secret APK_RSA_PRIVATE_KEY is not set"; exit 1; }
+          printf '%s\n' "$PKG_GPG_PRIVATE_KEY" > "$RUNNER_TEMP/keys/pkg.asc"
+          printf '%s\n' "$APK_RSA_PRIVATE_KEY" > "$RUNNER_TEMP/keys/21cloud.rsa"
+      - name: nfpm packages
+        env:
+          NFPM_GPG_KEY_FILE: ${{ runner.temp }}/keys/pkg.asc
+          NFPM_RPM_PASSPHRASE: ${{ secrets.PKG_GPG_PASSPHRASE }}
+          APK_KEY_FILE: ${{ runner.temp }}/keys/21cloud.rsa
+          COMPLETIONS_DIR: dist/completions
+        run: |
+          set -euo pipefail
+          for ARCH in amd64 arm64; do
+            export ARCH BIN_DIR="dist/docker/$ARCH"
+            for fmt in deb rpm; do nfpm package -f packaging/nfpm/rt.yaml -p "$fmt" -t dist/out/; done
+            for fmt in deb rpm apk; do nfpm package -f packaging/nfpm/21ci.yaml -p "$fmt" -t dist/out/; done
+          done
+          ls -l dist/out
+      - name: Unpack every tarball and package for scanning
+        run: |
+          set -euo pipefail
+          mkdir -p dist/scan
+          cd dist/out
+          for f in *.tar.gz; do d="../scan/${f%.tar.gz}"; mkdir -p "$d"; tar -xzf "$f" -C "$d"; done
+          for f in *.deb; do d="../scan/$f"; mkdir -p "$d"; dpkg-deb -x "$f" "$d"; done
+          for f in *.rpm; do d="../scan/$f"; mkdir -p "$d"; (cd "$d" && rpm2cpio "../../out/$f" | cpio -idm --quiet); done
+          for f in *.apk; do d="../scan/$f"; mkdir -p "$d"; tar -xzf "$f" -C "$d" 2>/dev/null || true; done
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        id: syft
+      - name: SBOMs (SPDX JSON) of every tarball, plus the source tree
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: |
+          set -euo pipefail
+          for f in dist/out/*.tar.gz; do
+            name=$(basename "$f" .tar.gz)
+            "$SYFT" scan "dir:dist/scan/$name" --source-name "$name" --source-version "$VERSION" \
+              -o "spdx-json=dist/out/$name.spdx.json"
+          done
+          "$SYFT" scan dir:. --exclude ./dist --exclude ./target --source-name runtime --source-version "$VERSION" \
+            -o "spdx-json=dist/out/runtime-$VERSION-source.spdx.json"
+      - name: trivy (unpacked artifacts) -> SARIF
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: rootfs
+          scan-ref: dist/scan
+          scanners: vuln,secret
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-artifacts.sarif
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always() && hashFiles('trivy-artifacts.sarif') != ''
+        with:
+          sarif_file: trivy-artifacts.sarif
+          category: release-artifacts
+      - uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        id: grype
+      - name: Gate - trivy + grype on every artifact and SBOM (HIGH/CRITICAL with a fix blocks the release)
+        env:
+          GRYPE: ${{ steps.grype.outputs.cmd }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for d in dist/scan/*/; do
+            echo "::group::$d"
+            trivy rootfs --quiet --scanners vuln,secret --severity HIGH,CRITICAL --ignore-unfixed \
+              --ignorefile .trivyignore --exit-code 1 "$d" || fail=1
+            "$GRYPE" "dir:$d" --only-fixed --fail-on high -q || fail=1
+            echo "::endgroup::"
+          done
+          for s in dist/out/*.spdx.json; do
+            echo "::group::$s"
+            trivy sbom --quiet --severity HIGH,CRITICAL --ignore-unfixed --ignorefile .trivyignore --exit-code 1 "$s" || fail=1
+            "$GRYPE" "sbom:$s" --only-fixed --fail-on high -q || fail=1
+            echo "::endgroup::"
+          done
+          exit "$fail"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: dist/out/
+          if-no-files-found: error
+          retention-days: 7
+
+  images:
+    name: image ${{ matrix.image }}
+    needs: [plan, build, artifacts]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { image: rt, dockerfile: Dockerfile }
+          - { image: 21ci, dockerfile: Dockerfile.21ci }
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+      SOURCE_DATE_EPOCH: ${{ needs.plan.outputs.source_date_epoch }}
+      IMAGE: ghcr.io/21-ci/${{ matrix.image }}
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*-linux-*
+          path: dist
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.plan.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.plan.outputs.tag }}
+            type=raw,value=latest,enable=${{ needs.plan.outputs.prerelease == 'false' }}
+      - id: build
+        name: Build and push by digest (untagged until the scans pass)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            BIN_STAGE=prebuilt
+            VERSION=${{ env.VERSION }}
+            REVISION=${{ github.sha }}
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true
+          provenance: mode=max
+          sbom: true
+          no-cache: true
+      - name: trivy image amd64 -> SARIF
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          scanners: vuln,secret
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-image-amd64.sarif
+      - name: trivy image arm64 -> SARIF
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          scanners: vuln,secret
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-image-arm64.sarif
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always() && hashFiles('trivy-image-amd64.sarif') != ''
+        with:
+          sarif_file: trivy-image-amd64.sarif
+          category: image-${{ matrix.image }}-amd64
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always() && hashFiles('trivy-image-arm64.sarif') != ''
+        with:
+          sarif_file: trivy-image-arm64.sarif
+          category: image-${{ matrix.image }}-arm64
+      - uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        id: grype
+      - name: Gate - trivy + grype on amd64 and arm64 (HIGH/CRITICAL with a fix blocks the release)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          GRYPE: ${{ steps.grype.outputs.cmd }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for p in amd64 arm64; do
+            trivy image --quiet --platform "linux/$p" --scanners vuln,secret --severity HIGH,CRITICAL --ignore-unfixed \
+              --ignorefile .trivyignore --exit-code 1 "$IMAGE@$DIGEST" || fail=1
+            "$GRYPE" "registry:$IMAGE@$DIGEST" --platform "linux/$p" --only-fixed --fail-on high -q || fail=1
+          done
+          exit "$fail"
+      - name: Tag the scanned digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r t; do [ -n "$t" ] && args+=(-t "$t"); done <<< "$TAGS"
+          docker buildx imagetools create "${args[@]}" "$IMAGE@$DIGEST"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: cosign sign (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom-${{ matrix.image }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom-${{ matrix.image }}.spdx.json
+          push-to-registry: true
+
+  release:
+    name: GitHub Release
+    needs: [plan, artifacts, images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: dist/out
+      - name: SHA256SUMS
+        run: |
+          cp packaging/install.sh dist/out/install.sh
+          cd dist/out
+          sha256sum -- * > ../SHA256SUMS
+          mv ../SHA256SUMS SHA256SUMS
+          cat SHA256SUMS
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: cosign sign-blob SHA256SUMS (keyless bundle)
+        run: cosign sign-blob --yes --bundle dist/out/SHA256SUMS.sigstore.json dist/out/SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/out/SHA256SUMS
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          flags=()
+          [ "$PRERELEASE" = true ] && flags+=(--prerelease)
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$TAG" "${flags[@]}"
+          fi
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/out/*
+
+  homebrew:
+    name: Homebrew tap
+    needs: [plan, release]
+    if: needs.plan.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The tap push needs the token in the checkout; the job runs no third-party code after it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: 21-ci/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+          persist-credentials: true # zizmor: ignore[artipacked]
+      - name: Render and push the formulae
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p SHA256SUMS -D "$RUNNER_TEMP"
+          packaging/homebrew/render.sh "$VERSION" "$RUNNER_TEMP/SHA256SUMS" tap
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula Aliases
+          git commit -m "rt, 21ci $VERSION" -m "From $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          git push
+
+  pages:
+    name: package repositories (Pages)
+    needs: [plan, release]
+    if: needs.plan.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch docs.yml on main (rebuilds docs + apt/rpm/apk repositories)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docs.yml --ref main -R "$GITHUB_REPOSITORY"
+
+  verify:
+    name: verify the published release
+    needs: [plan, release, images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Download the release
+        run: gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D rel
+      - name: Checksums and their signature
+        working-directory: rel
+        run: |
+          set -euo pipefail
+          cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+            --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" --certificate-oidc-issuer "$CERT_OIDC_ISSUER" SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - name: Build provenance of every file
+        working-directory: rel
+        run: |
+          set -euo pipefail
+          for f in *.tar.gz *.deb *.rpm *.apk; do
+            gh attestation verify "$f" -R "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          done
+      - name: Image signatures and attestations
+        run: |
+          set -euo pipefail
+          for img in rt 21ci; do
+            ref="ghcr.io/21-ci/$img:$VERSION"
+            cosign verify "$ref" --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
+              --certificate-oidc-issuer "$CERT_OIDC_ISSUER" > /dev/null
+            gh attestation verify "oci://$ref" -R "$GITHUB_REPOSITORY"
+          done
+      - name: The installer installs the release
+        run: |
+          set -euo pipefail
+          sh rel/install.sh --version "$VERSION" --bin-dir "$RUNNER_TEMP/bin" --verify-signature
+          "$RUNNER_TEMP/bin/rt" --version
+          "$RUNNER_TEMP/bin/21ci" --version
