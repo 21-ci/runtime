@@ -346,10 +346,11 @@ impl SchedInner {
             cfg.max_queued,
             cfg.max_queued_bytes,
             o.mem.budget_bytes(),
-        ));
+        ))
+        .with_aging(cfg.aging_factor);
         let sched_metrics = o.metrics.as_deref().and_then(SchedMetrics::new);
         let seed = cfg.seed;
-        Ok(Arc::new(Self {
+        let inner = Arc::new(Self {
             cfg,
             clock: o.clock,
             mem: o.mem,
@@ -394,7 +395,11 @@ impl SchedInner {
             threads: Mutex::new(Vec::new()),
             sysmon_thread: Mutex::new(None),
             autoscale_thread: Mutex::new(None),
-        }))
+        });
+        // Executors ask how much of a service waits (`min_run_time = 0` hand-off).
+        let backlog: std::sync::Weak<dyn crate::warm::Backlog> = Arc::downgrade(&inner) as _;
+        inner.warm.set_backlog(backlog);
+        Ok(inner)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -531,4 +536,10 @@ fn initial_split(cfg: &SchedConfig, has_deno: bool, has_wasm: bool) -> (u32, u32
         deno = n - wasm;
     }
     (deno, wasm)
+}
+
+impl crate::warm::Backlog for SchedInner {
+    fn waiting(&self, service: rt_types::ServiceId) -> u32 {
+        self.admission.waiting(service)
+    }
 }

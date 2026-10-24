@@ -99,6 +99,8 @@ pub struct SchedConfig {
     pub live: LiveSchedConfig,
     /// Seed for placement / victim selection (always set so runs are reproducible when asked).
     pub seed: u64,
+    /// `k` of the admission deadline key (`sched.aging_factor`; 0 = arrival order in a tenant).
+    pub aging_factor: u32,
 }
 
 impl Default for SchedConfig {
@@ -123,6 +125,7 @@ impl Default for SchedConfig {
             build_nice: 10,
             live: LiveSchedConfig::default(),
             seed: 0x5eed,
+            aging_factor: crate::admission::DEFAULT_AGING,
         }
     }
 }
@@ -157,6 +160,7 @@ impl SchedConfig {
             build_nice: 10,
             live: LiveSchedConfig::from_config(cfg),
             seed: 0x5eed,
+            aging_factor: cfg.sched.aging_factor,
         }
     }
 
