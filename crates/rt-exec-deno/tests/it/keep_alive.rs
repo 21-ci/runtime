@@ -289,3 +289,71 @@ fn mrt_dno_09_wait_until_finishes_before_the_keep_alive_starts() {
         assert_eq!(k.kept(), 0);
     });
 }
+
+impl Ka {
+    /// The real driver's park on an idle Machine: sleep until the executor signals or its next
+    /// deadline is due (never longer than `cap`), then housekeep. Returns whether it woke.
+    async fn idle_park(&mut self, cap: Duration) -> bool {
+        let signal = self.h.exec.wake_signal().expect("the Deno executor has a wake signal");
+        let deadline = self.h.exec.next_deadline();
+        let woke = tokio::select! {
+            () = signal.notified() => true,
+            () = async { tokio::time::sleep_until(deadline.expect("guarded").into()).await }, if deadline.is_some() => true,
+            () = tokio::time::sleep(cap) => false,
+        };
+        self.h.exec.between_tasks(Duration::from_millis(50));
+        woke
+    }
+
+    /// Park like an idle Machine until `done`, at most `within`; returns the time it took.
+    async fn idle_until(&mut self, within: Duration, done: impl Fn(&Self) -> bool) -> Option<Duration> {
+        let start = tokio::time::Instant::now();
+        while !done(self) {
+            let left = within.checked_sub(start.elapsed())?;
+            if !self.idle_park(left).await && !done(self) {
+                return None;
+            }
+        }
+        Some(start.elapsed())
+    }
+}
+
+/// A kept isolate expires at its `min_run_time` although no task arrives to housekeep: the idle
+/// Machine wakes at the executor's next deadline.
+#[test]
+fn mrt_dno_10_expiry_happens_on_an_idle_machine() {
+    run_local(async {
+        let mut k = ka(Duration::from_secs(60)).await;
+        let mrt = Duration::from_millis(300);
+        assert_eq!(k.n(Some(mrt)).await, 1);
+        assert_eq!(k.kept(), 1);
+        let deadline = k.h.exec.next_deadline().expect("a kept isolate has a deadline");
+        assert!(deadline <= std::time::Instant::now() + mrt + Duration::from_millis(100));
+        let took = k
+            .idle_until(mrt + Duration::from_secs(1), |k| k.kept() == 0)
+            .await
+            .expect("expired within min_run_time + 1 s on an idle Machine");
+        assert!(
+            took + Duration::from_millis(20) >= mrt - Duration::from_millis(50),
+            "not before it: {took:?}"
+        );
+        assert_eq!(k.count("expired"), 1.0);
+        assert_eq!(k.h.exec.next_deadline(), None, "nothing else is due");
+    });
+}
+
+/// `min_run_time = 0`: the isolate queued for disposal after the answer is disposed by the idle
+/// Machine, woken by the executor's signal.
+#[test]
+fn mrt_dno_11_zero_disposes_on_an_idle_machine() {
+    run_local(async {
+        let mut k = ka(Duration::from_secs(60)).await;
+        assert_eq!(k.n(ms(0)).await, 1);
+        assert_eq!(k.kept(), 0);
+        assert_eq!(k.count("disposed"), 1.0);
+        assert_eq!(k.h.exec.dispose_backlog_len(), 1, "queued for idle-time disposal");
+        k.idle_until(Duration::from_secs(1), |k| k.h.exec.dispose_backlog_len() == 0)
+            .await
+            .expect("disposed within 1 s on an idle Machine");
+    });
+}

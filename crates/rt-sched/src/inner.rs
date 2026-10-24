@@ -191,6 +191,16 @@ impl MachineRt {
             e.between_tasks(budget);
         }
     }
+
+    /// The earliest timed housekeeping of the created executors (`Executor::next_deadline`).
+    pub fn next_deadline(&self) -> Option<std::time::Instant> {
+        self.execs.iter().flatten().filter_map(|e| e.next_deadline()).min()
+    }
+
+    /// The executors' wake signals (`Executor::wake_signal`), at most one per kind.
+    pub fn wake_signals(&self) -> Vec<Arc<tokio::sync::Notify>> {
+        self.execs.iter().flatten().filter_map(|e| e.wake_signal()).collect()
+    }
 }
 
 /// Recorded scheduling events.

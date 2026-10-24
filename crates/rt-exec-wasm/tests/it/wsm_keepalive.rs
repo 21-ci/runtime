@@ -207,3 +207,49 @@ async fn mrt_wsm_07_floor_instances_are_kept_at_zero() {
     assert_eq!(rig.exec.idle_instances(), 1, "the floor instance never expires");
     assert_eq!(rig.run(&counter, req()).await.text(), "2");
 }
+
+/// A used instance expires at its `min_run_time` although no task arrives to housekeep: the
+/// idle Machine (here, the real driver's park: the executor's signal or its next deadline) wakes
+/// for it.
+#[tokio::test]
+async fn mrt_wsm_08_expiry_happens_on_an_idle_machine() {
+    use rt_sched::Executor;
+    let metrics = Metrics::new(MetricsOptions::default()).expect("metrics");
+    let mut rig = Rig::new().metrics(metrics.clone());
+    let counter = prepared("counter");
+    let mrt = Duration::from_millis(300);
+    let req = Req::get("/")
+        .reuse()
+        .service(108)
+        .idle_ttl(Duration::from_secs(600))
+        .min_run_time_ms(300);
+    let signal = rig.exec.wake_signal().expect("the WASM executor has a wake signal");
+    assert_eq!(rig.run(&counter, req).await.text(), "1");
+    assert_eq!(rig.exec.idle_instances(), 1);
+    let deadline = rig
+        .exec
+        .next_deadline()
+        .expect("a used instance with min_run_time has a deadline");
+    assert!(deadline <= std::time::Instant::now() + mrt);
+    let start = tokio::time::Instant::now();
+    let within = mrt + Duration::from_secs(1);
+    while rig.exec.idle_instances() > 0 {
+        let left = within
+            .checked_sub(start.elapsed())
+            .expect("expired within min_run_time + 1 s on an idle Machine");
+        let deadline = rig.exec.next_deadline();
+        let woke = tokio::select! {
+            () = signal.notified() => true,
+            () = async { tokio::time::sleep_until(deadline.expect("guarded").into()).await }, if deadline.is_some() => true,
+            () = tokio::time::sleep(left) => false,
+        };
+        rig.between_tasks(BUDGET).await;
+        assert!(woke || rig.exec.idle_instances() == 0, "the idle Machine never woke");
+    }
+    assert!(
+        start.elapsed() + Duration::from_millis(50) >= mrt - Duration::from_millis(100),
+        "not before min_run_time"
+    );
+    assert_eq!(keepalive(&metrics, "expired"), 1);
+    assert_eq!(rig.exec.next_deadline(), None, "nothing else is due");
+}

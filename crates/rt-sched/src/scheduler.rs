@@ -54,6 +54,8 @@ pub(crate) trait ErasedExecutor {
     fn interrupter(&self) -> Arc<dyn Interrupter>;
     fn on_idle(&mut self, budget: Duration);
     fn between_tasks(&mut self, budget: Duration);
+    fn next_deadline(&self) -> Option<std::time::Instant>;
+    fn wake_signal(&self) -> Option<Arc<tokio::sync::Notify>>;
 }
 
 impl<E: Executor> ErasedExecutor for E {
@@ -74,6 +76,14 @@ impl<E: Executor> ErasedExecutor for E {
 
     fn between_tasks(&mut self, budget: Duration) {
         Executor::between_tasks(self, budget)
+    }
+
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        Executor::next_deadline(self)
+    }
+
+    fn wake_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Executor::wake_signal(self)
     }
 }
 
