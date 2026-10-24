@@ -56,14 +56,18 @@ fn admission_rows(s: &Value) -> Vec<(&'static str, String)> {
         if let Some(instances) = instances(adm) {
             rows.push(("Instances", instances));
         }
-        rows.push((
-            "Queue wait",
-            format!(
-                "{:.1} ms (timeouts {})",
-                adm.get("queue_wait_ms").and_then(Value::as_f64).unwrap_or(0.0),
-                num(adm, "queue_timeouts")
-            ),
-        ));
+        let mut wait = format!(
+            "{:.1} ms (timeouts {})",
+            adm.get("queue_wait_ms").and_then(Value::as_f64).unwrap_or(0.0),
+            num(adm, "queue_timeouts")
+        );
+        if let Some(p) = adm.get("pred_ms").and_then(Value::as_f64) {
+            wait.push_str(&format!(", predicted run {}", run_time(p)));
+            if let Some(b) = adm.get("pred_background_ms").and_then(Value::as_f64) {
+                wait.push_str(&format!(" (background {})", run_time(b)));
+            }
+        }
+        rows.push(("Queue wait", wait));
         let rate = adm
             .get("rps")
             .and_then(Value::as_f64)
@@ -83,6 +87,15 @@ fn admission_rows(s: &Value) -> Vec<(&'static str, String)> {
         }
     }
     rows
+}
+
+/// A predicted run time: `4.3 ms` below a second, `2.1 s` from there.
+fn run_time(ms: f64) -> String {
+    if ms < 1000.0 {
+        format!("{ms:.1} ms")
+    } else {
+        format!("{:.1} s", ms / 1000.0)
+    }
 }
 
 /// `3 running, min 2, max 64, warm target 4` (nothing when the server sends no instance fields).

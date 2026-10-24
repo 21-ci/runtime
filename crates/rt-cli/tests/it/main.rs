@@ -22,6 +22,7 @@ mod schedule_queue;
 mod sdk;
 mod service;
 mod sockets;
+mod streams;
 mod tenant_key;
 mod token;
 mod versions;

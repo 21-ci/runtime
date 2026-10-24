@@ -256,6 +256,37 @@ fn service_stats_shows_queueing_and_the_autoscaler() {
     assert_eq!(ctx.run(&["stats", "hello"]).ok().lines(), out.lines());
 }
 
+/// The "Queue wait" row adds the predicted run time of the service version (`pred_ms`) and, when
+/// the server has one, the background-lane estimate (`pred_background_ms`); `null` adds nothing.
+#[test]
+fn service_stats_shows_the_predicted_run_time() {
+    for (pred, bg, want) in [
+        (
+            json!(4.3),
+            json!(2100.0),
+            "Queue wait: 12.5 ms (timeouts 1), predicted run 4.3 ms (background 2.1 s)",
+        ),
+        (
+            json!(1500.0),
+            Value::Null,
+            "Queue wait: 12.5 ms (timeouts 1), predicted run 1.5 s",
+        ),
+        (Value::Null, json!(9.0), "Queue wait: 12.5 ms (timeouts 1)"),
+    ] {
+        let mut adm = admission();
+        adm["pred_ms"] = pred;
+        adm["pred_background_ms"] = bg;
+        let ctx = Ctx::new();
+        ctx.lookup("hello", "svc_1");
+        ctx.server.mock(|when, then| {
+            when.method(GET).path("/v1/services/svc_1/stats");
+            then.status(200).json_body(stats_with(adm));
+        });
+        let lines = ctx.run(&["service", "stats", "hello"]).ok().lines();
+        assert!(lines.contains(&want.to_string()), "missing {want:?} in {lines:?}");
+    }
+}
+
 #[test]
 fn stats_of_a_service_without_admission_state() {
     let ctx = Ctx::new();

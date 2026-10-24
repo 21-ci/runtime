@@ -317,3 +317,129 @@ fn body_only_ends_quietly_when_the_reader_closes_stdout() {
     let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(0));
 }
+
+// ---- --async -----------------------------------------------------------------------------------
+
+/// `--async` sends `Prefer: respond-async` (and the idempotency key) and prints the id of the
+/// accepted invocation, exit 0.
+#[test]
+fn invoke_async_sends_prefer_and_prints_the_id() {
+    let ctx = ctx_with_invoke();
+    let m = ctx.server.mock(|when, then| {
+        when.method(POST)
+            .path("/s/hook/run")
+            .header("prefer", "respond-async")
+            .header("idempotency-key", "k1")
+            .body("hi");
+        then.status(202)
+            .header("content-type", "application/json")
+            .header("x-rt-invocation-id", "inv_1")
+            .header("preference-applied", "respond-async")
+            .body(r#"{"id":"inv_1","state":"pending"}"#);
+    });
+    let out = ctx
+        .run(&[
+            "invoke",
+            "hook",
+            "/run",
+            "-d",
+            "hi",
+            "--async",
+            "--idempotency-key",
+            "k1",
+        ])
+        .ok();
+    m.assert();
+    assert_eq!(out.stdout, "inv_1\n");
+    assert!(!out.stderr.contains("replay"), "{}", out.stderr);
+
+    let out = ctx
+        .run(&[
+            "invoke",
+            "hook",
+            "/run",
+            "-d",
+            "hi",
+            "--async",
+            "--idempotency-key",
+            "k1",
+            "--json",
+        ])
+        .ok();
+    assert_eq!(out.json(), json!({"id": "inv_1", "state": "pending", "replay": false}));
+}
+
+/// A replay (same key, same request) prints the original id and says so; the id may come from
+/// the header alone.
+#[test]
+fn invoke_async_replay_and_the_id_header() {
+    let ctx = ctx_with_invoke();
+    let m = ctx.server.mock(|when, then| {
+        when.method(GET)
+            .path("/s/hook/")
+            .header("prefer", "respond-async")
+            .header_missing("idempotency-key");
+        then.status(202)
+            .header("x-rt-invocation-id", "inv_7")
+            .header("x-rt-idempotent-replay", "true")
+            .body("");
+    });
+    let out = ctx.run(&["invoke", "hook", "--async"]).ok();
+    m.assert();
+    assert_eq!(out.stdout, "inv_7\n");
+    assert!(out.stderr.contains("idempotent replay"), "{}", out.stderr);
+}
+
+/// A key mismatch is `409 idempotency_mismatch`: the code is printed, exit 1.
+#[test]
+fn invoke_async_409_prints_idempotency_mismatch() {
+    let ctx = ctx_with_invoke();
+    ctx.server.mock(|when, then| {
+        when.method(POST).path("/s/hook/");
+        then.status(409)
+            .header("content-type", "application/json")
+            .body(r#"{"error":{"code":"idempotency_mismatch","message":"the key was used for another request"}}"#);
+    });
+    let out = ctx
+        .run(&["invoke", "hook", "-d", "x", "--async", "--idempotency-key", "k1"])
+        .fails_with(1);
+    assert!(out.stderr.contains("idempotency_mismatch"), "{}", out.stderr);
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+}
+
+/// The other refusals print their code: 403 / 413 exit 1, 429 with Retry-After exits 4 (busy);
+/// a body without the envelope falls back to `x-rt-reason`.
+#[test]
+fn invoke_async_refusals_print_the_code() {
+    for (status, code, retry, exit) in [
+        (403, "async_not_allowed", false, 1),
+        (413, "too_large", false, 1),
+        (429, "async_backlog_full", true, 4),
+    ] {
+        let ctx = ctx_with_invoke();
+        ctx.server.mock(|when, then| {
+            when.method(GET).path("/s/hook/");
+            let t = then.status(status).header("x-rt-reason", code).body("refused");
+            if retry {
+                t.header("retry-after", "1");
+            }
+        });
+        let out = ctx.run(&["invoke", "hook", "--async"]).fails_with(exit);
+        assert!(out.stderr.contains(code), "{status}: {}", out.stderr);
+    }
+}
+
+/// A preference the service ignored (async disabled) runs synchronously: printed as usual.
+#[test]
+fn invoke_async_ignored_prints_the_sync_answer() {
+    let ctx = ctx_with_invoke();
+    ctx.server.mock(|when, then| {
+        when.method(GET).path("/s/hook/");
+        then.status(200).header("content-type", "text/plain").body("done");
+    });
+    let out = ctx.run(&["invoke", "hook", "--async"]).ok();
+    assert!(out.stdout.contains("<- HTTP 200"), "{}", out.stdout);
+    assert!(out.stdout.contains("done"), "{}", out.stdout);
+    // --idempotency-key needs --async
+    ctx.run(&["invoke", "hook", "--idempotency-key", "k"]).fails_with(2);
+}

@@ -179,6 +179,26 @@ pub enum Command {
         #[command(subcommand)]
         cmd: QueueCmd,
     },
+    /// Stream topics (persistent, replayable logs): create, inspect, append, read
+    Topic {
+        #[command(subcommand)]
+        cmd: TopicCmd,
+    },
+    /// Stream consumers of a service: cursors, lag, reset, dead letters
+    Consumer {
+        #[command(subcommand)]
+        cmd: ConsumerCmd,
+    },
+    /// Pub/sub subjects (ephemeral fan-out): publish a message
+    Pubsub {
+        #[command(subcommand)]
+        cmd: PubsubCmd,
+    },
+    /// Async invocations of a service (`invoke --async`): list, show, redrive, purge
+    Invocation {
+        #[command(subcommand)]
+        cmd: InvocationCmd,
+    },
     /// Open WebSockets of a service: list them, close one or several
     Sockets {
         #[command(subcommand)]
@@ -527,6 +547,10 @@ pub enum ServiceCmd {
         /// own storage and alarm, one event or request at a time per object
         #[arg(long)]
         durable: bool,
+        /// Keep a reused instance alive this long after it answered, for more work (500ms, 30s;
+        /// 0 = dispose right after the answer unless work waits). Sets scaling.min_run_time_ms
+        #[arg(long, value_parser = parse_duration_arg, value_name = "DURATION")]
+        min_run_time: Option<Duration>,
         /// Set a field of a config block (repeatable): limits.cpu_ms=500, scaling.max_queued=100,
         /// triggers.cron=false, ingress.allowed_methods='["GET"]', egress.allowed_hosts='["api.x.com"]',
         /// ws.warm=false. The value is JSON when it parses as JSON, else a string
@@ -574,6 +598,10 @@ pub enum ServiceCmd {
         /// Make the service durable or not (true | false)
         #[arg(long, value_name = "BOOL")]
         durable: Option<bool>,
+        /// Keep a reused instance alive this long after it answered (0 = dispose unless work
+        /// waits); `--unset scaling.min_run_time_ms` goes back to inherit
+        #[arg(long, value_parser = parse_duration_arg, value_name = "DURATION")]
+        min_run_time: Option<Duration>,
         /// Set a field of a config block (repeatable), merged into the current block:
         /// limits.cpu_ms=500, scaling.max_queued=100, triggers.http=false, ingress.rate_limit.rps=50,
         /// ws.allowed_origins='["https://app.example"]'
@@ -1097,6 +1125,205 @@ pub enum QueueCmd {
     },
 }
 
+// ---- topics, consumers, pub/sub, invocations ------------------------------------------------
+
+/// `--project` / `--env`: the namespace a topic name (or a subject) resolves in.
+#[derive(Args, Debug, Clone, Default)]
+pub struct NsArgs {
+    /// Project: slug or prj_… id (default: default)
+    #[arg(long, value_name = "PROJECT")]
+    pub project: Option<String>,
+    /// Environment of the project (default: production)
+    #[arg(long = "env", value_name = "ENV")]
+    pub environment: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TopicCmd {
+    /// Create a topic
+    Create {
+        /// [a-z0-9][a-z0-9._-]{0,62}, not starting with tpc_
+        name: String,
+        #[command(flatten)]
+        ns: NsArgs,
+        /// Partitions (default 1; at most the plan's)
+        #[arg(long, value_name = "N")]
+        partitions: Option<u32>,
+        /// How long records are kept, in whole hours: 24h, 7d (default 24h)
+        #[arg(long, value_parser = parse_duration_arg, value_name = "DURATION")]
+        retention: Option<Duration>,
+        /// Size cap in MiB, oldest records go first (0 = only the plan's cap)
+        #[arg(long, value_name = "M")]
+        max_mb: Option<u64>,
+    },
+    /// List topics
+    List {
+        #[command(flatten)]
+        ns: NsArgs,
+    },
+    /// Show a topic: partitions, heads, consumers
+    Get {
+        /// Topic name or tpc_… id
+        topic: String,
+        #[command(flatten)]
+        ns: NsArgs,
+    },
+    /// Change the retention or the size cap of a topic
+    Update {
+        /// Topic name or tpc_… id
+        topic: String,
+        #[command(flatten)]
+        ns: NsArgs,
+        /// How long records are kept, in whole hours
+        #[arg(long, value_parser = parse_duration_arg, value_name = "DURATION")]
+        retention: Option<Duration>,
+        /// Size cap in MiB (0 = only the plan's cap)
+        #[arg(long, value_name = "M")]
+        max_mb: Option<u64>,
+    },
+    /// Delete a topic with its records, cursors and dead letters
+    #[command(alias = "rm")]
+    Delete {
+        /// Topic name or tpc_… id
+        topic: String,
+        #[command(flatten)]
+        ns: NsArgs,
+        /// Do not ask (required when stdin is not a terminal)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Append one record
+    Append {
+        /// Topic name or tpc_… id
+        topic: String,
+        #[command(flatten)]
+        ns: NsArgs,
+        /// JSON body, `@file`, or `-` for stdin
+        #[arg(long, value_name = "JSON")]
+        body: String,
+        /// Partition key (records with the same key keep their order)
+        #[arg(long, value_name = "K")]
+        key: Option<String>,
+        /// Record header NAME=VALUE (repeatable)
+        #[arg(long = "header", value_name = "NAME=VALUE")]
+        headers: Vec<String>,
+        /// De-duplication id
+        #[arg(long, value_name = "ID")]
+        dedup: Option<String>,
+    },
+    /// Read records of one partition
+    Read {
+        /// Topic name or tpc_… id
+        topic: String,
+        #[command(flatten)]
+        ns: NsArgs,
+        /// Partition (required when the topic has more than one)
+        #[arg(long, value_name = "N")]
+        partition: Option<u32>,
+        /// Start at this offset, or earliest | latest
+        #[arg(long, value_name = "OFFSET")]
+        from: Option<String>,
+        /// Start at the first record at or after this RFC 3339 time
+        #[arg(long, value_name = "RFC3339", conflicts_with = "from")]
+        from_time: Option<String>,
+        /// Most records to return (default 100)
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConsumerCmd {
+    /// The stream consumers of a service: cursor, lag and state per partition
+    #[command(alias = "ls")]
+    List(SvcArg),
+    /// Move a consumer's cursor (also unblocks a blocked partition)
+    Reset {
+        /// Service slug or svc_… id
+        #[arg(value_name = "SVC")]
+        svc: String,
+        topic: String,
+        group: String,
+        /// earliest | latest | an offset | an RFC 3339 time
+        #[arg(long, value_name = "WHERE")]
+        to: String,
+        /// Only this partition (default: all)
+        #[arg(long, value_name = "N")]
+        partition: Option<u32>,
+    },
+    /// Dead letters of a consumer
+    Dlq {
+        #[command(subcommand)]
+        cmd: ConsumerDlqCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConsumerDlqCmd {
+    /// List the dead letters
+    List {
+        /// Service slug or svc_… id
+        #[arg(value_name = "SVC")]
+        svc: String,
+        topic: String,
+        group: String,
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
+    /// Delete every dead letter
+    Purge {
+        /// Service slug or svc_… id
+        #[arg(value_name = "SVC")]
+        svc: String,
+        topic: String,
+        group: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PubsubCmd {
+    /// Publish a message to a subject: every subscriber (one per group) gets it, at most once
+    Publish {
+        /// Subject, e.g. orders.eu.created
+        subject: String,
+        /// JSON body, `@file`, or `-` for stdin
+        #[arg(long, value_name = "JSON")]
+        body: String,
+        /// Message header NAME=VALUE (repeatable)
+        #[arg(long = "header", value_name = "NAME=VALUE")]
+        headers: Vec<String>,
+        #[command(flatten)]
+        ns: NsArgs,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum InvocationCmd {
+    /// Async invocations of a service, newest first, with the pending / failed counts
+    #[command(alias = "ls")]
+    List {
+        /// Service slug or svc_… id
+        #[arg(value_name = "SVC")]
+        svc: String,
+        #[arg(long, value_parser = ["pending", "succeeded", "failed"])]
+        state: Option<String>,
+        #[command(flatten)]
+        page: ListArgs,
+    },
+    /// Show one invocation (never its headers or body)
+    Get {
+        /// Service slug or svc_… id
+        #[arg(value_name = "SVC")]
+        svc: String,
+        /// inv_… id
+        id: String,
+    },
+    /// Move every failed invocation back to pending
+    Redrive(SvcArg),
+    /// Delete every failed invocation
+    Purge(SvcArg),
+}
+
 // ---- observability ---------------------------------------------------------------------------
 
 #[derive(Args, Debug)]
@@ -1176,6 +1403,13 @@ pub struct InvokeArgs {
     /// Print only the response body
     #[arg(long)]
     pub body_only: bool,
+    /// Run asynchronously (sends `Prefer: respond-async`): prints the inv_… id of the accepted
+    /// invocation; a refusal prints its code
+    #[arg(long = "async", conflicts_with = "body_only")]
+    pub async_: bool,
+    /// Idempotency-Key of an async invocation: the same key returns the same id
+    #[arg(long, value_name = "KEY", requires = "async_")]
+    pub idempotency_key: Option<String>,
 }
 
 // ---- node and misc ---------------------------------------------------------------------------

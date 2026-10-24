@@ -11,7 +11,7 @@ use crate::error::{CliError, Result};
 use crate::fmt;
 
 /// `--body`: JSON text, `@file`, or `-` (stdin).
-fn read_body(arg: &str) -> Result<Value> {
+pub(crate) fn read_body(arg: &str) -> Result<Value> {
     let text = if arg == "-" {
         let mut s = String::new();
         std::io::stdin()
