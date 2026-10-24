@@ -1157,3 +1157,68 @@ async fn one_off_schedules_are_listed_on_their_own_paged_route() {
     node.shutdown().await;
 }
 }
+
+node_test! {
+/// mrt_api_05: the effective view shows `min_run_time_ms` with its source: `service` when the owner
+/// set it, and `default` (the executor's idle TTL applies) when it is unset.
+async fn mrt_api_05_effective_shows_min_run_time_and_its_source() {
+    let node = start_node().await;
+    let t = new_tenant(&node, "pro").await;
+    let created = post(
+        &node,
+        &t.key,
+        "/v1/services",
+        json!({"slug": uniq("mrt05"), "runtime": "deno", "scaling": {"min_run_time_ms": 5000}}),
+    )
+    .await;
+    assert_eq!(created.s(), 201, "{}", created.text);
+    assert_eq!(
+        created.json["effective"]["min_run_time_ms"],
+        json!({"value": 5000, "source": "service"}),
+        "{}",
+        created.text
+    );
+    let svc = created.json["id"].as_str().expect("id").to_string();
+
+    // a PATCH replaces the scaling block: without `min_run_time_ms` the keep-alive is inherited
+    let unset = patch(&node, &t.key, &format!("/v1/services/{svc}"), json!({"scaling": {"max_instances": 3}})).await;
+    assert_eq!(unset.s(), 200, "{}", unset.text);
+    assert_eq!(
+        unset.json["effective"]["min_run_time_ms"],
+        json!({"value": null, "source": "default"}),
+        "{}",
+        unset.text
+    );
+    let view = get(&node, &t.key, &format!("/v1/services/{svc}")).await;
+    assert_eq!(view.json["effective"]["min_run_time_ms"]["source"], json!("default"), "{}", view.text);
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// fair_api_01: the service stats report the predicted slot time. After a few HTTP tasks,
+/// `admission.pred_ms` is a number near the handler's run time, and `pred_background_ms` is present
+/// (`null` while the service has run no background task).
+async fn fair_api_01_stats_report_the_predicted_run_time() {
+    let node = start_node().await;
+    let t = new_tenant(&node, "pro").await;
+    let slug = uniq("fair01");
+    let created = post(&node, &t.key, "/v1/services", json!({"slug": slug, "runtime": "deno"})).await;
+    assert_eq!(created.s(), 201, "{}", created.text);
+    let svc = created.json["id"].as_str().expect("id").to_string();
+    let up = upload_ts(&node, &t.key, &svc, &guests::slow(1, 200), "activate=1").await;
+    assert_eq!(up.s(), 201, "{}", up.text);
+    for _ in 0..3 {
+        assert_eq!(invoke(&node, &slug, "/").await.s(), 200);
+    }
+
+    let stats = get(&node, &t.key, &format!("/v1/services/{svc}/stats?window=5m")).await;
+    assert_eq!(stats.s(), 200, "{}", stats.text);
+    let adm = &stats.json["admission"];
+    let pred = adm["pred_ms"].as_f64().unwrap_or_else(|| panic!("pred_ms is a number after samples: {}", stats.text));
+    assert!(pred >= 100.0 && pred < 5_000.0, "a 200 ms handler predicts about 200 ms, got {pred}: {}", stats.text);
+    assert!(adm.get("pred_background_ms").is_some(), "the field is always present: {}", stats.text);
+    assert_eq!(adm["pred_background_ms"], Value::Null, "no background task ran: {}", stats.text);
+    node.shutdown().await;
+}
+}

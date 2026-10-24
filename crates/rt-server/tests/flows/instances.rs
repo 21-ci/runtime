@@ -277,3 +277,59 @@ async fn a_tenant_above_its_warm_floor_cap_keeps_only_the_floors_that_fit() {
     node.shutdown().await;
 }
 }
+
+node_test! {
+/// mrt_flow_01: with `min_run_time_ms = 0` and no work waiting, the isolate is gone once the answer
+/// has been sent, so the next request on an idle service sees fresh module state. The control
+/// service has the same source and `min_run_time_ms` unset: its isolate is kept and the module
+/// counter carries on. Both services reuse isolates (`deno.reuse_isolates`), so only the keep-alive
+/// setting differs.
+async fn mrt_flow_01_zero_min_run_time_gives_fresh_module_state_when_idle() {
+    let node = start_node().await;
+    let t = new_tenant(&node, "pro").await;
+    let src = r#"
+let n = 0;
+export default function (): Response { n += 1; return new Response("n" + n); }
+"#;
+    let mut svcs = Vec::new();
+    for (tag, scaling) in [("mrt01z", json!({"min_run_time_ms": 0})), ("mrt01k", json!({}))] {
+        let slug = uniq(tag);
+        let created = post(
+            &node,
+            &t.key,
+            "/v1/services",
+            json!({"slug": slug, "runtime": "deno", "deno": {"reuse_isolates": true}, "scaling": scaling}),
+        )
+        .await;
+        assert_eq!(created.s(), 201, "{}", created.text);
+        let svc = created.json["id"].as_str().expect("id").to_string();
+        let up = upload_ts(&node, &t.key, &svc, src, "activate=1").await;
+        assert_eq!(up.s(), 201, "{}", up.text);
+        svcs.push(slug);
+    }
+    let (zero_slug, kept_slug) = (&svcs[0], &svcs[1]);
+
+    for slug in [zero_slug, kept_slug] {
+        let first = invoke(&node, slug, "/").await;
+        assert_eq!((first.s(), first.text.as_str()), (200, "n1"), "{slug}: {}", first.text);
+    }
+    // wait for the disposal the keep-alive metric reports, not for a fixed delay
+    let (client, metrics) = (node.http().clone(), node.metrics_url("/metrics"));
+    eventually(Duration::from_secs(10), "the zero service is disposed after its answer", || {
+        let (client, metrics) = (client.clone(), metrics.clone());
+        async move {
+            let text = send(client.get(metrics)).await.text;
+            metric_values(&text, "rt_instance_keepalive_total")
+                .iter()
+                .any(|(series, v)| series.contains("kind=\"deno\",outcome=\"disposed\"") && *v >= 1.0)
+        }
+    })
+    .await;
+
+    let fresh = invoke(&node, zero_slug, "/").await;
+    assert_eq!((fresh.s(), fresh.text.as_str()), (200, "n1"), "min_run_time 0 starts fresh when idle: {}", fresh.text);
+    let carried = invoke(&node, kept_slug, "/").await;
+    assert_eq!((carried.s(), carried.text.as_str()), (200, "n2"), "without the setting the isolate is kept: {}", carried.text);
+    node.shutdown().await;
+}
+}
