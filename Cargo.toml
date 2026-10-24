@@ -132,7 +132,7 @@ chrono-tz = "0.10.4"
 aes-gcm = "0.10.3"
 hmac = "0.12.1"
 sha2 = "0.10.9"
-hkdf = "0.12.4"
+hkdf = "0.13.0"
 rand = "0.8.5"
 zeroize = { version = "1.8.2", features = ["derive"] }
 subtle = "2.6.1"
