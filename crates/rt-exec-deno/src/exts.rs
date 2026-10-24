@@ -29,6 +29,9 @@ use crate::ops_durable::{
     op_rt_alarm_get, op_rt_alarm_set, op_rt_storage_delete, op_rt_storage_delete_all, op_rt_storage_get,
     op_rt_storage_list, op_rt_storage_put,
 };
+use crate::ops_events::{
+    op_rt_pubsub_publish, op_rt_pubsub_request, op_rt_stream_append, op_rt_stream_info, op_rt_stream_read,
+};
 use crate::ops_sqlite::{
     op_rt_sqlite_exec, op_rt_sqlite_in_tx, op_rt_sqlite_open, op_rt_sqlite_prepare, op_rt_sqlite_run, op_rt_sqlite_tx,
 };
@@ -127,6 +130,11 @@ deno_core::extension!(
         op_rt_ws_client_send,
         op_rt_ws_client_recv,
         op_rt_ws_client_close,
+        op_rt_pubsub_publish,
+        op_rt_pubsub_request,
+        op_rt_stream_append,
+        op_rt_stream_read,
+        op_rt_stream_info,
     ],
 );
 

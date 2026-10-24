@@ -449,3 +449,14 @@ fn a_relative_specifier_from_a_referrer_with_another_scheme_is_unsupported() {
     let err = resolver(default_cfg()).resolve("./x.js", &url("foo:/bar")).unwrap_err();
     assert!(matches!(err, ResolveError::Unsupported(_)), "{err:?}");
 }
+
+/// `std:pubsub` and `std:stream` are built-ins served by the executor, never bundled.
+#[test]
+fn std_pubsub_and_std_stream_are_builtin() {
+    let r = resolver(default_cfg());
+    for m in ["std:pubsub", "std:stream"] {
+        assert!(BUILTIN_MODULES.contains(&m), "{m} missing from BUILTIN_MODULES");
+        assert_eq!(classify_specifier(m), SpecifierKind::Builtin);
+        assert_eq!(r.resolve(m, &main_url()), Ok(Resolved::Builtin(m.to_string())));
+    }
+}

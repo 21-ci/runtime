@@ -15,6 +15,8 @@ pub const RT_LOCK_JS: &str = include_str!("../../../js/rt_lock.js");
 pub const RT_SCHEDULE_JS: &str = include_str!("../../../js/rt_schedule.js");
 pub const RT_DURABLE_JS: &str = include_str!("../../../js/rt_durable.js");
 pub const RT_SOCKETS_JS: &str = include_str!("../../../js/rt_sockets.js");
+pub const RT_PUBSUB_JS: &str = include_str!("../../../js/rt_pubsub.js");
+pub const RT_STREAM_JS: &str = include_str!("../../../js/rt_stream.js");
 pub const RT_SDK_JS: &str = include_str!("../../../js/rt_sdk.js");
 pub const RT_SDK_SERVER_JS: &str = include_str!("../../../js/rt_sdk_server.js");
 
@@ -32,6 +34,8 @@ pub const RT_MODULES: &[(&str, &str)] = &[
     ("std:blob", RT_BLOB_JS),
     ("std:queue", RT_QUEUE_JS),
     ("std:services", RT_SERVICES_JS),
+    ("std:pubsub", RT_PUBSUB_JS),
+    ("std:stream", RT_STREAM_JS),
     ("std:platform", RT_PLATFORM_JS),
     ("std:sdk", RT_SDK_JS),
     ("std:sdk/server", RT_SDK_SERVER_JS),

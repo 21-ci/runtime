@@ -69,6 +69,8 @@ pub const BUILTIN_MODULES: &[&str] = &[
     "std:blob",
     "std:queue",
     "std:services",
+    "std:pubsub",
+    "std:stream",
     "std:platform",
     "std:log",
     "std:secrets",

@@ -377,6 +377,11 @@ impl Harness {
         Self::build(cfg, LoopbackEgress::new(&[]), None, |_| {}, |_| {})
     }
 
+    /// With the node-wide host services adjusted by `f` (e.g. the event buses attached).
+    pub fn with_services(cfg: DenoExecutorConfig, f: impl FnOnce(HostServices) -> HostServices) -> Self {
+        Self::build_full(cfg, LoopbackEgress::new(&[]), None, |_| {}, |_| {}, f)
+    }
+
     pub fn with_egress(cfg: DenoExecutorConfig, egress: Arc<dyn EgressGuard>) -> Self {
         Self::build(cfg, egress, None, |_| {}, |_| {})
     }
@@ -403,6 +408,17 @@ impl Harness {
         adjust_data: impl FnOnce(&mut DataConfig),
         adjust_deps: impl FnOnce(&mut HostDeps),
     ) -> Self {
+        Self::build_full(cfg, egress, metrics, adjust_data, adjust_deps, |s| s)
+    }
+
+    fn build_full(
+        cfg: DenoExecutorConfig,
+        egress: Arc<dyn EgressGuard>,
+        metrics: Option<Arc<Metrics>>,
+        adjust_data: impl FnOnce(&mut DataConfig),
+        adjust_deps: impl FnOnce(&mut HostDeps),
+        adjust_services: impl FnOnce(HostServices) -> HostServices,
+    ) -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
         let gov = TestGovernor::with_mb(512);
         let logs = MemoryLogSink::new();
@@ -426,7 +442,7 @@ impl Harness {
         };
         adjust_deps(&mut deps);
         let engine_fp = engine_fingerprint(&cfg.v8_flags);
-        let mut exec = DenoExecutor::new(cfg.clone(), HostServices::new(deps));
+        let mut exec = DenoExecutor::new(cfg.clone(), adjust_services(HostServices::new(deps)));
         if let Some(m) = &metrics {
             exec = exec.with_metrics(m.clone());
         }
@@ -680,4 +696,210 @@ impl rt_sched::Backlog for TestBacklog {
     fn waiting(&self, _service: ServiceId) -> u32 {
         self.0.load(std::sync::atomic::Ordering::SeqCst)
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Event bus fakes (`std:pubsub`, `std:stream`)
+// ---------------------------------------------------------------------------------------------
+
+/// One recorded publish or request: `(subject, body, headers, publisher depth)`.
+pub type PubsubCall = (String, Bytes, Vec<(String, String)>, u8);
+
+/// A pub/sub router stand-in. `publish` records the call and answers `{receivers: 2, dropped:
+/// 1}`; `request` answers by subject: `r.json`, `r.text`, `r.bytes`, `r.empty`, `r.none`
+/// (`no_responders`), `r.slow` (never answers), anything else echoes the body as JSON.
+#[derive(Default)]
+pub struct FakePubsub {
+    /// `(subject, body, headers, publisher depth)` of every publish and request.
+    pub calls: Mutex<Vec<PubsubCall>>,
+    /// The timeout each request was given by the handle.
+    pub timeouts: Mutex<Vec<Option<Duration>>>,
+}
+
+#[async_trait]
+impl rt_host::PubsubBus for FakePubsub {
+    async fn publish(
+        &self,
+        from: &TaskCtx,
+        subject: &str,
+        body: Bytes,
+        o: rt_host::PublishOpts,
+    ) -> Result<rt_host::PublishOut, rt_host::HostError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((subject.to_string(), body, o.headers, from.depth));
+        Ok(rt_host::PublishOut {
+            receivers: 2,
+            dropped: 1,
+        })
+    }
+
+    async fn request(
+        &self,
+        from: &TaskCtx,
+        subject: &str,
+        body: Bytes,
+        o: rt_host::RequestOpts,
+    ) -> Result<rt_host::Reply, rt_host::HostError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((subject.to_string(), body.clone(), o.headers, from.depth));
+        self.timeouts.lock().unwrap().push(o.timeout);
+        let reply = |ct: Option<&str>, b: &'static [u8]| rt_host::Reply {
+            content_type: ct.map(str::to_string),
+            body: Bytes::from_static(b),
+        };
+        Ok(match subject {
+            "r.json" => reply(Some("application/json"), br#"{"ok":true}"#),
+            "r.text" => reply(Some("text/plain; charset=utf-8"), b"hi"),
+            "r.bytes" => reply(Some("application/octet-stream"), b"\x01\x02"),
+            "r.empty" => reply(None, b""),
+            "r.none" => return Err(rt_host::HostError::new("no_responders", "nothing subscribes")),
+            "r.slow" => {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            _ => rt_host::Reply {
+                content_type: Some("application/json".into()),
+                body,
+            },
+        })
+    }
+}
+
+/// An in-memory stream log: topic `events` has 1 partition, `multi` has 3, every other name is
+/// `not_found`. Keys pick partition `len(key) % partitions`, no key partition 0.
+#[derive(Default)]
+pub struct FakeStreams {
+    pub records: Mutex<HashMap<String, Vec<rt_types::events::StreamRecord>>>,
+}
+
+impl FakeStreams {
+    fn partitions(topic: &str) -> Result<u32, rt_host::HostError> {
+        match topic {
+            "events" => Ok(1),
+            "multi" => Ok(3),
+            _ => Err(rt_host::HostError::new("not_found", "no such topic")),
+        }
+    }
+}
+
+#[async_trait]
+impl rt_host::StreamBus for FakeStreams {
+    async fn append(
+        &self,
+        _from: &TaskCtx,
+        topic: &str,
+        entries: Vec<rt_host::AppendEntry>,
+    ) -> Result<Vec<rt_host::AppendedOut>, rt_host::HostError> {
+        let n = Self::partitions(topic)?;
+        let mut all = self.records.lock().unwrap();
+        let recs = all.entry(topic.to_string()).or_default();
+        let mut out = Vec::new();
+        for e in entries {
+            if let Some(d) = &e.dedup_id {
+                if let Some(r) = recs
+                    .iter()
+                    .find(|r| r.headers.iter().any(|(k, v)| k == "dedup" && v == d))
+                {
+                    out.push(rt_host::AppendedOut {
+                        partition: r.partition,
+                        offset: r.offset,
+                        duplicate: true,
+                    });
+                    continue;
+                }
+            }
+            let partition = e.key.as_ref().map_or(0, |k| k.len() as u32 % n);
+            let offset = recs.iter().filter(|r| r.partition == partition).count() as u64;
+            let mut headers = e.headers;
+            if let Some(d) = e.dedup_id {
+                headers.push(("dedup".into(), d));
+            }
+            recs.push(rt_types::events::StreamRecord {
+                partition,
+                offset,
+                key: e.key,
+                headers,
+                body: e.body,
+                ts_ms: 1_000 + offset as i64,
+            });
+            out.push(rt_host::AppendedOut {
+                partition,
+                offset,
+                duplicate: false,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn read(
+        &self,
+        _from: &TaskCtx,
+        topic: &str,
+        o: rt_host::ReadOpts,
+    ) -> Result<rt_host::ReadPage, rt_host::HostError> {
+        let n = Self::partitions(topic)?;
+        let partition = match o.partition {
+            None if n > 1 => {
+                return Err(rt_host::HostError::new(
+                    "validation_failed",
+                    format!("topic `{topic}` has {n} partitions: pass `partition`"),
+                ))
+            }
+            None => 0,
+            Some(p) if p >= n => {
+                return Err(rt_host::HostError::new(
+                    "validation_failed",
+                    "partition is out of range",
+                ))
+            }
+            Some(p) => p,
+        };
+        let all = self.records.lock().unwrap();
+        let recs: Vec<_> = all
+            .get(topic)
+            .map(|v| v.iter().filter(|r| r.partition == partition).cloned().collect())
+            .unwrap_or_default();
+        let end = recs.len() as u64;
+        let from = match o.start {
+            rt_host::ReadStart::Earliest => 0,
+            rt_host::ReadStart::Latest => end,
+            rt_host::ReadStart::Offset(x) => x,
+            rt_host::ReadStart::TimeMs(t) => recs.iter().find(|r| r.ts_ms >= t).map_or(end, |r| r.offset),
+        };
+        let records: Vec<_> = recs
+            .into_iter()
+            .filter(|r| r.offset >= from)
+            .take(o.limit as usize)
+            .collect();
+        let next = records.last().map_or(from.min(end), |r| r.offset + 1);
+        Ok(rt_host::ReadPage { records, next, end })
+    }
+
+    async fn info(&self, _from: &TaskCtx, topic: &str) -> Result<rt_host::TopicInfo, rt_host::HostError> {
+        let n = Self::partitions(topic)?;
+        let all = self.records.lock().unwrap();
+        let recs = all.get(topic).cloned().unwrap_or_default();
+        Ok(rt_host::TopicInfo {
+            name: topic.to_string(),
+            partitions: (0..n)
+                .map(|p| (p, 0, recs.iter().filter(|r| r.partition == p).count() as u64))
+                .collect(),
+            retention_hours: 24,
+            max_mb: 0,
+            bytes: recs.iter().map(|r| r.body.len() as u64).sum(),
+        })
+    }
+}
+
+/// A harness with both fake buses attached.
+pub fn event_harness() -> (Harness, Arc<FakePubsub>, Arc<FakeStreams>) {
+    let ps = Arc::new(FakePubsub::default());
+    let st = Arc::new(FakeStreams::default());
+    let (p2, s2) = (ps.clone(), st.clone());
+    let h = Harness::with_services(cfg0(), move |s| s.with_pubsub(p2).with_streams(s2));
+    (h, ps, st)
 }
