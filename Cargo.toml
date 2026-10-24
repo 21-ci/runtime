@@ -12,6 +12,7 @@ members = [
   "crates/rt-cache",
   "crates/rt-host",
   "crates/rt-build",
+  "crates/rt-exec-deno",
 ]
 
 [workspace.package]

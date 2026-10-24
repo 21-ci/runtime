@@ -1,0 +1,69 @@
+[package]
+name = "rt-exec-deno"
+description = "Deno executor: isolate per task, extensions, ops, limits (L4)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rt-types.workspace = true
+rt-mem.workspace = true
+rt-obs.workspace = true
+rt-sched.workspace = true
+rt-cache.workspace = true
+rt-config.workspace = true
+rt-sec.workspace = true
+rt-host.workspace = true
+rt-build.workspace = true
+rt-store.workspace = true
+deno_core.workspace = true
+deno_webidl.workspace = true
+deno_web.workspace = true
+deno_fetch.workspace = true
+deno_crypto.workspace = true
+deno_error.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+futures-util.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+http.workspace = true
+libc.workspace = true
+zeroize.workspace = true
+# `deno_web::BlobStoreTrait` names part ids by `uuid::Uuid` (memory.rs `CountedBlobStore`); the
+# version deno_web already pulls in.
+uuid = "1"
+
+# build.rs creates the base V8 snapshot (the deno_* JS lives on disk in the registry, the binary
+# must not read it at runtime). Same crates and features as [dependencies] so builds are shared.
+[build-dependencies]
+deno_core.workspace = true
+deno_webidl.workspace = true
+deno_web.workspace = true
+deno_fetch.workspace = true
+deno_crypto.workspace = true
+
+[dev-dependencies]
+rt-testkit.workspace = true
+tokio-tungstenite.workspace = true
+rt-store.workspace = true
+http.workspace = true
+url.workspace = true
+zeroize.workspace = true
+zip.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
