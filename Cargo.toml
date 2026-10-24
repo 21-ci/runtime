@@ -3,11 +3,10 @@ resolver = "2"
 members = [
   "crates/rt-types",
   "crates/rt-config",
-  "crates/rt-obs",
   "crates/rt-mem",
+  "crates/rt-obs",
   "crates/rt-sec",
   "crates/rt-sched",
-  "crates/rt-testkit",
   "crates/rt-store",
   "crates/rt-cache",
   "crates/rt-host",
@@ -17,6 +16,7 @@ members = [
   "crates/rt-triggers",
   "crates/rt-api",
   "crates/rt-server",
+  "crates/rt-testkit",
   "crates/rt-cli",
 ]
 
