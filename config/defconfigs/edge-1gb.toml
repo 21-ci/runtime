@@ -1,0 +1,188 @@
+# Edge 1GB profile - minimal resource deployment
+# Optimized for 1 vCPU / 1 GB RAM edge devices
+# Based on balanced profile but heavily resource-constrained
+
+[node]
+data_dir = "/data"
+default_profile = "balanced"
+
+[listeners]
+public = "0.0.0.0:8080"
+internal = "unix:/data/rt.sock"
+control = "127.0.0.1:8081"
+metrics = "127.0.0.1:9090"
+internal_allowed_uids = []      # UIDs besides the node's own allowed on the internal socket
+allow_tcp_internal = false      # a TCP internal listener needs this opt-in (no UID check)
+
+[routing]
+base_domain = ""
+
+[hosts]
+pending_ttl = "7d"              # Unverified custom-host claims expire
+verify_dns = true               # Activate claims whose _rt-verify TXT matches
+verify_interval = "60s"
+max_pending_per_tenant = 10     # Pending claims per tenant
+
+[sched]
+processors = 1                  # Force 1 processor
+spare_machines = 0
+lrq_capacity = 64
+max_inflight = 1000             # Reduced from 10000
+max_queued = 0                  # auto: 4 x max_inflight; over it 503 overloaded
+max_queued_mb = 0               # auto: 1/16 of the memory budget
+spin_us = 0
+time_slice = "20ms"
+pin_threads = false
+handoff_on_hog = false
+queue_timeout = "5s"
+warm_share = 0.15               # memory share for autoscaler warm instances
+
+[sched.kinds.deno]
+min = 1
+max = 1                         # Only 1 deno processor
+
+[sched.kinds.wasm]
+min = 0
+max = 1                         # Only 1 wasm processor (share deno)
+
+[sysmon]
+max_tick = "20ms"
+
+[rebalance]
+interval = "250ms"
+up_threshold = 2.0
+cooldown = "1s"
+
+[io]
+threads = 1                     # Minimal I/O threads
+
+[blocking]
+threads = 1                     # Minimal blocking threads
+
+[memory]
+budget_mb = 768                 # 768 MB for runtime
+check_interval = "500ms"        # Less frequent checks
+high = 0.85
+critical = 0.95
+purge_min_interval = "5s"
+
+[cache]
+t2_max_mb = 128                 # Very small T2 cache
+t1_share = 0.10
+idle_ttl = "120s"               # Short TTL
+preload = false
+preload_top_n = 100
+
+[disk]
+low_free_mb = 256
+high_free_mb = 512
+
+[deno]
+isolate_base_mb = 2             # Reduced from 4
+v8_platform_threads = 1
+dispose_backlog = 4             # Reduced from 8
+v8_flags = ["--single-threaded-gc", "--max-old-space-size=256"]
+max_bound_per_m = 4             # Very few isolates
+isolate_pool_per_p = 0
+reuse_isolates = false
+reuse_max_idle = 4
+reuse_max_idle_total = 16
+reuse_idle_ttl = "60s"
+reuse_max_uses = 1000
+
+[wasm]
+fuel = false
+reuse_max_idle = 2              # Reduced from 8
+linear_memory_keep_resident = 0
+reuse_instances = false
+max_unused_warm_slots = 0
+
+[build]
+threads = 1
+memory_mb = 128                 # Reduced from 256
+timeout = "120s"                # Longer timeout for slow device
+wasm_timeout = "120s"
+fetch_timeout = "30s"
+npm_cdn = "https://esm.sh"
+allowed_hosts = ["esm.sh"]      # Minimal hosts
+max_deps_mb = 25                # Reduced from 50
+compile = "lazy"
+
+[deploy]
+retain_versions = 3             # Keep fewer versions
+auto_rollback = true
+
+[storage]
+blob_backend = "local"
+max_open_dbs = 64               # Reduced from 256
+readers_per_db = 2
+sql_cache_mb = 64
+blob_cache_mb = 64              # Reduced from 512
+sql_budget_ms = 500             # Reduced from 1000
+
+[s3]
+endpoint = ""
+bucket = ""
+prefix = "rt"
+region = "us-east-1"
+
+[security]
+seccomp = false                 # Disable for performance on edge
+clock = "coarse"                # Coarse clock for edge
+require_v8_sandbox = false  # MVP images ship prebuilt V8 (no sandbox); true once the custom V8 build lands
+reserved_hosts = []
+master_key_file = ""
+
+[supervisor]
+reserve_mb = 20
+executor_restart_backoff = ["500ms", "2s", "10s"]
+
+[secrets]
+cache_ttl = "300s"              # Longer cache TTL
+max_services_per_min = 50
+
+[ingress]
+trusted_proxies = []
+header_timeout = "20s"
+idle_timeout = "120s"
+max_conns_per_ip = 64           # Reduced from 256
+h2_max_streams = 10             # Reduced from 100
+sse_streams_per_key = 2         # Reduced from 10
+backlog = 4096
+
+[egress]
+denied_ports = [25, 465, 587]
+denied_hosts = []
+denied_cidrs = []
+allow_https_downgrade = false
+
+[queue]
+batch_size = 5
+max_attempts = 3
+max_concurrency = 4
+
+[ws]
+max_sockets = 20000
+ping_interval = "30s"
+send_buffer_kb = 1024
+inbox_max = 1024
+max_event_attempts = 3
+max_alarm_attempts = 6
+msgs_per_sec = 50
+msgs_burst = 200
+flood_close_after = "10s"
+drain_grace = "5s"
+
+[logs]
+ring_lines = 500                # Reduced from 1000
+retention_days = 3              # Reduced from 7
+max_mb_per_service = 10         # Reduced from 50
+stdout = false
+
+[metrics]
+per_service = false
+per_service_top_n = 10          # Reduced from 100
+
+[otel]
+endpoint = ""
+sample_ratio = 0.001            # Minimal sampling

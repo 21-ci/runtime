@@ -1,0 +1,1432 @@
+{
+  "node": {
+    "help": "Node-level configuration",
+    "keys": {
+      "data_dir": {
+        "type": "string",
+        "default": "/data",
+        "help": "Runtime data directory for caches and logs",
+        "profile_scoped": false
+      },
+      "default_profile": {
+        "type": "enum",
+        "enum": [
+          "max_density",
+          "balanced",
+          "min_latency"
+        ],
+        "default": "balanced",
+        "help": "Default profile for node and services without explicit profile",
+        "profile_scoped": false
+      }
+    }
+  },
+  "listeners": {
+    "help": "Network listeners",
+    "keys": {
+      "public": {
+        "type": "string",
+        "default": "0.0.0.0:8080",
+        "help": "Public API listener address",
+        "profile_scoped": false
+      },
+      "internal": {
+        "type": "string",
+        "default": "unix:/data/rt.sock",
+        "help": "Internal API listener address",
+        "profile_scoped": false
+      },
+      "control": {
+        "type": "string",
+        "default": "127.0.0.1:8081",
+        "help": "Control API listener address (localhost only)",
+        "profile_scoped": false
+      },
+      "metrics": {
+        "type": "string",
+        "default": "127.0.0.1:9090",
+        "help": "Metrics listener address",
+        "profile_scoped": false
+      },
+      "internal_allowed_uids": {
+        "type": "list",
+        "default": [],
+        "help": "UIDs besides the node's own that may connect to the internal Unix socket (peer credentials are checked before serving; root only when listed)",
+        "profile_scoped": false,
+        "items": "int",
+        "item_min": 0,
+        "item_max": 4294967295
+      },
+      "allow_tcp_internal": {
+        "type": "bool",
+        "default": false,
+        "help": "Allow a loopback TCP internal listener (no peer UID check is possible: every local user gets trusted invokes)",
+        "profile_scoped": false
+      }
+    }
+  },
+  "routing": {
+    "help": "Service routing and discovery",
+    "keys": {
+      "base_domain": {
+        "type": "string",
+        "default": "",
+        "help": "Base domain for service URLs (e.g. fn.example.com)",
+        "profile_scoped": false
+      }
+    }
+  },
+  "hosts": {
+    "help": "Tenant custom-host claims",
+    "keys": {
+      "pending_ttl": {
+        "type": "duration",
+        "default": "7d",
+        "help": "A claim still pending verification after this long expires and stops blocking other services",
+        "profile_scoped": false
+      },
+      "verify_dns": {
+        "type": "bool",
+        "default": true,
+        "help": "Activate pending claims whose _rt-verify.<host> TXT record equals the claim's verify_token",
+        "profile_scoped": false
+      },
+      "verify_interval": {
+        "type": "duration",
+        "default": "60s",
+        "help": "How often pending claims are checked (DNS verification and expiry)",
+        "profile_scoped": false
+      },
+      "max_pending_per_tenant": {
+        "type": "int",
+        "default": 10,
+        "min": 0,
+        "help": "Pending custom-host claims one tenant may hold at once",
+        "profile_scoped": false
+      }
+    }
+  },
+  "sched": {
+    "help": "Scheduler configuration",
+    "keys": {
+      "processors": {
+        "type": "int",
+        "default": 0,
+        "min": 0,
+        "help": "Number of processors (0=cgroup quota or physical cores)",
+        "profile_scoped": false
+      },
+      "spare_machines": {
+        "type": "int",
+        "default": 2,
+        "min": 0,
+        "help": "Number of spare machines to keep ready",
+        "profile_scoped": false
+      },
+      "lrq_capacity": {
+        "type": "int",
+        "default": 256,
+        "min": 1,
+        "help": "Local run queue capacity",
+        "profile_scoped": false
+      },
+      "max_inflight": {
+        "type": "int",
+        "default": 10000,
+        "min": 2,
+        "help": "Run slots node-wide (at least 2: one stays reserved for service-to-service calls); tasks beyond it wait in their service queue",
+        "profile_scoped": false
+      },
+      "max_queued": {
+        "type": "int",
+        "default": 0,
+        "min": 0,
+        "help": "Node bound on queued tasks, over it 503 overloaded (0=auto: 4 x max_inflight)",
+        "profile_scoped": false
+      },
+      "max_queued_mb": {
+        "type": "int",
+        "default": 0,
+        "min": 0,
+        "help": "Node bound on bytes held by queued tasks in MB (0=auto: 1/16 of the memory budget)",
+        "profile_scoped": false
+      },
+      "spin_us": {
+        "type": "int",
+        "default": 10,
+        "min": 0,
+        "help": "Processor spin time in microseconds before sleeping",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": 0,
+          "balanced": 10,
+          "min_latency": 50
+        }
+      },
+      "time_slice": {
+        "type": "duration",
+        "default": "10ms",
+        "help": "Task time slice before preemption",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": "20ms",
+          "balanced": "10ms",
+          "min_latency": "5ms"
+        }
+      },
+      "pin_threads": {
+        "type": "bool",
+        "default": false,
+        "help": "Pin OS threads to cores",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": false,
+          "balanced": false,
+          "min_latency": true
+        }
+      },
+      "handoff_on_hog": {
+        "type": "bool",
+        "default": false,
+        "help": "Hand off tasks when processor is idle but task is hogging",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": false,
+          "balanced": false,
+          "min_latency": true
+        }
+      },
+      "queue_timeout": {
+        "type": "duration",
+        "default": "5s",
+        "help": "Longest wait for a run slot before 503 queue_timeout",
+        "profile_scoped": "service",
+        "profile_defaults": {
+          "max_density": "10s",
+          "balanced": "5s",
+          "min_latency": "1s"
+        }
+      },
+      "warm_share": {
+        "type": "float",
+        "default": 0.15,
+        "min": 0.0,
+        "max": 1.0,
+        "help": "Share of the memory budget warm instances may use (autoscaler warm targets)",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": 0.05,
+          "balanced": 0.15,
+          "min_latency": 0.3
+        }
+      }
+    },
+    "tables": {
+      "kinds": {
+        "help": "Processor allocation per executor kind",
+        "tables": {
+          "deno": {
+            "help": "deno processor range",
+            "keys": {
+              "min": {
+                "type": "int",
+                "default": 1,
+                "min": 0,
+                "help": "Minimum processors reserved for deno",
+                "profile_scoped": false
+              },
+              "max": {
+                "type": "int",
+                "default": 0,
+                "min": 0,
+                "help": "Maximum processors (0 = processors minus the other kinds' minimums)",
+                "profile_scoped": false
+              }
+            }
+          },
+          "wasm": {
+            "help": "wasm processor range",
+            "keys": {
+              "min": {
+                "type": "int",
+                "default": 1,
+                "min": 0,
+                "help": "Minimum processors reserved for wasm",
+                "profile_scoped": false
+              },
+              "max": {
+                "type": "int",
+                "default": 0,
+                "min": 0,
+                "help": "Maximum processors (0 = processors minus the other kinds' minimums)",
+                "profile_scoped": false
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "sysmon": {
+    "help": "System monitor configuration",
+    "keys": {
+      "max_tick": {
+        "type": "duration",
+        "default": "10ms",
+        "help": "Maximum tick interval for sysmon",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": "20ms",
+          "balanced": "10ms",
+          "min_latency": "2ms"
+        }
+      }
+    }
+  },
+  "rebalance": {
+    "help": "Load rebalancing",
+    "keys": {
+      "interval": {
+        "type": "duration",
+        "default": "100ms",
+        "help": "Interval between rebalancing attempts",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": "250ms",
+          "balanced": "100ms",
+          "min_latency": "50ms"
+        }
+      },
+      "up_threshold": {
+        "type": "float",
+        "default": 2.0,
+        "min": 1.0,
+        "help": "Load threshold to trigger rebalancing",
+        "profile_scoped": false
+      },
+      "cooldown": {
+        "type": "duration",
+        "default": "1s",
+        "help": "Cooldown between rebalancing attempts",
+        "profile_scoped": false
+      }
+    }
+  },
+  "io": {
+    "help": "I/O thread pool configuration",
+    "keys": {
+      "threads": {
+        "type": "int",
+        "default": 2,
+        "min": 1,
+        "help": "Number of I/O worker threads",
+        "profile_scoped": false
+      }
+    }
+  },
+  "blocking": {
+    "help": "Blocking operations thread pool",
+    "keys": {
+      "threads": {
+        "type": "int",
+        "default": 0,
+        "min": 0,
+        "help": "Blocking (service-data) pool threads; 0 = auto: max(4, available cores). One tenant may use floor(plan.blocking_share x threads) of them, at least 1",
+        "profile_scoped": false
+      }
+    }
+  },
+  "memory": {
+    "help": "Memory management",
+    "keys": {
+      "budget_mb": {
+        "type": "int",
+        "default": 0,
+        "min": 0,
+        "max": 16777216,
+        "help": "Memory budget in MB (0=85% of cgroup max)",
+        "profile_scoped": false
+      },
+      "check_interval": {
+        "type": "duration",
+        "default": "250ms",
+        "help": "Interval for memory pressure checks",
+        "profile_scoped": false
+      },
+      "high": {
+        "type": "float",
+        "default": 0.8,
+        "min": 0.0,
+        "max": 1.0,
+        "help": "Memory pressure high watermark (fraction of budget)",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": 0.9,
+          "balanced": 0.8,
+          "min_latency": 0.7
+        }
+      },
+      "critical": {
+        "type": "float",
+        "default": 0.92,
+        "min": 0.0,
+        "max": 1.0,
+        "help": "Memory pressure critical watermark (fraction of budget)",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": 0.97,
+          "balanced": 0.92,
+          "min_latency": 0.88
+        }
+      },
+      "purge_min_interval": {
+        "type": "duration",
+        "default": "30s",
+        "help": "Minimum interval between purge operations",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": "5s",
+          "balanced": "30s",
+          "min_latency": "120s"
+        }
+      }
+    }
+  },
+  "cache": {
+    "help": "Caching configuration",
+    "keys": {
+      "t2_max_mb": {
+        "type": "int",
+        "default": 4096,
+        "min": 0,
+        "help": "Maximum T2 cache size in MB",
+        "profile_scoped": false
+      },
+      "t1_share": {
+        "type": "float",
+        "default": 0.2,
+        "min": 0.0,
+        "max": 1.0,
+        "help": "T1 cache share (fraction of budget)",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": 0.1,
+          "balanced": 0.2,
+          "min_latency": 0.35
+        }
+      },
+      "idle_ttl": {
+        "type": "duration",
+        "default": "600s",
+        "help": "Idle TTL for cached services",
+        "profile_scoped": "service",
+        "profile_defaults": {
+          "max_density": "60s",
+          "balanced": "600s",
+          "min_latency": "3600s"
+        }
+      },
+      "preload": {
+        "type": "bool",
+        "default": false,
+        "help": "Preload services in T1 cache",
+        "profile_scoped": "service",
+        "profile_defaults": {
+          "max_density": false,
+          "balanced": false,
+          "min_latency": true
+        }
+      },
+      "preload_top_n": {
+        "type": "int",
+        "default": 100,
+        "min": 0,
+        "help": "Top-N services by persisted frequency to preload when `preload` applies",
+        "profile_scoped": false
+      }
+    }
+  },
+  "disk": {
+    "help": "Disk space management",
+    "keys": {
+      "low_free_mb": {
+        "type": "int",
+        "default": 2048,
+        "min": 0,
+        "help": "Low disk space threshold in MB",
+        "profile_scoped": false
+      },
+      "high_free_mb": {
+        "type": "int",
+        "default": 4096,
+        "min": 0,
+        "help": "High disk space threshold in MB",
+        "profile_scoped": false
+      }
+    }
+  },
+  "deno": {
+    "help": "Deno executor configuration",
+    "keys": {
+      "isolate_base_mb": {
+        "type": "int",
+        "default": 4,
+        "min": 1,
+        "help": "Base isolate memory in MB",
+        "profile_scoped": false
+      },
+      "v8_platform_threads": {
+        "type": "int",
+        "default": 1,
+        "min": 1,
+        "help": "V8 platform worker threads",
+        "profile_scoped": false
+      },
+      "dispose_backlog": {
+        "type": "int",
+        "default": 8,
+        "min": 1,
+        "help": "Isolate dispose backlog size",
+        "profile_scoped": false
+      },
+      "v8_flags": {
+        "type": "list",
+        "default": [
+          "--single-threaded-gc"
+        ],
+        "help": "V8 command-line flags",
+        "profile_scoped": false,
+        "items": "string"
+      },
+      "max_bound_per_m": {
+        "type": "int",
+        "default": 64,
+        "min": 1,
+        "help": "Maximum bound isolates per machine",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": 128,
+          "balanced": 64,
+          "min_latency": 32
+        }
+      },
+      "isolate_pool_per_p": {
+        "type": "int",
+        "default": 1,
+        "min": 0,
+        "help": "Isolate pool per processor (0=none)",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": 0,
+          "balanced": 1,
+          "min_latency": 4
+        }
+      },
+      "reuse_isolates": {
+        "type": "bool",
+        "default": false,
+        "help": "Keep isolates with the evaluated module for the next request of the same service version (module state persists)",
+        "profile_scoped": "service",
+        "profile_defaults": {
+          "max_density": false,
+          "balanced": false,
+          "min_latency": true
+        }
+      },
+      "reuse_max_idle": {
+        "type": "int",
+        "default": 4,
+        "min": 0,
+        "help": "Kept isolates per service version per machine when no warm target is published (0 = keep none)",
+        "profile_scoped": false
+      },
+      "reuse_max_idle_total": {
+        "type": "int",
+        "default": 16,
+        "min": 0,
+        "help": "Kept isolates per machine across services; the oldest go first",
+        "profile_scoped": false
+      },
+      "reuse_idle_ttl": {
+        "type": "duration",
+        "default": "60s",
+        "help": "A kept isolate unused this long is disposed",
+        "profile_scoped": false
+      },
+      "reuse_max_uses": {
+        "type": "int",
+        "default": 1000,
+        "min": 1,
+        "help": "Requests one kept isolate serves before it is replaced",
+        "profile_scoped": false
+      }
+    }
+  },
+  "wasm": {
+    "help": "WASM executor configuration",
+    "keys": {
+      "fuel": {
+        "type": "bool",
+        "default": false,
+        "help": "Enable WASM fuel metering",
+        "profile_scoped": false
+      },
+      "reuse_max_idle": {
+        "type": "int",
+        "default": 8,
+        "min": 0,
+        "help": "Maximum idle reused instances",
+        "profile_scoped": false
+      },
+      "linear_memory_keep_resident": {
+        "type": "int",
+        "default": 1,
+        "min": 0,
+        "help": "Keep resident linear memory in MB",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": 0,
+          "balanced": 1,
+          "min_latency": 8
+        }
+      },
+      "reuse_instances": {
+        "type": "bool",
+        "default": false,
+        "help": "Reuse WASM instances (a service's config.wasm.reuse_instances overrides it)",
+        "profile_scoped": "service",
+        "profile_defaults": {
+          "max_density": false,
+          "balanced": false,
+          "min_latency": true
+        }
+      },
+      "max_unused_warm_slots": {
+        "type": "int",
+        "default": 100,
+        "min": 0,
+        "help": "Pooling-allocator slots kept warm (affine to their module) after release; capped at the pool size",
+        "profile_scoped": "node",
+        "profile_defaults": {
+          "max_density": 0,
+          "balanced": 100,
+          "min_latency": 1000
+        }
+      }
+    }
+  },
+  "build": {
+    "help": "Build system configuration",
+    "keys": {
+      "threads": {
+        "type": "int",
+        "default": 1,
+        "min": 1,
+        "help": "Build worker threads",
+        "profile_scoped": false
+      },
+      "memory_mb": {
+        "type": "int",
+        "default": 256,
+        "min": 1,
+        "help": "Build memory limit in MB",
+        "profile_scoped": false
+      },
+      "timeout": {
+        "type": "duration",
+        "default": "60s",
+        "help": "Build timeout",
+        "profile_scoped": false
+      },
+      "wasm_timeout": {
+        "type": "duration",
+        "default": "120s",
+        "help": "WASM build timeout",
+        "profile_scoped": false
+      },
+      "fetch_timeout": {
+        "type": "duration",
+        "default": "30s",
+        "help": "Per-module fetch timeout",
+        "profile_scoped": false
+      },
+      "npm_cdn": {
+        "type": "string",
+        "default": "https://esm.sh",
+        "help": "NPM CDN endpoint",
+        "profile_scoped": false
+      },
+      "allowed_hosts": {
+        "type": "list",
+        "default": [
+          "esm.sh",
+          "jsr.io",
+          "deno.land",
+          "cdn.jsdelivr.net",
+          "unpkg.com"
+        ],
+        "help": "Allowed hosts for build dependencies",
+        "profile_scoped": false,
+        "items": "string"
+      },
+      "max_deps_mb": {
+        "type": "int",
+        "default": 50,
+        "min": 1,
+        "help": "Maximum dependency bundle size in MB",
+        "profile_scoped": false
+      },
+      "compile": {
+        "type": "enum",
+        "enum": [
+          "lazy",
+          "eager"
+        ],
+        "default": "lazy",
+        "help": "Compilation strategy",
+        "profile_scoped": "service",
+        "profile_defaults": {
+          "max_density": "lazy",
+          "balanced": "lazy",
+          "min_latency": "eager"
+        }
+      }
+    }
+  },
+  "deploy": {
+    "help": "Deployment configuration",
+    "keys": {
+      "retain_versions": {
+        "type": "int",
+        "default": 10,
+        "min": 1,
+        "help": "Number of versions to retain",
+        "profile_scoped": false
+      },
+      "auto_rollback": {
+        "type": "bool",
+        "default": true,
+        "help": "Automatically rollback on deploy failure",
+        "profile_scoped": false
+      }
+    }
+  },
+  "storage": {
+    "help": "Storage backend configuration",
+    "keys": {
+      "blob_backend": {
+        "type": "enum",
+        "enum": [
+          "local",
+          "s3"
+        ],
+        "default": "local",
+        "help": "Blob storage backend",
+        "profile_scoped": false
+      },
+      "max_open_dbs": {
+        "type": "int",
+        "default": 256,
+        "min": 1,
+        "help": "Cap on open SQLite connections of service databases (writers and readers together); idle services are closed whole, LRU first",
+        "profile_scoped": false
+      },
+      "readers_per_db": {
+        "type": "int",
+        "default": 4,
+        "min": 0,
+        "max": 64,
+        "help": "Read-only connections per service database next to its writer, opened under concurrent reads (0 = reads use the writer)",
+        "profile_scoped": false
+      },
+      "sql_cache_mb": {
+        "type": "int",
+        "default": 512,
+        "min": 0,
+        "help": "SQLite page-cache budget of all service-database connections together in MB; each gets sql_cache_mb / max_open_dbs (0 = SQLite default)",
+        "profile_scoped": false
+      },
+      "blob_cache_mb": {
+        "type": "int",
+        "default": 512,
+        "min": 0,
+        "help": "Blob cache size in MB",
+        "profile_scoped": false
+      },
+      "sql_budget_ms": {
+        "type": "int",
+        "default": 1000,
+        "min": 1,
+        "help": "SQL execution budget in milliseconds",
+        "profile_scoped": false
+      }
+    }
+  },
+  "s3": {
+    "help": "S3 storage configuration",
+    "keys": {
+      "endpoint": {
+        "type": "string",
+        "default": "",
+        "help": "S3 endpoint URL",
+        "profile_scoped": false
+      },
+      "bucket": {
+        "type": "string",
+        "default": "",
+        "help": "S3 bucket name",
+        "profile_scoped": false
+      },
+      "prefix": {
+        "type": "string",
+        "default": "rt",
+        "help": "S3 object prefix",
+        "profile_scoped": false
+      },
+      "region": {
+        "type": "string",
+        "default": "us-east-1",
+        "help": "S3 region",
+        "profile_scoped": false
+      }
+    }
+  },
+  "security": {
+    "help": "Security configuration",
+    "keys": {
+      "seccomp": {
+        "type": "bool",
+        "default": true,
+        "help": "Enable seccomp sandboxing",
+        "profile_scoped": false
+      },
+      "clock": {
+        "type": "enum",
+        "enum": [
+          "frozen",
+          "coarse"
+        ],
+        "default": "frozen",
+        "help": "Clock coarsening strategy",
+        "profile_scoped": false
+      },
+      "require_v8_sandbox": {
+        "type": "bool",
+        "default": true,
+        "help": "Require V8 sandbox (official builds only)",
+        "profile_scoped": false
+      },
+      "reserved_hosts": {
+        "type": "list",
+        "default": [],
+        "help": "Hosts tenants cannot claim",
+        "profile_scoped": false,
+        "items": "string"
+      },
+      "master_key_file": {
+        "type": "string",
+        "default": "",
+        "help": "Path to master key file",
+        "profile_scoped": false
+      }
+    }
+  },
+  "supervisor": {
+    "help": "Supervisor process configuration",
+    "keys": {
+      "reserve_mb": {
+        "type": "int",
+        "default": 30,
+        "min": 1,
+        "help": "Memory reserved for supervisor in MB",
+        "profile_scoped": false
+      },
+      "executor_restart_backoff": {
+        "type": "list",
+        "default": [
+          "100ms",
+          "1s",
+          "5s"
+        ],
+        "help": "Executor restart backoff durations",
+        "profile_scoped": false,
+        "items": "duration"
+      }
+    }
+  },
+  "secrets": {
+    "help": "Secrets management configuration",
+    "keys": {
+      "cache_ttl": {
+        "type": "duration",
+        "default": "60s",
+        "help": "Secrets cache TTL (0=fetch per task)",
+        "profile_scoped": false
+      },
+      "max_services_per_min": {
+        "type": "int",
+        "default": 200,
+        "min": 1,
+        "help": "Anomaly threshold for secret requests per minute",
+        "profile_scoped": false
+      }
+    }
+  },
+  "ingress": {
+    "help": "Ingress configuration",
+    "keys": {
+      "trusted_proxies": {
+        "type": "list",
+        "default": [],
+        "help": "Trusted proxy IP addresses",
+        "profile_scoped": false,
+        "items": "string"
+      },
+      "header_timeout": {
+        "type": "duration",
+        "default": "10s",
+        "help": "Request header read timeout",
+        "profile_scoped": false
+      },
+      "idle_timeout": {
+        "type": "duration",
+        "default": "60s",
+        "help": "Connection idle timeout",
+        "profile_scoped": false
+      },
+      "max_conns_per_ip": {
+        "type": "int",
+        "default": 256,
+        "min": 1,
+        "help": "Maximum concurrent connections per peer IP (extra ones are closed; trusted proxies are exempt)",
+        "profile_scoped": false
+      },
+      "h2_max_streams": {
+        "type": "int",
+        "default": 100,
+        "min": 1,
+        "help": "Maximum concurrent HTTP/2 streams",
+        "profile_scoped": false
+      },
+      "sse_streams_per_key": {
+        "type": "int",
+        "default": 10,
+        "min": 1,
+        "help": "Maximum SSE streams per API key",
+        "profile_scoped": false
+      },
+      "backlog": {
+        "type": "int",
+        "default": 4096,
+        "min": 1,
+        "help": "listen() backlog of the TCP listeners (capped by kern.ipc.somaxconn / net.core.somaxconn)",
+        "profile_scoped": false
+      }
+    }
+  },
+  "egress": {
+    "help": "Egress (outbound) configuration",
+    "keys": {
+      "denied_ports": {
+        "type": "list",
+        "default": [
+          25,
+          465,
+          587
+        ],
+        "help": "Denied outbound ports (SMTP)",
+        "profile_scoped": false,
+        "items": "int",
+        "item_min": 0,
+        "item_max": 65535
+      },
+      "denied_hosts": {
+        "type": "list",
+        "default": [],
+        "help": "Denied outbound host patterns",
+        "profile_scoped": false,
+        "items": "string"
+      },
+      "denied_cidrs": {
+        "type": "list",
+        "default": [],
+        "help": "Denied outbound CIDR blocks",
+        "profile_scoped": false,
+        "items": "string"
+      },
+      "allow_https_downgrade": {
+        "type": "bool",
+        "default": false,
+        "help": "Follow https -> http redirects in guest fetches (off: the fetch fails with egress_insecure_redirect)",
+        "profile_scoped": false
+      }
+    }
+  },
+  "queue": {
+    "help": "Work queue configuration",
+    "keys": {
+      "batch_size": {
+        "type": "int",
+        "default": 10,
+        "min": 1,
+        "help": "Queue batch size",
+        "profile_scoped": false
+      },
+      "max_attempts": {
+        "type": "int",
+        "default": 5,
+        "min": 1,
+        "help": "Maximum delivery attempts",
+        "profile_scoped": false
+      },
+      "max_concurrency": {
+        "type": "int",
+        "default": 4,
+        "min": 1,
+        "help": "Per-service concurrent queue tasks (within the service's scaling.max_instances)",
+        "profile_scoped": false
+      }
+    }
+  },
+  "ws": {
+    "help": "WebSockets the node holds",
+    "keys": {
+      "max_sockets": {
+        "type": "int",
+        "default": 20000,
+        "min": 1,
+        "help": "Open WebSockets on the node, every tenant together; an upgrade over it is refused",
+        "profile_scoped": false
+      },
+      "ping_interval": {
+        "type": "duration",
+        "default": "30s",
+        "help": "Server ping interval; a socket silent for two intervals is dropped",
+        "profile_scoped": false
+      },
+      "send_buffer_kb": {
+        "type": "int",
+        "default": 1024,
+        "min": 1,
+        "help": "KiB queued for one client before the socket is closed with 1013 (slow consumer)",
+        "profile_scoped": false
+      },
+      "inbox_max": {
+        "type": "int",
+        "default": 1024,
+        "min": 1,
+        "help": "Events queued per object; a full inbox stops reading that object's sockets",
+        "profile_scoped": false
+      },
+      "max_event_attempts": {
+        "type": "int",
+        "default": 3,
+        "min": 1,
+        "help": "Deliveries of a socket event before it is given up (a message's socket then closes 1011)",
+        "profile_scoped": false
+      },
+      "max_alarm_attempts": {
+        "type": "int",
+        "default": 6,
+        "min": 1,
+        "help": "Deliveries of a durable object's alarm before it is dropped",
+        "profile_scoped": false
+      },
+      "msgs_per_sec": {
+        "type": "int",
+        "default": 50,
+        "min": 1,
+        "help": "Messages one client may send per second",
+        "profile_scoped": false
+      },
+      "msgs_burst": {
+        "type": "int",
+        "default": 200,
+        "min": 1,
+        "help": "Messages one client may send in a burst above msgs_per_sec",
+        "profile_scoped": false
+      },
+      "flood_close_after": {
+        "type": "duration",
+        "default": "10s",
+        "help": "A client throttled without a break this long is closed with 1008",
+        "profile_scoped": false
+      },
+      "drain_grace": {
+        "type": "duration",
+        "default": "5s",
+        "help": "How long a drain waits for event tasks after closing every socket with 1001",
+        "profile_scoped": false
+      }
+    }
+  },
+  "logs": {
+    "help": "Logging configuration",
+    "keys": {
+      "ring_lines": {
+        "type": "int",
+        "default": 1000,
+        "min": 1,
+        "help": "Ring buffer size in lines",
+        "profile_scoped": false
+      },
+      "retention_days": {
+        "type": "int",
+        "default": 7,
+        "min": 1,
+        "help": "Log retention period in days",
+        "profile_scoped": false
+      },
+      "max_mb_per_service": {
+        "type": "int",
+        "default": 50,
+        "min": 1,
+        "help": "Maximum log size per service in MB",
+        "profile_scoped": false
+      },
+      "stdout": {
+        "type": "bool",
+        "default": false,
+        "help": "Log to stdout",
+        "profile_scoped": false
+      }
+    }
+  },
+  "metrics": {
+    "help": "Metrics configuration",
+    "keys": {
+      "per_service": {
+        "type": "bool",
+        "default": false,
+        "help": "Enable per-service metrics",
+        "profile_scoped": false
+      },
+      "per_service_top_n": {
+        "type": "int",
+        "default": 100,
+        "min": 1,
+        "help": "Top N services to track",
+        "profile_scoped": false
+      }
+    }
+  },
+  "otel": {
+    "help": "OpenTelemetry configuration",
+    "keys": {
+      "endpoint": {
+        "type": "string",
+        "default": "",
+        "help": "OTEL collector endpoint",
+        "profile_scoped": false
+      },
+      "sample_ratio": {
+        "type": "float",
+        "default": 0.01,
+        "min": 0.0,
+        "max": 1.0,
+        "help": "Trace sample ratio",
+        "profile_scoped": false
+      }
+    }
+  },
+  "plans": {
+    "help": "Tenant plan definitions: [plans.<name>]. A `free` plan always exists",
+    "keys": {},
+    "named": {
+      "help": "One plan",
+      "keys": {
+        "max_services": {
+          "type": "int",
+          "default": 10,
+          "min": 0,
+          "help": "Services per tenant",
+          "profile_scoped": false
+        },
+        "max_concurrency": {
+          "type": "int",
+          "default": 10,
+          "min": 0,
+          "help": "Tenant-wide in-flight tasks",
+          "profile_scoped": false
+        },
+        "max_instances": {
+          "type": "int",
+          "default": 4,
+          "min": 0,
+          "help": "Most instances (concurrently running copies) of one service; bounds scaling.min_instances and scaling.max_instances. 0 = the node default (the profile's ceiling)",
+          "profile_scoped": false
+        },
+        "rps": {
+          "type": "int",
+          "default": 50,
+          "min": 0,
+          "help": "Tenant-wide token bucket (requests per second)",
+          "profile_scoped": false
+        },
+        "invocations_per_day": {
+          "type": "int",
+          "default": 100000,
+          "min": 0,
+          "help": "Invocations per day",
+          "profile_scoped": false
+        },
+        "storage_mb": {
+          "type": "int",
+          "default": 100,
+          "min": 0,
+          "help": "KV + SQL + blobs across all services, in MB",
+          "profile_scoped": false
+        },
+        "egress_mb_per_day": {
+          "type": "int",
+          "default": 1000,
+          "min": 0,
+          "help": "Egress per day, in MB",
+          "profile_scoped": false
+        },
+        "max_schedules": {
+          "type": "int",
+          "default": 3,
+          "min": 0,
+          "help": "Schedules per service (each service of the tenant may hold this many)",
+          "profile_scoped": false
+        },
+        "min_schedule_seconds": {
+          "type": "int",
+          "default": 60,
+          "min": 0,
+          "help": "Minimum interval of an interval schedule, in seconds",
+          "profile_scoped": false
+        },
+        "max_queue_depth": {
+          "type": "int",
+          "default": 10000,
+          "min": 0,
+          "help": "Queued messages per service queue (enqueue answers `429 queue_full` at this depth)",
+          "profile_scoped": false
+        },
+        "max_pinned_mb": {
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "help": "Memory a tenant may pin resident, in MB",
+          "profile_scoped": false
+        },
+        "allowed_triggers": {
+          "type": "list",
+          "default": [
+            "http",
+            "interval",
+            "queue",
+            "call",
+            "websocket"
+          ],
+          "help": "Trigger kinds the plan allows",
+          "items": "enum",
+          "item_enum": [
+            "http",
+            "interval",
+            "cron",
+            "queue",
+            "call",
+            "websocket"
+          ],
+          "profile_scoped": false
+        },
+        "builds_per_hour": {
+          "type": "int",
+          "default": 20,
+          "min": 0,
+          "help": "Builds per hour",
+          "profile_scoped": false
+        },
+        "custom_host_suffixes": {
+          "type": "list",
+          "default": [],
+          "help": "Suffixes tenants may attach custom hosts under (none = operator-only)",
+          "items": "string",
+          "profile_scoped": false
+        },
+        "blocking_share": {
+          "type": "float",
+          "default": 0.25,
+          "min": 0.0,
+          "max": 1.0,
+          "help": "Max share of blocking-pool threads one tenant may occupy",
+          "profile_scoped": false
+        },
+        "egress_default": {
+          "type": "enum",
+          "default": "allow",
+          "help": "Default egress stance for services of the plan",
+          "enum": [
+            "allow",
+            "deny"
+          ],
+          "profile_scoped": false
+        },
+        "allow_cross_tenant_calls": {
+          "type": "bool",
+          "default": false,
+          "help": "Allow std:call to services of other tenants",
+          "profile_scoped": false
+        },
+        "max_sockets": {
+          "type": "int",
+          "default": 1000,
+          "min": 0,
+          "help": "Open WebSockets across the tenant's services (0 = no tenant cap)",
+          "profile_scoped": false
+        },
+        "max_sockets_per_object": {
+          "type": "int",
+          "default": 1000,
+          "min": 0,
+          "help": "Open WebSockets on one object (0 = no cap)",
+          "profile_scoped": false
+        },
+        "ws_max_message_bytes": {
+          "type": "int",
+          "default": 1048576,
+          "min": 1,
+          "help": "Largest WebSocket message a client may send; a larger one closes the socket with 1009",
+          "profile_scoped": false
+        }
+      },
+      "tables": {
+        "limits_max": {
+          "help": "Maximum per-service limits the plan allows",
+          "keys": {
+            "wall_ms": {
+              "type": "int",
+              "default": 30000,
+              "min": 0,
+              "help": "Wall-clock limit, ms",
+              "profile_scoped": false
+            },
+            "cpu_ms": {
+              "type": "int",
+              "default": 1000,
+              "min": 0,
+              "help": "CPU limit, ms",
+              "profile_scoped": false
+            },
+            "memory_mb": {
+              "type": "int",
+              "default": 128,
+              "min": 0,
+              "help": "Memory limit, MB",
+              "profile_scoped": false
+            }
+          }
+        }
+      }
+    }
+  },
+  "binding": {
+    "help": "Operator platform bindings: [[binding]] array of tables (std:platform)",
+    "keys": {},
+    "rows": {
+      "help": "One binding",
+      "keys": {
+        "name": {
+          "type": "string",
+          "default": "",
+          "help": "Binding name",
+          "profile_scoped": false
+        },
+        "base_url": {
+          "type": "string",
+          "default": "",
+          "help": "Base URL requests are forwarded to",
+          "profile_scoped": false
+        },
+        "inject_headers": {
+          "type": "map",
+          "default": {},
+          "help": "Header name -> value; a value `env:NAME` is read from the node environment",
+          "profile_scoped": false
+        },
+        "tenant_header": {
+          "type": "string",
+          "default": "",
+          "help": "Header carrying the tenant id",
+          "profile_scoped": false
+        },
+        "allowed_plans": {
+          "type": "list",
+          "default": [],
+          "help": "Plans that may use the binding",
+          "items": "string",
+          "profile_scoped": false
+        },
+        "allowed_methods": {
+          "type": "list",
+          "default": [],
+          "help": "Allowed HTTP methods",
+          "items": "string",
+          "profile_scoped": false
+        },
+        "allowed_paths": {
+          "type": "list",
+          "default": [],
+          "help": "Allowed path patterns",
+          "items": "string",
+          "profile_scoped": false
+        }
+      },
+      "tables": {
+        "rate_limit": {
+          "help": "Per-tenant rate limit of the binding",
+          "keys": {
+            "rps": {
+              "type": "int",
+              "default": 0,
+              "min": 0,
+              "help": "Requests per second (0 = unlimited)",
+              "profile_scoped": false
+            },
+            "burst": {
+              "type": "int",
+              "default": 0,
+              "min": 0,
+              "help": "Burst size",
+              "profile_scoped": false
+            }
+          }
+        }
+      }
+    }
+  },
+  "scaling": {
+    "help": "Per-service scaling block (ServiceConfig.scaling). NOT an rt.toml section: the node loader rejects it, so tools never emit it into node config",
+    "scope": "service",
+    "keys": {
+      "keep_resident": {
+        "type": "bool",
+        "default": false,
+        "help": "Keep service instances resident",
+        "profile_scoped": "service",
+        "profile_defaults": {
+          "max_density": false,
+          "balanced": false,
+          "min_latency": false
+        }
+      },
+      "min_instances": {
+        "type": "int",
+        "default": 0,
+        "min": 0,
+        "help": "Instances kept warm: never scaled to zero, floor of the concurrency limit. At most the plan's max_instances (0 = scale to zero)",
+        "profile_scoped": false
+      },
+      "max_instances": {
+        "type": "int",
+        "default": 0,
+        "min": 0,
+        "help": "Most instances running at once; excess requests queue. At most the plan's max_instances (0 = the plan's limit, else the profile's ceiling). Replaces scaling.max_concurrency",
+        "profile_scoped": false
+      }
+    }
+  }
+}

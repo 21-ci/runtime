@@ -1,0 +1,188 @@
+# Balanced profile - default configuration
+# Medium throughput, latency, and resource efficiency
+# Suitable for most general-purpose workloads
+
+[node]
+data_dir = "/data"
+default_profile = "balanced"
+
+[listeners]
+public = "0.0.0.0:8080"
+internal = "unix:/data/rt.sock"
+control = "127.0.0.1:8081"
+metrics = "127.0.0.1:9090"
+internal_allowed_uids = []      # UIDs besides the node's own allowed on the internal socket
+allow_tcp_internal = false      # a TCP internal listener needs this opt-in (no UID check)
+
+[routing]
+base_domain = ""
+
+[hosts]
+pending_ttl = "7d"              # Unverified custom-host claims expire
+verify_dns = true               # Activate claims whose _rt-verify TXT matches
+verify_interval = "60s"
+max_pending_per_tenant = 10     # Pending claims per tenant
+
+[sched]
+processors = 0                  # Auto-detect from cgroup
+spare_machines = 2
+lrq_capacity = 256
+max_inflight = 10000
+max_queued = 0                  # auto: 4 x max_inflight; over it 503 overloaded
+max_queued_mb = 0               # auto: 1/16 of the memory budget
+spin_us = 10
+time_slice = "10ms"
+pin_threads = false
+handoff_on_hog = false
+queue_timeout = "5s"
+warm_share = 0.15               # memory share for autoscaler warm instances
+
+[sched.kinds.deno]
+min = 1
+max = 0
+
+[sched.kinds.wasm]
+min = 1
+max = 0
+
+[sysmon]
+max_tick = "10ms"
+
+[rebalance]
+interval = "100ms"
+up_threshold = 2.0
+cooldown = "1s"
+
+[io]
+threads = 2
+
+[blocking]
+threads = 0                     # auto: max(4, available cores)
+
+[memory]
+budget_mb = 0                   # 85% of cgroup max
+check_interval = "250ms"
+high = 0.80
+critical = 0.92
+purge_min_interval = "30s"
+
+[cache]
+t2_max_mb = 4096
+t1_share = 0.20
+idle_ttl = "600s"
+preload = false
+preload_top_n = 100
+
+[disk]
+low_free_mb = 2048
+high_free_mb = 4096
+
+[deno]
+isolate_base_mb = 4
+v8_platform_threads = 1
+dispose_backlog = 8
+v8_flags = ["--single-threaded-gc"]
+max_bound_per_m = 64
+isolate_pool_per_p = 1
+reuse_isolates = false
+reuse_max_idle = 4
+reuse_max_idle_total = 16
+reuse_idle_ttl = "60s"
+reuse_max_uses = 1000
+
+[wasm]
+fuel = false
+reuse_max_idle = 8
+linear_memory_keep_resident = 1
+reuse_instances = false
+max_unused_warm_slots = 100
+
+[build]
+threads = 1
+memory_mb = 256
+timeout = "60s"
+wasm_timeout = "120s"
+fetch_timeout = "30s"
+npm_cdn = "https://esm.sh"
+allowed_hosts = ["esm.sh", "jsr.io", "deno.land", "cdn.jsdelivr.net", "unpkg.com"]
+max_deps_mb = 50
+compile = "lazy"
+
+[deploy]
+retain_versions = 10
+auto_rollback = true
+
+[storage]
+blob_backend = "local"
+max_open_dbs = 256
+readers_per_db = 4
+sql_cache_mb = 512
+blob_cache_mb = 512
+sql_budget_ms = 1000
+
+[s3]
+endpoint = ""
+bucket = ""
+prefix = "rt"
+region = "us-east-1"
+
+[security]
+seccomp = true
+clock = "frozen"
+require_v8_sandbox = false  # MVP images ship prebuilt V8 (no sandbox); true once the custom V8 build lands
+reserved_hosts = []
+master_key_file = ""
+
+[supervisor]
+reserve_mb = 30
+executor_restart_backoff = ["100ms", "1s", "5s"]
+
+[secrets]
+cache_ttl = "60s"
+max_services_per_min = 200
+
+[ingress]
+trusted_proxies = []
+header_timeout = "10s"
+idle_timeout = "60s"
+max_conns_per_ip = 256
+h2_max_streams = 100
+sse_streams_per_key = 10
+backlog = 4096
+
+[egress]
+denied_ports = [25, 465, 587]
+denied_hosts = []
+denied_cidrs = []
+allow_https_downgrade = false
+
+[queue]
+batch_size = 10
+max_attempts = 5
+max_concurrency = 4
+
+[ws]
+max_sockets = 20000
+ping_interval = "30s"
+send_buffer_kb = 1024
+inbox_max = 1024
+max_event_attempts = 3
+max_alarm_attempts = 6
+msgs_per_sec = 50
+msgs_burst = 200
+flood_close_after = "10s"
+drain_grace = "5s"
+
+[logs]
+ring_lines = 1000
+retention_days = 7
+max_mb_per_service = 50
+stdout = false
+
+[metrics]
+per_service = false
+per_service_top_n = 100
+
+[otel]
+endpoint = ""
+sample_ratio = 0.01
