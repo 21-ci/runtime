@@ -7,7 +7,7 @@ to carry patch backports.
 
 | Branch | Purpose | Rules (ruleset in `.github/rulesets/`) |
 |---|---|---|
-| `main` | trunk; always releasable | PRs only, 1 approving review (code owner), stale approvals dismissed, conversations resolved, required check `CI result`, linear history (squash or rebase merge), signed commits, no force push, no deletion |
+| `main` | trunk; always releasable | PRs only (no review required while there is one maintainer; raise `required_approving_review_count` and turn on code-owner review when there are more), conversations resolved, required check `CI result`, linear history (squash or rebase merge), signed commits, no force push, no deletion |
 | `release/x.y` | patch backports for the `x.y` line | same as `main`; created from the `vx.y.0` tag when the first backport is needed |
 | `feat/…`, `fix/…`, … | work branches in forks or the repo | none; deleted after merge |
 
