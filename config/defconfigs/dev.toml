@@ -1,0 +1,188 @@
+# Development profile - local development configuration
+# Debug-friendly settings, verbose logging, small resource limits
+# NOT for production use
+
+[node]
+data_dir = "./data"
+default_profile = "balanced"
+
+[listeners]
+public = "127.0.0.1:8080"       # Localhost only
+internal = "unix:./data/rt.sock"
+control = "127.0.0.1:8081"
+metrics = "127.0.0.1:9090"
+internal_allowed_uids = []      # UIDs besides the node's own allowed on the internal socket
+allow_tcp_internal = false      # a TCP internal listener needs this opt-in (no UID check)
+
+[routing]
+base_domain = "local.test"
+
+[hosts]
+pending_ttl = "7d"              # Unverified custom-host claims expire
+verify_dns = true               # Activate claims whose _rt-verify TXT matches
+verify_interval = "60s"
+max_pending_per_tenant = 10     # Pending claims per tenant
+
+[sched]
+processors = 0                  # Auto-detect
+spare_machines = 0
+lrq_capacity = 64
+max_inflight = 100              # Very small for dev
+max_queued = 0                  # auto: 4 x max_inflight; over it 503 overloaded
+max_queued_mb = 0               # auto: 1/16 of the memory budget
+spin_us = 0
+time_slice = "10ms"
+pin_threads = false
+handoff_on_hog = false
+queue_timeout = "30s"           # Very generous timeout
+warm_share = 0.15               # memory share for autoscaler warm instances
+
+[sched.kinds.deno]
+min = 1
+max = 4                         # Limit deno
+
+[sched.kinds.wasm]
+min = 0
+max = 2                         # Limit wasm
+
+[sysmon]
+max_tick = "100ms"
+
+[rebalance]
+interval = "1s"
+up_threshold = 2.0
+cooldown = "1s"
+
+[io]
+threads = 1
+
+[blocking]
+threads = 1
+
+[memory]
+budget_mb = 256                 # Small for dev
+check_interval = "1s"
+high = 0.80
+critical = 0.92
+purge_min_interval = "10s"
+
+[cache]
+t2_max_mb = 256                 # Small cache
+t1_share = 0.20
+idle_ttl = "60s"
+preload = false
+preload_top_n = 100
+
+[disk]
+low_free_mb = 100
+high_free_mb = 200
+
+[deno]
+isolate_base_mb = 2
+v8_platform_threads = 1
+dispose_backlog = 4
+v8_flags = ["--single-threaded-gc", "--inspect=127.0.0.1:9229"]
+max_bound_per_m = 16
+isolate_pool_per_p = 0
+reuse_isolates = false
+reuse_max_idle = 4
+reuse_max_idle_total = 16
+reuse_idle_ttl = "60s"
+reuse_max_uses = 1000
+
+[wasm]
+fuel = false
+reuse_max_idle = 2
+linear_memory_keep_resident = 0
+reuse_instances = false
+max_unused_warm_slots = 0
+
+[build]
+threads = 1
+memory_mb = 128
+timeout = "300s"                # Generous for slow dev machines
+wasm_timeout = "120s"
+fetch_timeout = "30s"
+npm_cdn = "https://esm.sh"
+allowed_hosts = ["esm.sh", "jsr.io", "deno.land", "localhost", "127.0.0.1"]
+max_deps_mb = 100
+compile = "lazy"
+
+[deploy]
+retain_versions = 3
+auto_rollback = false
+
+[storage]
+blob_backend = "local"
+max_open_dbs = 32
+readers_per_db = 2
+sql_cache_mb = 64
+blob_cache_mb = 64
+sql_budget_ms = 5000            # Generous for dev
+
+[s3]
+endpoint = "http://localhost:9000"  # Local minio for dev
+bucket = "dev"
+prefix = "rt"
+region = "us-east-1"
+
+[security]
+seccomp = false                 # Disable for easier debugging
+clock = "coarse"                # Coarse for dev
+require_v8_sandbox = false  # MVP images ship prebuilt V8 (no sandbox); true once the custom V8 build lands
+reserved_hosts = []
+master_key_file = ""
+
+[supervisor]
+reserve_mb = 20
+executor_restart_backoff = ["100ms", "500ms", "2s"]
+
+[secrets]
+cache_ttl = "0s"                # Always fetch fresh in dev
+max_services_per_min = 1000
+
+[ingress]
+trusted_proxies = ["127.0.0.1", "::1"]  # Allow localhost
+header_timeout = "30s"
+idle_timeout = "300s"
+max_conns_per_ip = 1000
+h2_max_streams = 1000
+sse_streams_per_key = 100
+backlog = 4096
+
+[egress]
+denied_ports = []               # Allow everything in dev
+denied_hosts = []
+denied_cidrs = []
+allow_https_downgrade = false
+
+[queue]
+batch_size = 1
+max_attempts = 3
+max_concurrency = 4
+
+[ws]
+max_sockets = 20000
+ping_interval = "30s"
+send_buffer_kb = 1024
+inbox_max = 1024
+max_event_attempts = 3
+max_alarm_attempts = 6
+msgs_per_sec = 50
+msgs_burst = 200
+flood_close_after = "10s"
+drain_grace = "5s"
+
+[logs]
+ring_lines = 10000              # Lots of logs
+retention_days = 1
+max_mb_per_service = 500        # Generous
+stdout = true                   # Log to stdout
+
+[metrics]
+per_service = true              # Track all services
+per_service_top_n = 1000
+
+[otel]
+endpoint = "http://127.0.0.1:4317"  # Local collector
+sample_ratio = 1.0              # Sample everything
