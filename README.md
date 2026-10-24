@@ -267,7 +267,8 @@ no seccomp profile beyond the basics, no OTLP export) are listed in
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md) (dev setup, tests and coverage, DCO). Coding agents start
   at [AGENTS.md](AGENTS.md).
 - Releases: [RELEASING.md](RELEASING.md) (publishing a version, every channel, one-time setup).
-- Security issues: privately, as described in [SECURITY.md](SECURITY.md#reporting-a-vulnerability).
+- Security issues: privately, as described in [SECURITY.md](SECURITY.md#reporting-a-vulnerability)
+  (security@21ci.uz). Anything else: contact@21ci.uz.
 - Everyone follows the [Code of Conduct](CODE_OF_CONDUCT.md); project roles: [GOVERNANCE.md](GOVERNANCE.md).
 
 ## Building from source

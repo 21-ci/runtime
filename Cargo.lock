@@ -5188,6 +5188,7 @@ dependencies = [
  "http",
  "ipnet",
  "libc",
+ "nix 0.31.3",
  "parking_lot",
  "proptest",
  "rand 0.8.5",

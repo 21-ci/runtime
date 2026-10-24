@@ -32,7 +32,7 @@ represents the project in public spaces.
 
 ## Enforcement
 
-Report unacceptable behavior to the maintainers at **conduct@21-ci.uz** or privately to any maintainer listed in [GOVERNANCE.md](GOVERNANCE.md). Every report is reviewed
+Report unacceptable behavior to the maintainers at **conduct@21ci.uz** or privately to any maintainer listed in [GOVERNANCE.md](GOVERNANCE.md). Every report is reviewed
 promptly and fairly, and the reporter's privacy is respected.
 
 Maintainers follow the Contributor Covenant's enforcement guidelines: correction, warning, temporary ban, permanent

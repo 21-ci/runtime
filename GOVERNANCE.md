@@ -8,11 +8,12 @@ The 21 Cloud runtime is maintained by the 21 Cloud team with contributions from 
 |---|---|---|
 | Contributor | anyone who opens an issue, a discussion or a PR | propose changes |
 | Maintainer | listed in [.github/CODEOWNERS](.github/CODEOWNERS) | review and merge PRs, triage issues, cut releases |
-| Lead maintainer | the 21 Cloud project lead | final say when maintainers cannot agree; security response; adds or removes maintainers |
+| Lead maintainer | Alex Sayfi ([@aliakseych](https://github.com/aliakseych), alex@sayfi.uz), project owner | final say when maintainers cannot agree; security response; adds or removes maintainers |
 
 ## Decisions
 
-- Day-to-day changes: a PR with one maintainer approval and green CI.
+- Day-to-day changes: a PR with green CI, and one maintainer approval once the project has more than one
+  maintainer (until then the lead maintainer merges their own PRs after CI passes).
 - Larger changes (a new `std:*` module, a breaking API or config change, a new trust boundary): an issue labeled
   `proposal` first, open for comment for at least 7 days, then accepted or declined by the maintainers with the
   reasons written down in the issue.

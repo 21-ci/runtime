@@ -106,7 +106,8 @@ if [[ ${#CRATES[@]} -gt 0 ]]; then
   PKGS=()
   for c in "${CRATES[@]}"; do PKGS+=(-p "$c"); done
   echo "==> tests under coverage: ${CRATES[*]}"
-  cargo llvm-cov --no-report "${PKGS[@]}" ${SCOPE[@]+"${SCOPE[@]}"} \
+  # --no-fail-fast: a failing test still fails the run, but every crate is still measured.
+  cargo llvm-cov --no-report --no-fail-fast "${PKGS[@]}" ${SCOPE[@]+"${SCOPE[@]}"} \
     ${CARGO_EXTRA[@]+"${CARGO_EXTRA[@]}"} || { echo "some tests failed (report still written)" >&2; RC=1; }
 
   # Test code, test support and fixtures are not the code under test.

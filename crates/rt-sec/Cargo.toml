@@ -38,3 +38,7 @@ hex.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Safe getifaddrs for the self-denylist (crates/rt-sec/src/egress.rs).
+nix = { version = "0.31", default-features = false, features = ["net"] }

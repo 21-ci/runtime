@@ -945,7 +945,7 @@ otherwise.
 | Channel | Use it for |
 |---|---|
 | [GitHub private vulnerability report](https://github.com/21-ci/runtime/security/advisories/new) | the preferred channel: the report, the discussion, the fix and the advisory stay in one private place |
-| **security@21-ci.uz** | if you cannot use GitHub. If the report contains exploit details, prefer a private advisory, or ask for an encryption key first |
+| **security@21ci.uz** | if you cannot use GitHub. If the report contains exploit details, prefer a private advisory, or ask for an encryption key first |
 
 In scope: `rt`, `21ci`, the `std:*` guest APIs, the container images, the packages and the installer in this
 repository, and the release pipeline itself (`.github/workflows/`). Out of scope: findings that need an operator to
@@ -1023,7 +1023,10 @@ packages with an RSA key. Check the fingerprint before you trust the key:
 
 ```bash
 curl -fsSL https://21-ci.github.io/runtime/packages/gpg.key | gpg --show-keys --with-fingerprint
-# expected: 8CA0 AF89 52C4 4EC7 4163  94EC E61F 9E71 A8E8 EF51  (21 Cloud Packages <packages@21-ci.uz>, expires 2029-10-23)
+# expected: the fingerprint below
 ```
+
+Package signing key: `21 Cloud Packages <packages@21ci.uz>`, fingerprint `PENDING-NEW-KEY` (set when the key is
+created; a changed key is announced in the release notes).
 
 The Homebrew formulae pin the SHA-256 of each tarball; `brew` verifies it on install.

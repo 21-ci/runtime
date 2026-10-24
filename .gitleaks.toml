@@ -1,0 +1,16 @@
+# gitleaks configuration: the default rules plus an allowlist of reviewed false positives.
+# Each entry is a test fixture or sample value shaped like a key. Match values, not commit fingerprints, so the
+# allowlist survives history changes and a real secret in the same file is still reported. Never add a real
+# secret here: rotate it and remove it from the history instead.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "reviewed test fixtures"
+regexes = [
+  '''wrong-secret-0123456789''',   # sample/apps/telegram-bot/smoke.sh: the wrong webhook secret the smoke sends
+  '''tok-canary-1234567''',        # rt-exec-deno tests: a canary env value that must never appear in logs
+  '''0x1234_5678_9abc_def0''',     # rt-cache tests: a fixed hash key for the frequency sketch
+  '''dGhlIHNhbXBsZSBub25jZQ==''',   # the RFC 6455 example Sec-WebSocket-Key ("the sample nonce")
+]

@@ -251,13 +251,16 @@ The docs appear at `https://21-ci.github.io/runtime/`; `packages/` fills in with
 
 ### 5. Contact addresses
 
-The published files name three mailboxes on `21-ci.uz`; make sure each one exists and is read:
+The project's domain is `21ci.uz` (the GitHub organization is `21-ci`). The published files name these addresses;
+make sure each mailbox exists and is read:
 
 | Address | Named in | For |
 |---|---|---|
-| `security@21-ci.uz` | `SECURITY.md` | vulnerability reports from people who cannot use GitHub advisories |
-| `conduct@21-ci.uz` | `CODE_OF_CONDUCT.md` | code of conduct reports |
-| `packages@21-ci.uz` | the GPG key, `packaging/nfpm/*.yaml` (package maintainer field) | package questions |
+| `alex@sayfi.uz` | `GOVERNANCE.md`, `Cargo.toml` authors, `packaging/nfpm/*.yaml` (package maintainer) | the owner and lead maintainer |
+| `contact@21ci.uz` | `SUPPORT.md`, `README.md` | general contact |
+| `security@21ci.uz` | `SECURITY.md` | vulnerability reports from people who cannot use GitHub advisories |
+| `conduct@21ci.uz` | `CODE_OF_CONDUCT.md` | code of conduct reports |
+| `packages@21ci.uz` | the package signing key's user ID | the key that signs apt/rpm |
 
 ### 6. Branch and tag rules
 

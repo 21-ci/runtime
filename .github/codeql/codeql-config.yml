@@ -1,0 +1,8 @@
+# CodeQL scans the code that ships: crates' src, js/, wit/, workflows, scripts and the samples users copy.
+# Test code is left out on purpose: it prints throwaway test keys in assertion messages and uses fixed nonces to
+# build legacy-format fixtures, which CodeQL reports as cleartext logging and hard-coded crypto values.
+name: runtime
+paths-ignore:
+  - "**/tests/**"
+  - fixtures
+  - crates/rt-testkit
