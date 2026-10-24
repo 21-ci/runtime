@@ -203,15 +203,18 @@ async fn a_failing_delivery_is_retried_with_backoff_then_dropped() {
                 "every attempt, no more"
             );
             let gap = |i: usize| (d[i + 1].at_ms - d[i].at_ms) as f64 / 1000.0;
-            // 2 s, 4 s, 8 s, 16 s of backoff (+ up to 20 %).
-            assert!((1.6..=2.6).contains(&gap(0)), "first backoff ≈ 2 s, got {}", gap(0));
-            assert!(
-                gap(1) > gap(0) && gap(2) > gap(1),
-                "the backoff grows: {} {} {}",
-                gap(0),
-                gap(1),
-                gap(2)
-            );
+            // 2 s, 4 s, 8 s, 16 s of backoff (jitter within 20 %). Only the lower bound is exact here: virtual
+            // time keeps advancing while the store's real I/O records a failure, so on a loaded runner a retry
+            // can be seen later than scheduled, never earlier.
+            for i in 0..d.len() - 1 {
+                let backoff = 2f64.powi(i as i32 + 1);
+                assert!(
+                    gap(i) >= 0.8 * backoff,
+                    "retry {} waited {} s, its backoff is {backoff} s",
+                    i + 1,
+                    gap(i)
+                );
+            }
             assert!(
                 r.store.list(svc(), None, 10).await.expect("list").is_empty(),
                 "dropped after the last attempt"

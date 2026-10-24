@@ -28,8 +28,9 @@ mod linux {
     }
 
     /// SQL-016: writes into a database whose disk fills up fail with `storage_quota`; every row
-    /// committed before is still there and the file passes `integrity_check`; deleting rows makes
-    /// writes work again.
+    /// committed before is still there and the file passes `integrity_check`; once space is freed
+    /// (here: the volume grows), writes work again. Deleting rows is no way out on a 100 % full disk:
+    /// the delete itself needs WAL pages.
     #[tokio::test]
     async fn sql_016_a_full_disk_is_storage_quota_and_the_database_stays_consistent() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -65,8 +66,12 @@ mod linux {
         );
         let ok = sql.execute(st("PRAGMA integrity_check")).await.expect("integrity");
         assert_eq!(ok.rows, vec![vec![SqlValue::Text("ok".into())]]);
-        sql.execute(st("DELETE FROM t")).await.expect("delete frees pages");
-        sql.execute(st("VACUUM")).await.ok();
+        let grown = Command::new("sudo")
+            .args(["-n", "mount", "-o", "remount,size=16m"])
+            .arg(dir.path())
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(grown, "remount the tmpfs larger");
         sql.execute(st_args(
             "INSERT INTO t VALUES (?)",
             vec![SqlValue::Blob(vec![1u8; 1024])],

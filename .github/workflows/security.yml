@@ -37,14 +37,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      # Native, on the pinned toolchain: the cargo-deny Docker action ships its own (older) Rust and cannot run
+      # cargo metadata under rust-toolchain.toml.
+      - uses: ./.github/actions/setup-rust
         with:
-          command: check
-          arguments: --workspace
-          command-arguments: advisories licenses bans sources
+          cache-key: deps
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
-          tool: cargo-audit@0.22.2
+          tool: cargo-deny,cargo-audit@0.22.2
+      - name: cargo deny (advisories, licenses, bans, sources)
+        run: cargo deny --workspace check advisories licenses bans sources
       - name: cargo audit (ignores come from deny.toml, each with its reason)
         run: |
           ignores=$(python3 -c 'import tomllib; print(" ".join("--ignore " + i["id"] for i in tomllib.load(open("deny.toml","rb"))["advisories"].get("ignore", [])))')
@@ -74,6 +76,7 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: none
           queries: security-extended
+          config-file: ./.github/codeql/codeql-config.yml
       - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           category: /language:${{ matrix.language }}
@@ -157,10 +160,10 @@ jobs:
         with:
           version: 1.31.1
           min-severity: medium
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
-        with:
-          tool: actionlint@1.7.12
-      - run: actionlint -color
+      # install-action does not know this release; build it like gitleaks (Go is on the runner).
+      - name: Install actionlint v1.7.12
+        run: GOBIN="$RUNNER_TEMP/bin" go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - run: '"$RUNNER_TEMP/bin/actionlint" -color'
 
   lint:
     name: hadolint + shellcheck
@@ -189,11 +192,17 @@ jobs:
           failure-threshold: warning
           format: sarif
           output-file: hadolint-21ci.sarif
+      # One upload per file: code scanning refuses two runs under one category.
       - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
-        if: always()
+        if: always() && hashFiles('hadolint-rt.sarif') != ''
         with:
-          sarif_file: .
-          category: hadolint
+          sarif_file: hadolint-rt.sarif
+          category: hadolint-rt
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always() && hashFiles('hadolint-21ci.sarif') != ''
+        with:
+          sarif_file: hadolint-21ci.sarif
+          category: hadolint-21ci
       - name: shellcheck (packaging, scripts, samples, e2e)
         run: |
           # packaging/ is POSIX sh and must be clean at every severity; the rest blocks on errors.

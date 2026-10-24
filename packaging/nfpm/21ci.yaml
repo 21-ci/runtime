@@ -14,7 +14,7 @@ version: ${VERSION}
 version_schema: semver
 section: devel
 priority: optional
-maintainer: 21 Cloud Runtime Maintainers <packages@21-ci.uz>
+maintainer: Alex Sayfi <alex@sayfi.uz>
 vendor: 21 Cloud
 homepage: https://github.com/21-ci/runtime
 license: Apache-2.0

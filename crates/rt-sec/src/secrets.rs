@@ -12,9 +12,8 @@
 //! keep the previous master key for decryption only (`RT_MASTER_KEY_PREVIOUS`) while
 //! `rt secrets reseal` rewrites every value under the current one.
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{Aead, AeadCore, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use rand::RngCore;
 use rt_types::{ServiceId, TenantId};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -211,8 +210,8 @@ impl SecretsBackend for LocalSecrets {
         reason = "AES-GCM fails only past 64 GiB of plaintext; secrets are capped at 32 KiB"
     )]
     fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Sealed {
-        let mut nonce = [0u8; NONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        // A fresh random 96-bit nonce per seal, from the OS RNG (the AEAD crate's own generator).
+        let nonce: [u8; NONCE_LEN] = Aes256Gcm::generate_nonce(&mut aes_gcm::aead::OsRng).into();
         let aad = v1_aad(self.current.id, aad);
         let ciphertext = self
             .current

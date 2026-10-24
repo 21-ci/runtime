@@ -7,7 +7,7 @@ use crate::common;
 use std::sync::Arc;
 
 use common::*;
-use rt_types::{ObjectRef, TaskSpec};
+use rt_types::{ObjectRef, Outcome, TaskSpec};
 use serde_json::{json, Value};
 
 /// Run `code` as a guest on `h` and return the JSON it answers (the guest must answer 200).
@@ -581,9 +581,19 @@ fn many_services_each_open_their_connection_and_the_registry_forgets_the_dead_on
                  export default () => { const db = new Database(); db.run('create table if not exists t (n integer)'); return new Response('ok'); };",
             ))
             .await;
+        // A cold service's first statement waits at most its budget for the open (on the blocking pool)
+        // and fails fast with sql_busy otherwise; the open goes on and the next call finds it. On a slow
+        // runner that happens, so retry like a client would: every service still gets its connection.
         for n in 1..=270u128 {
-            let ran = h.run(spec().service(n).http_get("/").finish(), &p).await;
-            assert_eq!(read(ran.outcome).await.status, 200, "service {n}");
+            let mut tries = 0;
+            let ran = loop {
+                tries += 1;
+                let ran = h.run(spec().service(n).http_get("/").finish(), &p).await;
+                if matches!(ran.outcome, Outcome::Ok(_)) || tries == 5 {
+                    break ran;
+                }
+            };
+            assert_eq!(read(ran.outcome).await.status, 200, "service {n} after {tries} tries");
         }
     });
 }

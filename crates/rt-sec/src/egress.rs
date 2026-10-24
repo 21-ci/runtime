@@ -124,32 +124,14 @@ pub struct SelfDenylist {
 pub fn local_interface_addrs() -> Vec<IpAddr> {
     let mut out = Vec::new();
     #[cfg(unix)]
-    // SAFETY: getifaddrs allocates a list we only read and then free with freeifaddrs; every
-    // `ifa_addr` is checked for null and its family before the cast to the matching sockaddr type.
-    unsafe {
-        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut head) != 0 {
-            return out;
-        }
-        let mut cur = head;
-        while !cur.is_null() {
-            let addr = (*cur).ifa_addr;
-            if !addr.is_null() {
-                match i32::from((*addr).sa_family) {
-                    libc::AF_INET => {
-                        let sin = &*(addr as *const libc::sockaddr_in);
-                        out.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))));
-                    }
-                    libc::AF_INET6 => {
-                        let sin6 = &*(addr as *const libc::sockaddr_in6);
-                        out.push(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
-                    }
-                    _ => {}
-                }
+    if let Ok(interfaces) = nix::ifaddrs::getifaddrs() {
+        for address in interfaces.filter_map(|i| i.address) {
+            if let Some(v4) = address.as_sockaddr_in() {
+                out.push(IpAddr::V4(v4.ip()));
+            } else if let Some(v6) = address.as_sockaddr_in6() {
+                out.push(IpAddr::V6(v6.ip()));
             }
-            cur = (*cur).ifa_next;
         }
-        libc::freeifaddrs(head);
     }
     out
 }

@@ -42,7 +42,8 @@ jobs:
 
   dco:
     name: DCO sign-off
-    if: github.event_name == 'pull_request'
+    # Bots (Dependabot, the release App) cannot sign off; their PRs only change versions and lock files.
+    if: github.event_name == 'pull_request' && !endsWith(github.event.pull_request.user.login, '[bot]')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -100,6 +101,10 @@ jobs:
         with:
           targets: wasm32-wasip2
           cache-key: fixtures
+      # wasm-tools derives multimem.wasm (a two-memory component the executor must refuse) from hello.wasm.
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: wasm-tools
       - run: scripts/build-fixtures.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -361,7 +366,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: All required jobs passed (skipped counts as passed only for DCO outside pull requests)
+      - name: All required jobs passed (skipped counts as passed only for DCO outside pull requests or on bot PRs)
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: |
