@@ -159,12 +159,15 @@ async fn key_035_a_child_minted_during_the_parents_revocation_dies_with_it() {
         let mint = self_key(&node, &parent, json!({"scopes": ["services:read"]}));
         let (rv, mk) = tokio::join!(revoke, mint);
         assert_eq!(rv.s(), 204, "round {round}: {}", rv.text);
+        // Refused either as unauthenticated (401) or, once the rounds' failed attempts trip the failed-auth
+        // limiter, as rate limited (429 `rate_limited`): both mean the key did not authenticate.
+        let refused = |s: u16, code: String| s == 401 || (s == 429 && code == "rate_limited");
         if mk.s() == 201 {
             let secret = mk.json["secret"].as_str().unwrap();
             let r = get(&node, secret, "/v1/services").await;
-            assert_eq!(r.s(), 401, "round {round}: a child of a revoked parent authenticated");
+            assert!(refused(r.s(), r.code()), "round {round}: a child of a revoked parent authenticated: {}", r.text);
         } else {
-            assert_eq!(mk.s(), 401, "round {round}: {}", mk.text);
+            assert!(refused(mk.s(), mk.code()), "round {round}: {}", mk.text);
         }
     }
     node.shutdown().await;

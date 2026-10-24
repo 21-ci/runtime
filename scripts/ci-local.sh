@@ -11,6 +11,8 @@
 #   test       every test of the workspace under coverage, with the CI floors (scripts/coverage.sh)
 #   smokes     the sample apps against the rt binary of the test stage
 #   image      docker build of rt and 21ci, trivy + grype on the images (slow; not in the default set)
+#   packages   signed deb/rpm/apk, the apt/rpm/apk repositories and installs from them in containers
+#              (scripts/test-packages.sh; needs Docker and nfpm; not in the default set)
 #
 #   --fast     lint security docs only (a few minutes): what to run before every push
 #
@@ -31,7 +33,7 @@ for a in "$@"; do
   case "$a" in
     -h|--help) usage; exit 0 ;;
     --fast) STAGES+=(lint security docs) ;;
-    lint|security|docs|test|smokes|image) STAGES+=("$a") ;;
+    lint|security|docs|test|smokes|image|packages) STAGES+=("$a") ;;
     *) echo "unknown stage or option '$a' (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -112,6 +114,8 @@ image() {
     --exit-code 1 21ci:ci'
   check grype-image sh -c 'grype --only-fixed --fail-on high rt:ci && grype --only-fixed --fail-on high 21ci:ci'
 }
+
+packages() { check packages scripts/test-packages.sh; }
 
 for s in "${STAGES[@]}"; do
   echo "==> $s"

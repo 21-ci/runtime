@@ -114,7 +114,7 @@ fn dsql_003_iterate_is_capped() {
     run_local(async {
         let mut h = Harness::new(cfg0());
         let p = h.prepare(&ts_upload(ITERATE)).await;
-        let (got, _) = h.get("/", &p).await;
+        let got = read(h.run_past_cold_open(|| get("/"), &p).await.outcome).await;
         assert_eq!(got.status, 200, "{}", got.text());
         let v = got.json();
         assert_eq!(v["code"], json!("sql_result_too_large"), "{v}");
@@ -160,10 +160,13 @@ fn preempt_003_host_sql_cpu_counts_toward_the_cpu_limit() {
     run_local(async {
         let mut h = Harness::new(cfg0());
         let p = h.prepare(&ts_upload(SQL_BURN)).await;
-        let mut s = get("/");
-        s.limits.cpu = std::time::Duration::from_millis(150);
-        s.limits.wall = std::time::Duration::from_secs(30);
-        let ran = h.run(s, &p).await;
+        let spec = || {
+            let mut s = get("/");
+            s.limits.cpu = std::time::Duration::from_millis(150);
+            s.limits.wall = std::time::Duration::from_secs(30);
+            s
+        };
+        let ran = h.run_past_cold_open(spec, &p).await;
         let logs: Vec<String> = h.log_records().into_iter().map(|r| r.msg).collect();
         assert!(
             matches!(ran.outcome, rt_types::Outcome::Killed(rt_types::KillReason::CpuLimit)),
