@@ -360,6 +360,7 @@ impl EffectiveService {
             idle_ttl: self.idle_ttl.value,
             preload: self.preload.value,
             compile: self.compile.value,
+            min_run_time: None,
             scaling: self.scaling,
         }
     }
