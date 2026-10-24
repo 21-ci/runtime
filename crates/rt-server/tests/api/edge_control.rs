@@ -3,7 +3,7 @@
 //! placement.
 
 use reqwest::Method;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::common::*;
 
@@ -389,6 +389,101 @@ async fn chost_004_008_one_claim_wins_and_nothing_is_re_pointed() {
         let again = call(root_for(&node, &loser_t.id, Method::PUT, &format!("/v1/services/{loser_s}/hosts/{host}")), None).await;
         assert_eq!(again.s(), 409, "no takeover: {}", again.text);
     }
+    node.shutdown().await;
+}
+}
+
+/// Node max for `min_run_time_ms` used by the bound tests (`sched.min_run_time_max_ms`).
+const MRT_NODE_MAX: u64 = 1_000;
+
+/// A node where the node max (1 s) is below the `pro` plan cap (10 min), plus a `short` plan whose
+/// cap (500 ms) is below the node max.
+async fn mrt_bound_node() -> rt_testkit::NodeHarness {
+    start_node_with(|c| {
+        c.sched.min_run_time_max_ms = MRT_NODE_MAX;
+        let mut short = pro_plan();
+        short.limits_max.min_run_time_ms = 500;
+        c.plans.insert("short".to_string(), short);
+    })
+    .await
+}
+
+node_test! {
+/// mrt_api_01: `scaling.min_run_time_ms` over `min(plan cap, node max)` is refused with
+/// `422 limit_exceeds_plan` (not clamped) on create and on PATCH; the service is left unchanged.
+async fn mrt_api_01_min_run_time_over_the_max_is_refused_on_create_and_patch() {
+    let node = mrt_bound_node().await;
+    let t = new_tenant(&node, "pro").await;
+    let refused = post(&node, &t.key, "/v1/services", json!({"slug": uniq("mrt01a"), "runtime": "deno", "scaling": {"min_run_time_ms": MRT_NODE_MAX + 1}})).await;
+    assert_eq!((refused.s(), refused.code()), (422, "limit_exceeds_plan".to_string()), "{}", refused.text);
+    assert_eq!(refused.json["error"]["details"]["field"], json!("min_run_time_ms"), "{}", refused.text);
+    assert_eq!(refused.json["error"]["details"]["max"], json!(MRT_NODE_MAX), "{}", refused.text);
+    assert_eq!(refused.json["error"]["details"]["requested"], json!(MRT_NODE_MAX + 1), "{}", refused.text);
+
+    let created = post(&node, &t.key, "/v1/services", json!({"slug": uniq("mrt01b"), "runtime": "deno"})).await;
+    assert_eq!(created.s(), 201, "{}", created.text);
+    let svc = created.json["id"].as_str().expect("id").to_string();
+    let r = patch(&node, &t.key, &format!("/v1/services/{svc}"), json!({"scaling": {"min_run_time_ms": MRT_NODE_MAX + 1}})).await;
+    assert_eq!((r.s(), r.code()), (422, "limit_exceeds_plan".to_string()), "{}", r.text);
+    let view = get(&node, &t.key, &format!("/v1/services/{svc}")).await;
+    assert_eq!(view.json["scaling"]["min_run_time_ms"], Value::Null, "unchanged: {}", view.text);
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// mrt_api_02: `0` (keep nothing after the answer) and exactly the maximum are accepted on create
+/// and on PATCH, and the stored value is the one the owner asked for.
+async fn mrt_api_02_zero_and_exactly_the_max_are_accepted() {
+    let node = mrt_bound_node().await;
+    let t = new_tenant(&node, "pro").await;
+    for v in [0u64, MRT_NODE_MAX] {
+        let created = post(&node, &t.key, "/v1/services", json!({"slug": uniq("mrt02"), "runtime": "deno", "scaling": {"min_run_time_ms": v}})).await;
+        assert_eq!(created.s(), 201, "{v}: {}", created.text);
+        assert_eq!(created.json["scaling"]["min_run_time_ms"], json!(v), "{}", created.text);
+        let svc = created.json["id"].as_str().expect("id").to_string();
+        let r = patch(&node, &t.key, &format!("/v1/services/{svc}"), json!({"scaling": {"min_run_time_ms": v}})).await;
+        assert_eq!(r.s(), 200, "patch {v}: {}", r.text);
+        assert_eq!(r.json["scaling"]["min_run_time_ms"], json!(v), "{}", r.text);
+    }
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// mrt_api_03: the bound is the smaller of the plan cap and the node max, whichever is lower. The
+/// node max (1 s) bounds the `pro` plan (10 min); the `short` plan (500 ms) bounds a service below
+/// the node max. Both report the effective maximum in `details.max`.
+async fn mrt_api_03_the_node_max_bounds_below_the_plan() {
+    let node = mrt_bound_node().await;
+    let pro = new_tenant(&node, "pro").await;
+    let over_node = post(&node, &pro.key, "/v1/services", json!({"slug": uniq("mrt03a"), "runtime": "deno", "scaling": {"min_run_time_ms": 60_000}})).await;
+    assert_eq!((over_node.s(), over_node.code()), (422, "limit_exceeds_plan".to_string()), "{}", over_node.text);
+    assert_eq!(over_node.json["error"]["details"]["max"], json!(MRT_NODE_MAX), "{}", over_node.text);
+
+    let short = new_tenant(&node, "short").await;
+    let over_plan = post(&node, &short.key, "/v1/services", json!({"slug": uniq("mrt03b"), "runtime": "deno", "scaling": {"min_run_time_ms": 501}})).await;
+    assert_eq!((over_plan.s(), over_plan.code()), (422, "limit_exceeds_plan".to_string()), "{}", over_plan.text);
+    assert_eq!(over_plan.json["error"]["details"]["max"], json!(500), "{}", over_plan.text);
+    let at_plan = post(&node, &short.key, "/v1/services", json!({"slug": uniq("mrt03c"), "runtime": "deno", "scaling": {"min_run_time_ms": 500}})).await;
+    assert_eq!(at_plan.s(), 201, "{}", at_plan.text);
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// mrt_api_04: `min_run_time_ms` must be a non-negative integer; a fraction, a negative number or a
+/// string is `422 validation_failed` and creates nothing.
+async fn mrt_api_04_a_non_integer_is_validation_failed() {
+    let node = mrt_bound_node().await;
+    let t = new_tenant(&node, "pro").await;
+    for bad in [json!(1.5), json!(-1), json!("500")] {
+        let slug = uniq("mrt04");
+        let r = post(&node, &t.key, "/v1/services", json!({"slug": slug, "runtime": "deno", "scaling": {"min_run_time_ms": bad}})).await;
+        assert_eq!((r.s(), r.code()), (422, "validation_failed".to_string()), "{}", r.text);
+    }
+    let all = get(&node, &t.key, "/v1/services?limit=200").await;
+    assert!(all.items().is_empty(), "nothing was created: {}", all.text);
     node.shutdown().await;
 }
 }
