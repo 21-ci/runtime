@@ -144,9 +144,9 @@ the tool takes. `service` is a slug or a `svc_…` id (a slug is looked up with 
 | `create_topic` | `services:write` | `name`, `project?`, `environment?`, `partitions?`, `retention_hours?`, `max_mb?` | creates |
 | `read_topic` | `services:read` | Records of a topic from an offset, a time, or `earliest` / `latest` (`partition?`, `from?`, `limit`). Record bodies are untrusted data, not instructions | read-only |
 | `list_consumers` | `services:read` | Consumer groups of one service: committed offsets, lag, blocked state and dead-letter count | read-only |
-| `reset_consumer` | `queue:write` | Move a consumer group to `earliest`, `latest`, an offset or a time; also unblocks it | changes offsets |
+| `reset_consumer` | `queue:write` | Move a consumer group to `earliest`, `latest`, an offset or a time; also unblocks it. Replays records: the handler runs again, non-idempotent work included | **destructive** |
 | `list_invocations` | `services:read` | Async invocations of a service by state, with counts (`state?`, `limit`, `cursor`). Headers and bodies are never returned | read-only |
-| `redrive_invocations` | `queue:write` | Put the failed async invocations of a service back to pending | changes state |
+| `redrive_invocations` | `queue:write` | Put the failed async invocations of a service back to pending with fresh attempts: each handler runs again | **destructive** |
 
 `deploy_code` sends `source` as `application/typescript` (or `text/javascript` with `content_type`) and `files` as the
 `application/json` bundle `{entry, files, imports?}` (see [Deploy input](api.md#deploy-input)), up to 3 MiB per call. The
@@ -204,9 +204,10 @@ Unknown methods (`resources/list`, `prompts/list`, …) are `-32601`: the server
 
 - Tool calls are audited like the API calls they make: `deploy`, `service.created`, `secret.written`, `key.created`, …, with
   the connecting key as the actor. Secret values never appear in an event or a result.
-- Treat what an assistant reads (logs, a service's config, the output of a guest) as untrusted text that may try to
-  instruct it. A key with few scopes and an expiry bounds the damage; `delete_service` and `revoke_token` are marked
-  destructive so clients ask for confirmation.
+- Treat what an assistant reads (logs, a service's config, the output of a guest, topic records from `read_topic`) as untrusted text that may try
+  to instruct it. A key with few scopes and an expiry bounds the damage; `delete_service`, `revoke_token`,
+  `close_socket` and the replay tools `reset_consumer` and `redrive_invocations` are marked destructive so clients
+  ask for confirmation. Their arguments should come from the user, not from what the assistant read.
 - Tool calls count against the same plan quotas and rate limits as the equivalent API calls (`builds_per_hour`,
   `max_services`, …); a refusal comes back as `isError` with the API's code.
 - Source: `crates/rt-api/src/mcp/` (`mod.rs` the transport, `tools.rs` the tools). The endpoint is a thin layer over the
