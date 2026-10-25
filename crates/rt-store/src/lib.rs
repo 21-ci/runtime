@@ -42,8 +42,8 @@ pub use meta::{
 pub use queue::{
     DlqEntry, Leased, NewMessage, QueueStats, QueueStore, RetryResult, SqliteQueueStore, MIGRATIONS as QUEUE_MIGRATIONS,
 };
-pub use sync_sql::{LocalDb, LocalError, LocalSqlSource, RowRef, RunStats, SqlRef, StmtInfo, TxMode};
 pub use stream::{
     Appended, Cursor, CursorKey, DeadRecord, NewRecord, PartitionHead, ReadFrom, SqliteStreamStore, StreamStore, Topic,
     TopicSpec, TrimStats, STREAM_MIGRATIONS,
 };
+pub use sync_sql::{LocalDb, LocalError, LocalSqlSource, RowRef, RunStats, SqlRef, StmtInfo, TxMode};
