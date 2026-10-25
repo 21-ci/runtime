@@ -1055,13 +1055,13 @@ fn adm_reentrant_calls_stay_within_the_tenant_allowance_and_max_inflight() {
         waits(&a.admit(&reentrant(task(1, 1, k))).unwrap()),
         "a request is never re-entrant: it waits on the ceiling"
     );
-    assert!(runs(&a.admit(&reentrant(call(1, 1, k))).unwrap()));
+    assert!(runs(&a.admit(&reentrant(call_from(1, 1, k, 1))).unwrap()));
     assert!(
-        runs(&a.admit(&reentrant(call(1, 1, k))).unwrap()),
-        "two depth-1 calls: the plan cap of 2"
+        runs(&a.admit(&reentrant(call_from(1, 1, k, 2))).unwrap()),
+        "two depth-1 calls (of two parents): the plan cap of 2"
     );
     assert!(
-        waits(&a.admit(&reentrant(call(1, 1, k))).unwrap()),
+        waits(&a.admit(&reentrant(call_from(1, 1, k, 3))).unwrap()),
         "the third depth-1 call waits on the tenant's call allowance"
     );
     assert!(
@@ -1072,8 +1072,11 @@ fn adm_reentrant_calls_stay_within_the_tenant_allowance_and_max_inflight() {
     let mut b = Adm::new(limits(2));
     let k = knobs(1, 0, 0);
     assert!(runs(&b.admit(&task(2, 2, k)).unwrap()));
-    assert!(runs(&b.admit(&reentrant(call(2, 2, k))).unwrap()), "the call reserve");
-    let blocked = b.admit(&reentrant(call(2, 2, k))).unwrap();
+    assert!(
+        runs(&b.admit(&reentrant(call_from(2, 2, k, 1))).unwrap()),
+        "the call reserve"
+    );
+    let blocked = b.admit(&reentrant(call_from(2, 2, k, 2))).unwrap();
     assert!(waits(&blocked), "max_inflight of 2 holds a re-entrant call");
     let n = b.next;
     assert_eq!(
@@ -1081,6 +1084,77 @@ fn adm_reentrant_calls_stay_within_the_tenant_allowance_and_max_inflight() {
         vec![n],
         "granted past the ceiling once a node slot frees"
     );
+}
+
+fn call_from(tenant: u128, service: u128, k: ServiceKnobs, parent: u64) -> TaskSpec {
+    SpecBuilder::deno()
+        .tenant(tenant)
+        .service(service)
+        .knobs(k)
+        .trigger(Trigger::Call {
+            parent: TaskId(parent),
+            depth: 1,
+        })
+        .finish()
+}
+
+/// M3: a blocked parent lends one slot, not one per child. A `Promise.all` fan-out of self-calls
+/// from one parent at `max_instances: 1` runs one child past the ceiling at a time; the others
+/// wait for it (no deadlock: one always runs). A child that calls itself again lends its own slot.
+#[test]
+fn adm_reentrant_fan_out_of_one_parent_borrows_one_slot() {
+    let mut a = Adm::new(limits(100));
+    let k = knobs(1, 0, 0);
+    assert!(runs(&a.admit(&task(1, 1, k)).unwrap()));
+    assert!(
+        runs(&a.admit(&reentrant(call_from(1, 1, k, 7))).unwrap()),
+        "the first child borrows the parent's slot"
+    );
+    let first = a.next;
+    let mut queued = Vec::new();
+    for _ in 0..5 {
+        assert!(
+            waits(&a.admit(&reentrant(call_from(1, 1, k, 7))).unwrap()),
+            "a second child of the same parent waits"
+        );
+        queued.push(a.next);
+    }
+    assert_eq!(a.a.service(ids::service(1)).map(|s| s.running), Some(2));
+    // the running child calls itself: its own slot is lent (a chain still makes progress)
+    assert!(
+        runs(&a.admit(&reentrant(call_from(1, 1, k, 99))).unwrap()),
+        "a grandchild runs"
+    );
+    let grand = a.next;
+    assert_eq!(a.a.service(ids::service(1)).map(|s| s.running), Some(3));
+    assert!(a.finish(grand).is_empty());
+    assert_eq!(a.finish(first), vec![queued[0]], "the next sibling takes the lent slot");
+    for w in queued.windows(2) {
+        assert_eq!(a.finish(w[0]), vec![w[1]]);
+    }
+    assert!(a.finish(*queued.last().unwrap()).is_empty());
+}
+
+/// M3: re-entrant tasks with no parent id (pub/sub replies) or many parents never take more than
+/// `MAX_CALL_DEPTH` slots past the ceiling.
+#[test]
+fn adm_reentrant_overshoot_has_a_hard_cap() {
+    let mut a = Adm::new(limits(1000));
+    let k = knobs(1, 0, 0);
+    assert!(runs(&a.admit(&task(1, 1, k)).unwrap()));
+    let cap = u32::from(rt_types::MAX_CALL_DEPTH);
+    for _ in 0..cap {
+        assert!(runs(&a.admit(&reentrant(reply_of(1, 1, k, 2))).unwrap()));
+    }
+    assert!(
+        waits(&a.admit(&reentrant(reply_of(1, 1, k, 2))).unwrap()),
+        "past the hard cap"
+    );
+    assert!(
+        waits(&a.admit(&reentrant(call_from(1, 1, k, 5))).unwrap()),
+        "past the hard cap"
+    );
+    assert_eq!(a.a.service(ids::service(1)).map(|s| s.running), Some(1 + cap));
 }
 
 /// Review 7: a call queued for a service that is already listed, while its tenant is out of the

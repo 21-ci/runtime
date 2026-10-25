@@ -30,9 +30,12 @@
 //! **Re-entrant calls.** A call or a pub/sub request reply that a task of the *same* service
 //! submitted ([`TaskSpec::reentrant`]) is not held by the service ceiling: its parent waits for it
 //! while holding one of the service's slots, so at `max_instances: 1` the slot could never free
-//! (the self-call would end `queue_timeout`). Such a call may run past `max_instances`; it still
-//! takes the tenant's call allowance at its depth, a `max_inflight` slot and its own memory
-//! reservation, so the overshoot is bounded by the call depth limit × the plan cap. Calls from
+//! (the self-call would end `queue_timeout`). Such a call may borrow its parent's slot past
+//! `max_instances`: the service runs below `ceiling + lenders`, where a lender is a parent with a
+//! running re-entrant child (a pub/sub reply has no parent id: each is its own lender), capped at
+//! `MAX_CALL_DEPTH`. A fan-out of one parent runs one child past the ceiling at a time; a chain
+//! lends one slot per level, so it cannot deadlock. It still takes the tenant's call allowance at
+//! its depth, a `max_inflight` slot and its own memory reservation. Calls from
 //! other services keep the ceiling as a hard cap; an indirect cycle (A calls B calls A) is not
 //! detected and still waits on A's ceiling.
 //!
@@ -63,7 +66,7 @@
 //! wakeups are excluded Dekker-style: a waiter bumps `queued` and then tries the slots under the
 //! lock; a releaser frees its slots and then reads `queued` (all `SeqCst`).
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,8 +76,8 @@ use parking_lot::{Mutex, RwLock};
 use rt_mem::Pressure;
 use rt_types::events::admission_lane;
 use rt_types::{
-    DegradationMode, Payload, PreparedKey, RejectReason, ScalingKnobs, ServiceId, ServiceKnobs, ServiceRef, TaskKind,
-    TaskSpec, TenantId, Trigger, MAX_CALL_DEPTH,
+    DegradationMode, Payload, PreparedKey, RejectReason, ScalingKnobs, ServiceId, ServiceKnobs, ServiceRef, TaskId,
+    TaskKind, TaskSpec, TenantId, Trigger, MAX_CALL_DEPTH,
 };
 
 use crate::autoscale::{self, Cause, ScaleInput, ScaleState};
@@ -210,8 +213,10 @@ pub struct AdmitRequest {
     /// Estimator lane ([`admission_lane`]).
     pub lane: u8,
     /// A [`SlotClass::Call`] submitted by a task of the same service ([`TaskSpec::reentrant`]):
-    /// not held by the service ceiling (see the module doc).
+    /// may borrow its blocked parent's slot past the service ceiling (see the module doc).
     pub reentrant: bool,
+    /// The parent task of a re-entrant call (`None`: a pub/sub reply, whose requester is unknown).
+    pub parent: Option<TaskId>,
 }
 
 impl AdmitRequest {
@@ -237,6 +242,10 @@ impl AdmitRequest {
             wall: spec.limits.wall,
             lane: admission_lane(&spec.trigger),
             reentrant: spec.reentrant && SlotClass::of(spec.kind, &spec.trigger) == SlotClass::Call,
+            parent: match spec.trigger {
+                Trigger::Call { parent, .. } if spec.reentrant => Some(parent),
+                _ => None,
+            },
         }
     }
 }
@@ -262,6 +271,9 @@ pub struct AdmissionTicket {
     pub pred_ns: u64,
     /// Estimator lane.
     pub lane: u8,
+    /// A re-entrant call ([`AdmitRequest::reentrant`]) and its parent: registered as a borrower.
+    pub reentrant: bool,
+    pub parent: Option<TaskId>,
     pub(crate) slot: Arc<SvcSlot>,
 }
 
@@ -494,6 +506,49 @@ pub(crate) struct SvcSlot {
     scale: Mutex<SlotScale>,
     /// Slot-time EWMA per lane (ns, 0 = no sample), reset on a new version.
     pred_ns: [AtomicU64; LANES],
+    /// Running re-entrant calls by the parent they borrow a slot from.
+    lent: Mutex<Lenders>,
+}
+
+/// Parents lending a slot to their running re-entrant children (see the module doc).
+#[derive(Debug, Default)]
+struct Lenders {
+    /// Running re-entrant children per parent task.
+    by_parent: HashMap<TaskId, u32>,
+    /// Running re-entrant children with no known parent (pub/sub replies): one lender each.
+    anon: u32,
+}
+
+impl Lenders {
+    /// Lenders if a child of `parent` joins.
+    fn with(&self, parent: Option<TaskId>) -> u32 {
+        let have = self.by_parent.len() as u32 + self.anon;
+        match parent {
+            Some(p) if self.by_parent.contains_key(&p) => have,
+            _ => have + 1,
+        }
+    }
+
+    fn add(&mut self, parent: Option<TaskId>) {
+        match parent {
+            Some(p) => *self.by_parent.entry(p).or_insert(0) += 1,
+            None => self.anon += 1,
+        }
+    }
+
+    fn remove(&mut self, parent: Option<TaskId>) {
+        match parent {
+            Some(p) => {
+                if let Some(n) = self.by_parent.get_mut(&p) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.by_parent.remove(&p);
+                    }
+                }
+            }
+            None => self.anon = self.anon.saturating_sub(1),
+        }
+    }
 }
 
 impl SvcSlot {
@@ -523,6 +578,7 @@ impl SvcSlot {
                 ..SlotScale::default()
             }),
             pred_ns: [AtomicU64::new(0), AtomicU64::new(0)],
+            lent: Mutex::new(Lenders::default()),
         }
     }
 
@@ -690,6 +746,7 @@ struct Waiting<T> {
     class: SlotClass,
     depth: u8,
     reentrant: bool,
+    parent: Option<TaskId>,
     since_ns: u64,
     key: u64,
     pred_ns: u64,
@@ -718,11 +775,11 @@ impl<T> SvcQ<T> {
         self.items.first_key_value().map(|(&(k, s), _)| (1, k, s))
     }
 
-    fn head(&self) -> Option<(SlotClass, u8, bool)> {
+    fn head(&self) -> Option<(SlotClass, u8, bool, Option<TaskId>)> {
         self.calls
             .first_key_value()
             .or(self.items.first_key_value())
-            .map(|(_, x)| (x.class, x.depth, x.reentrant))
+            .map(|(_, x)| (x.class, x.depth, x.reentrant, x.parent))
     }
 
     fn pop_head(&mut self) -> Option<Waiting<T>> {
@@ -1163,6 +1220,8 @@ impl<T> Admission<T> {
             wait: wait.map(|(k, _)| k),
             pred_ns: wait.map_or(0, |(_, p)| p),
             lane: req.lane,
+            reentrant: req.reentrant,
+            parent: req.parent,
             slot: slot.clone(),
         }
     }
@@ -1182,7 +1241,7 @@ impl<T> Admission<T> {
         // waiting for the artifact) already holds slots.
         let line_up = req.class == SlotClass::Throttled
             && (slot.queued.load(SeqCst) > 0 || slot.tenant.queued.load(SeqCst) > 0 || self.ringed.load(SeqCst) > 0);
-        if !line_up && self.try_take(slot, req.class, req.call_depth, req.reentrant) == Take::Ok {
+        if !line_up && self.try_take(slot, req.class, req.call_depth, req.reentrant.then_some(req.parent)) == Take::Ok {
             if counted {
                 slot.win.arrivals.fetch_add(1, Ordering::Relaxed);
             }
@@ -1257,6 +1316,7 @@ impl<T> Admission<T> {
             class: req.class,
             depth: req.call_depth,
             reentrant: req.reentrant,
+            parent: req.parent,
             since_ns: req.now_ns,
             key,
             pred_ns: pred,
@@ -1286,11 +1346,11 @@ impl<T> Admission<T> {
     ///   a task of the same service) is not held by the ceiling: its parent waits for it holding
     ///   one of the service's slots, so at `max_instances: 1` the ceiling would never free for it
     ///   (a self-call or self-request would wait to `queue_timeout`). It still takes the tenant's
-    ///   call allowance at its depth and a `max_inflight` slot, and its memory reservation, so the
-    ///   overshoot is bounded by `MAX_CALL_DEPTH` × the plan cap (and `max_inflight`). An
+    ///   call allowance at its depth and a `max_inflight` slot, and its memory reservation; past the
+    ///   ceiling it only takes a slot its parent lends (at most `MAX_CALL_DEPTH` lenders). An
     ///   indirect cycle (A calls B calls A) is not seen here and still waits on A's ceiling;
     /// - `Build`: `max_inflight` counts it, nothing holds it (not the service's, not the tenant's).
-    fn try_take(&self, slot: &SvcSlot, class: SlotClass, depth: u8, reentrant: bool) -> Take {
+    fn try_take(&self, slot: &SvcSlot, class: SlotClass, depth: u8, reentrant: Option<Option<TaskId>>) -> Take {
         let calls = &slot.tenant.calls[usize::from(depth).min(CALL_DEPTHS - 1)];
         let max_inflight = self.max_inflight.load(SeqCst);
         match class {
@@ -1303,8 +1363,14 @@ impl<T> Admission<T> {
                     return Take::Service;
                 }
             }
-            SlotClass::Call if reentrant => {
-                slot.running.fetch_add(1, SeqCst);
+            SlotClass::Call if reentrant.is_some() => {
+                let parent = reentrant.flatten();
+                let mut lent = slot.lent.lock();
+                let lenders = lent.with(parent).min(u32::from(MAX_CALL_DEPTH));
+                if !inc_below(&slot.running, slot.ceiling.load(SeqCst).saturating_add(lenders)) {
+                    return Take::Service;
+                }
+                lent.add(parent);
             }
             SlotClass::Call => {
                 if !inc_below(&slot.running, slot.ceiling.load(SeqCst)) {
@@ -1335,7 +1401,7 @@ impl<T> Admission<T> {
             false
         };
         if !tenant_ok {
-            dec(&slot.running);
+            Self::untake_svc(slot, reentrant);
             return Take::Tenant;
         }
         let node_cap = match class {
@@ -1347,11 +1413,19 @@ impl<T> Admission<T> {
             if class == SlotClass::Call {
                 dec(calls);
             }
-            dec(&slot.running);
+            Self::untake_svc(slot, reentrant);
             return Take::Global;
         }
         raise(&slot.win.peak_running, slot.running.load(Ordering::Relaxed));
         Take::Ok
+    }
+
+    /// Give back the service slot [`Self::try_take`] took (and a re-entrant call's loan).
+    fn untake_svc(slot: &SvcSlot, reentrant: Option<Option<TaskId>>) {
+        if let Some(parent) = reentrant {
+            slot.lent.lock().remove(parent);
+        }
+        dec(&slot.running);
     }
 
     /// Grant slots to waiting items: tenants by virtual time, a tenant's services by head key.
@@ -1371,7 +1445,7 @@ impl<T> Admission<T> {
                 }
                 continue;
             };
-            let Some((class, depth, reentrant)) = sq.head() else {
+            let Some((class, depth, reentrant, parent)) = sq.head() else {
                 // LCOV_EXCL_START: an empty queue is removed with its last item
                 w.services.remove(&sid);
                 if let Some(tq) = w.tenants.get_mut(&tid) {
@@ -1380,7 +1454,7 @@ impl<T> Admission<T> {
                 continue;
                 // LCOV_EXCL_STOP
             };
-            match self.try_take(&sq.slot, class, depth, reentrant) {
+            match self.try_take(&sq.slot, class, depth, reentrant.then_some(parent)) {
                 Take::Ok => {
                     let x = sq.pop_head().expect("the head was just seen");
                     let slot = sq.slot.clone();
@@ -1455,7 +1529,7 @@ impl<T> Admission<T> {
         }
         let slot = &ticket.slot;
         if ticket.class != SlotClass::Build {
-            dec(&slot.running);
+            Self::untake_svc(slot, ticket.reentrant.then_some(ticket.parent));
             dec(&slot.tenant.running);
             if ticket.class == SlotClass::Call {
                 dec(&slot.tenant.calls[usize::from(ticket.call_depth).min(CALL_DEPTHS - 1)]);
