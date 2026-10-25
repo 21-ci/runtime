@@ -156,10 +156,14 @@ holds a slot: they are served before the service's waiting requests and may use 
 `scaling.max_instances`, by the tenant's call allowance (calls in flight at each call depth, at most the plan's
 `max_concurrency`) and by `sched.max_inflight`. One exception: a call or request reply that a task of the **same
 service** made (a self-call, or a `request()` on a subject the service answers itself) may run past
-`max_instances`. Its parent waits for it while holding one of the service's instances, so at `max_instances: 1` it
-could otherwise never start and would end `queue_timeout`. It still takes the tenant's call allowance at its depth, a
-`max_inflight` slot and its own memory reservation, so the overshoot is bounded by the call depth limit (15) times the
-plan cap. An indirect cycle (A calls B, B calls A) is not detected: keep `max_instances` above 1 for services in one.
+`max_instances` on the instance its parent lends. Its parent waits for it while holding one of the service's
+instances, so at `max_instances: 1` it could otherwise never start and would end `queue_timeout`. Each waiting parent
+lends one instance: a `Promise.all` of self-calls from one task runs one child past `max_instances` at a time, the
+others wait for it (a child that calls itself again lends its own). Request replies carry no parent id, so each
+running one counts as its own lender. The overshoot is the number of lending parents, never more than the call depth
+limit (15). The call still takes the tenant's call allowance at its depth, a `max_inflight` slot and its own memory
+reservation. Request replies are calls: they use the `max_inflight` call reserve and the per-depth allowance, not the
+tenant's request cap. An indirect cycle (A calls B, B calls A) is not detected: keep `max_instances` above 1 for services in one.
 
 Then, while it waits:
 
