@@ -244,7 +244,7 @@ topic the key cannot see is `404 not_found`.
 | DELETE | `/v1/services/{s}/consumers/{topic}/{group}/dlq` | `queue:write` | → `204` |
 | GET | `/v1/services/{s}/invocations` | `services:read` | `?state=pending\|succeeded\|failed&limit&cursor` → `{items: [invocation], next_cursor, counts: {pending, failed}}` |
 | GET | `/v1/services/{s}/invocations/{id}` | `services:read` | → invocation |
-| POST | `/v1/services/{s}/invocations/redrive` | `queue:write` | → `200 {redriven}`. Failed invocations go back to pending with their attempts reset |
+| POST | `/v1/services/{s}/invocations/redrive` | `queue:write` | → `200 {redriven}`. Failed invocations go back to pending with their attempts reset, oldest first, up to `max_async_pending` pending; `unreadable` ones stay failed |
 | DELETE | `/v1/services/{s}/invocations` | `queue:write` | `?state=failed` (the only value accepted) → `204` |
 
 A record is `{partition, offset, key, headers, body, timestamp}`. An invocation is `{id, state, method, path, has_query,
@@ -315,16 +315,16 @@ Failures are `text/plain` with the reason as body and in `x-rt-reason` (never JS
 | `timeout` (wall limit) | 504 |
 | `call_depth` | 508 |
 | `async_not_allowed` (`X-Rt-Invocation-Type: Event` while the service's `async.enabled` is off, or on a durable service or a WebSocket upgrade) | 403 |
-| `bad_request` (an unknown `X-Rt-Invocation-Type` value, a bad `Idempotency-Key`) | 400 |
+| `bad_request` (an unknown `X-Rt-Invocation-Type` value on a service with async on, a bad `Idempotency-Key` on an async request) | 400 |
 | `idempotency_mismatch` (the same `Idempotency-Key` on a different method, URI or body) | 409 |
-| `async_backlog_full` (the service has `max_async_pending` pending invocations; `Retry-After: 1`) | 429 |
+| `async_backlog_full` (the service has `max_async_pending` pending invocations, or the tenant's pending and failed invocations would exceed `storage_mb` of stored bytes; `Retry-After: 1`) | 429 |
 
 **Async invocations** are opt-in per service (`async.enabled`, default `false`; set it with `21ci service update <svc> --set async.enabled=true`). With it on, `Prefer: respond-async` (RFC 7240; other preferences are ignored) or `X-Rt-Invocation-Type: Event` makes the invoke path store the request and answer `202 {"id":"inv_…","state":"pending"}` with `x-rt-invocation-id`, before the handler runs. The handler then gets the same method, path, query, headers and body, plus `x-rt-invocation-id` and `x-rt-invocation-attempt` (1-based). Its response body is discarded and only the status counts: a `5xx` or `429` is a failed attempt and is retried until `async.max_attempts` is used up, after which the invocation is `failed`. An invocation still pending `async.max_event_age_s` after it was accepted fails with `event_age_exceeded`. Any other status is a success. The `condition` of a finished invocation is `success`, `retries_exhausted`, `event_age_exceeded` or `unreadable`: a stored request that can no longer be opened (`sealed_unreadable`) fails at once with `unreadable`, without a retry.
 
 - With `Prefer` and a known `Content-Length` over `min(1 MiB, limits.max_body_bytes)`, the request runs synchronously. With `X-Rt-Invocation-Type: Event` it is `413 too_large`. A body of unknown length is buffered up to the same cap and is `413 too_large` in both modes.
 - An `Idempotency-Key` (1–255 visible ASCII characters) replays the original `202` while the record exists: pending, then 24 h after success or 7 d after failure. The same key with a different method, URI or body is `409 idempotency_mismatch`. The header is always forwarded to the handler unchanged.
 - Headers and body are stored sealed with the node's secret key. Authorization is decided at accept: revoking a key later does not cancel accepted invocations (purge them with `21ci invocation purge`). Ingress checks run first; an accepted request costs one rate-limit token and one daily invocation.
-- Each service may hold `plan.max_async_pending` pending invocations (`429 async_backlog_full` above it). The node runs at most 256 async attempts at once.
+- Each service may hold `plan.max_async_pending` pending invocations (`429 async_backlog_full` above it). A tenant's pending and failed invocations together may hold `plan.storage_mb` MiB of stored (sealed) headers and body across all its services (`429 async_backlog_full` above it); this budget is separate from, and the same size as, the storage quota. A service with async off ignores `X-Rt-Invocation-Type` values it does not know; with async on they are `400 bad_request`. The node runs at most 256 async attempts at once.
 
 Also see [Topics, consumers and invocations](#topics-consumers-and-invocations) for the inspection routes.
 
@@ -332,7 +332,7 @@ Also see [Topics, consumers and invocations](#topics-consumers-and-invocations) 
 
 ## Plans (built-in `free`; more under `[plans.<name>]`)
 
-`max_services` 10, `max_concurrency` 10, `max_instances` 4 (per service, 0 = node default), `rps` 50, `invocations_per_day` 100,000, `storage_mb` 100, `egress_mb_per_day` 1,000, `max_schedules` 3, `min_schedule_seconds` 60, `max_queue_depth` 10,000, `builds_per_hour` 20, `allowed_triggers` `http interval queue call websocket pubsub stream` (no `cron`), `limits_max` wall 30 s / CPU 1 s / 128 MB / `min_run_time_ms` 60 s, `custom_host_suffixes` none, `allow_cross_tenant_calls` false, `max_sockets` 1,000 (open sockets of the tenant; 0 = only the node cap), `max_sockets_per_object` 1,000, `ws_max_message_bytes` 1 MiB, `max_async_pending` 10,000 (pending async invocations per service), `max_topics` 10, `max_topic_partitions` 4, `max_stream_mb` 100 (record bytes across the tenant's topics; not part of `storage_mb`), `max_stream_retention_hours` 72.
+`max_services` 10, `max_concurrency` 10, `max_instances` 4 (per service, 0 = node default), `rps` 50, `invocations_per_day` 100,000, `storage_mb` 100, `egress_mb_per_day` 1,000, `max_schedules` 3, `min_schedule_seconds` 60, `max_queue_depth` 10,000, `builds_per_hour` 20, `allowed_triggers` `http interval queue call websocket pubsub stream` (no `cron`), `limits_max` wall 30 s / CPU 1 s / 128 MB / `min_run_time_ms` 60 s, `custom_host_suffixes` none, `allow_cross_tenant_calls` false, `max_sockets` 1,000 (open sockets of the tenant; 0 = only the node cap), `max_sockets_per_object` 1,000, `ws_max_message_bytes` 1 MiB, `max_async_pending` 10,000 (pending async invocations per service; `storage_mb` also caps the tenant's pending + failed async bytes), `max_topics` 10, `max_topic_partitions` 4, `max_stream_mb` 100 (record bytes across the tenant's topics; not part of `storage_mb`), `max_stream_retention_hours` 72.
 
 The built-in `system` plan (the node's own tenant) uses `limits_max.min_run_time_ms` 600,000, `max_async_pending` 100,000, `max_topics` 1,000, `max_topic_partitions` 16, `max_stream_mb` 10,240 and `max_stream_retention_hours` 720. `limits_max.min_run_time_ms` is the largest `scaling.min_run_time_ms` a service of the plan may set; the node's `sched.min_run_time_max_ms` caps it too (the lower value wins).
 

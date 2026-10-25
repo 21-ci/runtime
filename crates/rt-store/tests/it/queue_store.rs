@@ -1058,7 +1058,7 @@ mod invocations {
         q.fail_attempt(id, l[0].attempt, "guest_error", None, Duration::ZERO)
             .await
             .expect("fail");
-        assert_eq!(q.redrive_invocations(s).await.expect("redrive"), 1);
+        assert_eq!(q.redrive_invocations(s, 100_000).await.expect("redrive"), 1);
         let r = q.invocation(s, id).await.expect("get").expect("record");
         assert_eq!(
             (r.state, r.attempts, r.error.clone()),
@@ -1254,5 +1254,93 @@ mod invocations {
         let p = q.list_invocations(s, None, 10, None).await.expect("list");
         assert_eq!((p.counts.pending, p.counts.failed), (1, 1));
         assert_eq!(p.items.len(), 2);
+    }
+
+    /// B1: pending + failed sealed bytes are capped per tenant across its services; succeeded
+    /// records (wiped) and other tenants do not count.
+    #[tokio::test]
+    async fn b1_tenant_byte_cap_spans_services_and_refuses_with_async_backlog_full() {
+        use rt_store::queue::AcceptLimits;
+        let q = queue(5);
+        let t = rt_types::TenantId::from_u128(1);
+        let other = rt_types::TenantId::from_u128(2);
+        let big = |s| {
+            let mut n = inv(s, None, "h");
+            n.sealed_body = vec![7; 1000];
+            n
+        };
+        let per = 1000 + 4; // sealed body + sealed headers
+        let lim = |tenant| AcceptLimits {
+            tenant: Some(tenant),
+            max_pending: 100,
+            max_tenant_bytes: 3 * per,
+        };
+        let first = match q.accept_with(big(svc(1)), lim(t)).await.expect("1") {
+            Accepted::New(id) => id,
+            other => panic!("{other:?}"),
+        };
+        q.accept_with(big(svc(2)), lim(t)).await.expect("2");
+        let mut failing = big(svc(2));
+        failing.max_attempts = 1;
+        let fid = match q.accept_with(failing, lim(t)).await.expect("3") {
+            Accepted::New(id) => id,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            q.accept_with(big(svc(1)), lim(t)).await,
+            Err(StoreError::Conflict("async_backlog_full"))
+        ));
+        q.accept_with(big(svc(3)), lim(other))
+            .await
+            .expect("another tenant has its own budget");
+        // A failed record still holds its bytes.
+        let l = q.lease_invocations(svc(2), 10, LONG).await.expect("lease");
+        let a = l.iter().find(|l| l.id == fid).expect("leased").attempt;
+        q.fail_attempt(fid, a, "guest_error", None, Duration::ZERO)
+            .await
+            .expect("fail");
+        assert!(matches!(
+            q.accept_with(big(svc(1)), lim(t)).await,
+            Err(StoreError::Conflict("async_backlog_full"))
+        ));
+        // A succeeded record is wiped and frees its bytes.
+        let l = q.lease_invocations(svc(1), 10, LONG).await.expect("lease");
+        assert!(q.complete(first, l[0].attempt, 200).await.expect("complete"));
+        q.accept_with(big(svc(1)), lim(t)).await.expect("room again");
+    }
+
+    /// MINOR 3: redrive leaves `unreadable` records failed and never pushes the service past
+    /// `max_pending`.
+    #[tokio::test]
+    async fn minor3_redrive_skips_unreadable_and_respects_the_pending_cap() {
+        let q = queue(5);
+        let s = svc(1);
+        let mut ids = Vec::new();
+        for h in ["a", "b", "c"] {
+            let mut n = inv(s, None, h);
+            n.max_attempts = 1;
+            ids.push(accept_new(&q, n).await);
+        }
+        let l = q.lease_invocations(s, 10, LONG).await.expect("lease");
+        for x in &l {
+            if x.id == ids[0] {
+                q.fail_now(x.id, x.attempt, "sealed_unreadable")
+                    .await
+                    .expect("fail now");
+            } else {
+                q.fail_attempt(x.id, x.attempt, "guest_error", None, Duration::ZERO)
+                    .await
+                    .expect("fail");
+            }
+        }
+        accept_new(&q, inv(s, None, "pending")).await;
+        // One pending already, cap 2: only one of the two readable failures comes back.
+        assert_eq!(q.redrive_invocations(s, 2).await.expect("redrive"), 1);
+        let r = q.invocation(s, ids[0]).await.expect("get").expect("record");
+        assert_eq!(r.state, InvocationState::Failed, "unreadable stays failed");
+        assert_eq!(q.redrive_invocations(s, 2).await.expect("full"), 0);
+        assert_eq!(q.redrive_invocations(s, 100).await.expect("rest"), 1);
+        let r = q.invocation(s, ids[0]).await.expect("get").expect("record");
+        assert_eq!(r.state, InvocationState::Failed);
     }
 }

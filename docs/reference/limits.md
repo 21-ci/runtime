@@ -79,7 +79,8 @@ key, so a plan you define inherits them for keys it leaves out.
 | `max_schedules` | 3 | Schedules per service | `403 quota_exceeded` |
 | `min_schedule_seconds` | 60 | Shortest schedule period (an interval, or the gap between a cron's next two fires) | `422 schedule_too_frequent` |
 | `max_queue_depth` | 10,000 | Ready messages in a service's queue | `429 queue_full` (API), `queue_full` (guest `enqueue`) |
-| `max_async_pending` | 10,000 | Pending async invocations per service (`async.enabled` on) | `429 async_backlog_full` with `Retry-After: 1` |
+| `max_async_pending` | 10,000 | Pending async invocations per service (`async.enabled` on); a redrive moves back at most up to this cap | `429 async_backlog_full` with `Retry-After: 1` |
+| `storage_mb` (async backlog) | 100 | Stored (sealed) headers + body bytes of the tenant's pending and failed async invocations, across all its services. A separate budget of the same size as the storage quota, not counted in it | `429 async_backlog_full` with `Retry-After: 1` |
 | `max_topics` | 10 | Topics per tenant | `403 quota_exceeded` |
 | `max_topic_partitions` | 4 | Partitions of one topic (the node hard maximum is 16) | `422 limit_exceeds_plan` |
 | `max_stream_mb` | 100 | Record bytes across the tenant's topics, dead letters included. Not part of `storage_mb` | `429 stream_full` on append |
@@ -124,7 +125,7 @@ Node-wide bounds on running and waiting work ([`[sched]`](../config.md#scheduler
 | Logs page size | 100 by default, 1,000 max | Clamped | fixed |
 | Failed authentications per client | 10 per minute (control listener and `access = key` invokes counted separately) | `429 rate_limited` + `Retry-After` | fixed |
 | Log and event streams (SSE) per credential | 10 | `429 rate_limited` | `ingress.sse_streams_per_key` |
-| `Idempotency-Key` replay window | 24 h, per principal, in memory | A different request with the same key: `422 idempotency_mismatch` | fixed |
+| Control API `Idempotency-Key` | At most 255 bytes; replayed for 24 h, per principal, in memory | Longer: `422 validation_failed`. A different request with the same key: `422 idempotency_mismatch` | fixed |
 | Slug | `^[a-z][a-z0-9-]{1,62}$` | `422 validation_failed` | fixed |
 | Environment label | `^[a-z][a-z0-9-]{0,31}$` | `422 validation_failed` | fixed |
 | `call.allowed_callers` entries | 64 | `422 validation_failed` | fixed |
@@ -221,7 +222,7 @@ A schedule fire is skipped (and counted) while the previous run of the same sche
 | Async event age | 60 s to 86,400 s, default 3,600 | `event_age_exceeded` | `async.max_event_age_s` |
 | Failed async records | 1,000 per service, kept 7 days | The oldest are evicted | fixed |
 | Async attempts in flight | 256 per node; `queue.max_concurrency` (4) per service | Attempts wait | `queue.max_concurrency` |
-| `Idempotency-Key` | 1 to 255 visible ASCII characters | `400 bad_request` | fixed |
+| Async invoke `Idempotency-Key` | 1 to 255 visible ASCII characters; replayed while the record exists | Invalid: `400 bad_request`. A different request with the same key: `409 idempotency_mismatch` | fixed |
 
 ## Env, secrets and logs
 
