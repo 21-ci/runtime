@@ -97,7 +97,8 @@ impl std::fmt::Display for PubsubError {
 
 impl std::error::Error for PubsubError {}
 
-/// Tenant quota check (rps + daily), taken per publish/request and per delivery.
+/// Tenant quota check (rps + daily). A request takes one; a publish takes one that also covers
+/// its first delivery, and one more per further delivery.
 pub type PubsubQuota = Arc<dyn Fn(TenantId) -> Result<(), PubsubError> + Send + Sync>;
 
 struct Entry {
@@ -132,7 +133,9 @@ pub struct PubsubRouter {
     quota: Option<PubsubQuota>,
     index: Mutex<Option<Arc<Index>>>,
     group_rr: DashMap<(Namespace, String), Arc<AtomicUsize>>,
-    subject_rr: DashMap<(Namespace, String), Arc<AtomicUsize>>,
+    /// One counter per namespace: keyed by the requested subject it would grow with every
+    /// subject a guest invents.
+    request_rr: DashMap<Namespace, Arc<AtomicUsize>>,
     fanout_rr: DashMap<Namespace, Arc<AtomicUsize>>,
     inflight: Arc<DashMap<ServiceId, Arc<AtomicU32>>>,
 }
@@ -146,7 +149,7 @@ impl PubsubRouter {
             quota: None,
             index: Mutex::new(None),
             group_rr: DashMap::new(),
-            subject_rr: DashMap::new(),
+            request_rr: DashMap::new(),
             fanout_rr: DashMap::new(),
             inflight: Arc::new(DashMap::new()),
         }
@@ -170,6 +173,12 @@ impl PubsubRouter {
             .unwrap_or(0)
     }
 
+    /// Round-robin counters held (group, request and fan-out), for tests of their bound.
+    #[doc(hidden)]
+    pub fn rr_entries(&self) -> usize {
+        self.group_rr.len() + self.request_rr.len() + self.fanout_rr.len()
+    }
+
     fn index(&self) -> Arc<Index> {
         let generation = self.tasks.generation();
         let mut slot = self.index.lock();
@@ -187,6 +196,15 @@ impl PubsubRouter {
             });
         }
         let idx = Arc::new(Index { generation, by_ns });
+        // Keep only the counters of live namespaces and groups, so they stay bounded by the
+        // current subscriptions.
+        self.group_rr.retain(|(ns, g), _| {
+            idx.by_ns
+                .get(ns)
+                .is_some_and(|v| v.iter().any(|e| e.group.as_deref() == Some(g.as_str())))
+        });
+        self.request_rr.retain(|ns, _| idx.by_ns.contains_key(ns));
+        self.fanout_rr.retain(|ns, _| idx.by_ns.contains_key(ns));
         *slot = Some(idx.clone());
         idx
     }
@@ -209,12 +227,9 @@ impl PubsubRouter {
         m
     }
 
-    fn rr(map: &DashMap<(Namespace, String), Arc<AtomicUsize>>, ns: &Namespace, key: &str) -> usize {
-        let c = map
-            .entry((ns.clone(), key.to_string()))
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .clone();
-        c.fetch_add(1, Ordering::Relaxed)
+    fn rr<K: std::hash::Hash + Eq>(map: &DashMap<K, Arc<AtomicUsize>>, key: K, step: usize) -> usize {
+        let c = map.entry(key).or_insert_with(|| Arc::new(AtomicUsize::new(0))).clone();
+        c.fetch_add(step, Ordering::Relaxed)
     }
 
     fn drop_count(&self, reason: &str, n: u64) {
@@ -289,18 +304,13 @@ impl PubsubRouter {
         let m = self.matches(ns, subject);
         let mut list = m.ungrouped;
         for (g, members) in &m.groups {
-            let i = Self::rr(&self.group_rr, ns, g) % members.len();
+            let i = Self::rr(&self.group_rr, (ns.clone(), g.clone()), 1) % members.len();
             list.push(members[i]);
         }
 
         let mut dropped: u32 = 0;
         if list.len() > PUBSUB_FANOUT_MAX {
-            let c = self
-                .fanout_rr
-                .entry(ns.clone())
-                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-                .clone();
-            let start = c.fetch_add(PUBSUB_FANOUT_MAX, Ordering::Relaxed) % list.len();
+            let start = Self::rr(&self.fanout_rr, ns.clone(), PUBSUB_FANOUT_MAX) % list.len();
             let over = list.len() - PUBSUB_FANOUT_MAX;
             list = (0..PUBSUB_FANOUT_MAX).map(|k| list[(start + k) % list.len()]).collect();
             dropped += over as u32;
@@ -309,8 +319,9 @@ impl PubsubRouter {
 
         let msg = Self::message(subject, body, headers, false);
         let mut receivers: u32 = 0;
-        for service in list {
-            if self.check_quota(ns.tenant).is_err() {
+        for (k, service) in list.into_iter().enumerate() {
+            // The publish's own token covers the first delivery.
+            if k > 0 && self.check_quota(ns.tenant).is_err() {
                 dropped += 1;
                 self.drop_count("quota", 1);
                 continue;
@@ -399,8 +410,7 @@ impl PubsubRouter {
         if list.is_empty() {
             return Err(PubsubError::NoResponders);
         }
-        let service = list[Self::rr(&self.subject_rr, ns, subject) % list.len()];
-        self.check_quota(ns.tenant)?;
+        let service = list[Self::rr(&self.request_rr, ns.clone(), 1) % list.len()];
         let msg = Self::message(subject, body, headers, true);
         let mut spec = self
             .task(service, msg, depth, Some(timeout))
