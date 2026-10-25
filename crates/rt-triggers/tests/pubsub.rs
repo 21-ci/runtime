@@ -381,14 +381,14 @@ async fn ac_ps_13_quota_refusal_is_returned_to_the_publisher() {
     assert!(delivered(&s).is_empty());
 }
 
-/// Every delivery takes its own quota check; a refused one is dropped as `quota`.
+/// Every delivery past the first takes its own quota check; a refused one is dropped as `quota`.
 #[tokio::test]
 async fn ac_ps_14_each_delivery_is_quota_checked() {
     let n = ns(1, 1, "prod");
     let (s, sub) = submitter(ok_answer());
     let calls = Arc::new(AtomicUsize::new(0));
     let c = calls.clone();
-    // The publish check and the first delivery pass; the rest are refused.
+    // The publish check (covering the first delivery) and the second delivery pass.
     let q: PubsubQuota = Arc::new(move |_| {
         if c.fetch_add(1, Ordering::SeqCst) < 2 {
             Ok(())
@@ -401,10 +401,10 @@ async fn ac_ps_14_each_delivery_is_quota_checked() {
     let r = PubsubRouter::new(Factory::new(rows), sub)
         .with_quota(q)
         .with_metrics(m.clone());
-    assert_eq!(publish(&r, &n, "a").unwrap(), (1, 2));
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
-    assert_eq!(delivered(&s).len(), 1);
-    assert_eq!(m.pubsub_dropped_total.with_label_values(&["quota"]).get(), 2);
+    assert_eq!(publish(&r, &n, "a").unwrap(), (2, 1));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(delivered(&s).len(), 2);
+    assert_eq!(m.pubsub_dropped_total.with_label_values(&["quota"]).get(), 1);
 }
 
 /// A subscriber with PUBSUB_INFLIGHT_PER_SERVICE deliveries in flight drops more as `backlog`;
@@ -503,4 +503,85 @@ async fn ac_ps_17_request_task_has_reply_true() {
             ..
         }
     ));
+}
+
+/// A request costs one quota token in total, with or without a responder.
+#[tokio::test]
+async fn ac_ps_18_a_request_takes_one_quota_token() {
+    let n = ns(1, 1, "prod");
+    let (_s, sub) = submitter(ok_answer());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let q: PubsubQuota = Arc::new(move |_| {
+        c.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    let r = PubsubRouter::new(Factory::new(vec![row(&n, 1, "a", None)]), sub).with_quota(q);
+    let t = Duration::from_secs(1);
+    r.request(&n, 1, "a", Bytes::new(), vec![], t).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    r.request(&n, 1, "b", Bytes::new(), vec![], t).await.unwrap_err();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+/// A publish's own token covers its first delivery: N deliveries cost N tokens (one with none).
+#[tokio::test]
+async fn ac_ps_19_a_publish_takes_one_token_per_delivery() {
+    let n = ns(1, 1, "prod");
+    let (_s, sub) = submitter(ok_answer());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let q: PubsubQuota = Arc::new(move |_| {
+        c.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    let rows = (1..=3).map(|i| row(&n, i, "a", None)).collect();
+    let r = PubsubRouter::new(Factory::new(rows), sub).with_quota(q);
+    assert_eq!(publish(&r, &n, "a").unwrap(), (3, 0));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(publish(&r, &n, "none").unwrap(), (0, 0));
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+}
+
+/// Requests to many distinct subjects keep one round-robin counter per namespace, and still
+/// spread over the responders.
+#[tokio::test]
+async fn ac_ps_20_request_round_robin_is_bounded_by_namespace() {
+    let n = ns(1, 1, "prod");
+    let (s, sub) = submitter(ok_answer());
+    let rows = vec![row(&n, 1, "x.>", None), row(&n, 2, "x.>", None)];
+    let r = PubsubRouter::new(Factory::new(rows), sub);
+    let t = Duration::from_secs(1);
+    for i in 0..10_000 {
+        r.request(&n, 1, &format!("x.s{i}"), Bytes::new(), vec![], t)
+            .await
+            .unwrap();
+    }
+    assert!(r.rr_entries() <= 1, "rr entries: {}", r.rr_entries());
+    let d = delivered(&s);
+    assert_eq!(d.iter().filter(|x| **x == svc(1)).count(), 5_000);
+}
+
+/// Group and fan-out counters of namespaces and groups that no longer exist are dropped when the
+/// subscription index changes.
+#[tokio::test]
+async fn ac_ps_21_rr_counters_are_pruned_on_index_change() {
+    let n = ns(1, 1, "prod");
+    let n2 = ns(1, 1, "dev");
+    let (_s, sub) = submitter(ok_answer());
+    let mut rows: Vec<SubRow> = (1..=101).map(|i| row(&n, i, "a", None)).collect();
+    rows.push(row(&n2, 500, "a", Some("g")));
+    rows.push(row(&n2, 501, "a", Some("g")));
+    let f = Factory::new(rows);
+    let r = PubsubRouter::new(f.clone(), sub);
+    publish(&r, &n, "a").unwrap();
+    publish(&r, &n2, "a").unwrap();
+    r.request(&n2, 1, "a", Bytes::new(), vec![], Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(r.rr_entries(), 3, "fanout(n) + group(n2,g) + request(n2)");
+    f.rows.lock().clear();
+    f.gen.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(publish(&r, &n, "a").unwrap(), (0, 0));
+    assert_eq!(r.rr_entries(), 0);
 }
