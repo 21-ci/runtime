@@ -713,9 +713,18 @@ async fn read_all<S: AsyncReadExt + Unpin>(s: &mut S, timeout: Duration) -> Vec<
 /// Send raw bytes to `addr` and read the response until the peer closes (use `Connection: close`).
 /// `None` when the connection was refused or closed without a parsable response.
 pub async fn raw_tcp(addr: SocketAddr, request: &[u8], timeout: Duration) -> Option<RawResp> {
-    let mut s = tokio::net::TcpStream::connect(addr).await.ok()?;
-    s.write_all(request).await.ok()?;
-    let buf = read_all(&mut s, timeout).await;
+    let s = tokio::net::TcpStream::connect(addr).await.ok()?;
+    // Write and read at once: a node that answers before reading the whole request (a lying
+    // Content-Length, an early 413) closes while bytes are still in flight, and a writer that
+    // waited for write_all would see the reset instead of the answer already sent.
+    let (mut rd, mut wr) = s.into_split();
+    let request = request.to_vec();
+    let writer = tokio::spawn(async move {
+        let _ = wr.write_all(&request).await;
+        wr
+    });
+    let buf = read_all(&mut rd, timeout).await;
+    writer.abort();
     parse_raw(&buf)
 }
 
