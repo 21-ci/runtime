@@ -188,8 +188,12 @@ which key sealed it, so a rotation needs no downtime beyond two restarts:
    neither key opens; those are left untouched.
 4. API key hashes cannot be re-sealed (the plaintext is never stored): keys issued before step 2 verify only while
    `RT_MASTER_KEY_PREVIOUS` is set. Have tenants create new keys and revoke the old ones.
-5. Once reseal reports `failed: 0` and the old API keys are revoked, restart without `RT_MASTER_KEY_PREVIOUS` and
-   destroy the old key.
+5. Async invocations are not resealed: their sealed headers and bodies open only while `RT_MASTER_KEY_PREVIOUS` is
+   set. Before the last restart, drain them: let pending invocations run, and redrive or purge failed ones
+   (`GET /v1/services/{s}/invocations?state=pending|failed`, `21ci invocation purge`). Any left behind fail once
+   with `sealed_unreadable`.
+6. Once reseal reports `failed: 0`, the old API keys are revoked and the async invocations are drained, restart
+   without `RT_MASTER_KEY_PREVIOUS` and destroy the old key.
 
 ## Security checklist
 

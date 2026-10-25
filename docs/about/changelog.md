@@ -102,6 +102,12 @@ Performance. Internal refactoring and test-only changes are left out.
 
 - An asynchronous delivery whose stored request cannot be opened fails at once (`sealed_unreadable`) and no longer
   uses up its retries.
+- A kept instance now expires on time on an idle node too (at most about 50 ms after `min_run_time_ms`); before, it
+  stayed until the node next had work.
+- With `min_run_time_ms = 0`, the only instances kept are the warm floor of `scaling.min_instances` (and an instance
+  handed to a waiting task of the same service).
+- A self-call, or a pub/sub request to a subject the service answers itself, at `max_instances: 1` no longer ends in
+  `503 queue_timeout`: it runs on the slot its waiting parent lends.
 
 #### Security
 
