@@ -1216,7 +1216,7 @@ async fn fair_api_01_stats_report_the_predicted_run_time() {
     assert_eq!(stats.s(), 200, "{}", stats.text);
     let adm = &stats.json["admission"];
     let pred = adm["pred_ms"].as_f64().unwrap_or_else(|| panic!("pred_ms is a number after samples: {}", stats.text));
-    assert!(pred >= 100.0 && pred < 5_000.0, "a 200 ms handler predicts about 200 ms, got {pred}: {}", stats.text);
+    assert!((100.0..5_000.0).contains(&pred), "a 200 ms handler predicts about 200 ms, got {pred}: {}", stats.text);
     assert!(adm.get("pred_background_ms").is_some(), "the field is always present: {}", stats.text);
     assert_eq!(adm["pred_background_ms"], Value::Null, "no background task ran: {}", stats.text);
     node.shutdown().await;

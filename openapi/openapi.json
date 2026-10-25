@@ -1142,6 +1142,76 @@
         }
       }
     },
+    "/v1/pubsub/publish": {
+      "post": {
+        "tags": [
+          "pubsub"
+        ],
+        "operationId": "pubsub_publish",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublishBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Published"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/sdk-grants": {
       "get": {
         "tags": [
@@ -2217,6 +2287,366 @@
         }
       }
     },
+    "/v1/services/{s}/consumers": {
+      "get": {
+        "tags": [
+          "topics"
+        ],
+        "operationId": "consumers_list",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "service id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsumerList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/services/{s}/consumers/{topic}/{group}/dlq": {
+      "get": {
+        "tags": [
+          "topics"
+        ],
+        "operationId": "dlq_list",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "service id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "topic",
+            "in": "path",
+            "description": "topic name or id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group",
+            "in": "path",
+            "description": "consumer group",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "At most this many (default 100, max 1000).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeadList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "topics"
+        ],
+        "operationId": "dlq_purge",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "service id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "topic",
+            "in": "path",
+            "description": "topic name or id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group",
+            "in": "path",
+            "description": "consumer group",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/services/{s}/consumers/{topic}/{group}/reset": {
+      "post": {
+        "tags": [
+          "topics"
+        ],
+        "operationId": "consumers_reset",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "service id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "topic",
+            "in": "path",
+            "description": "topic name or id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group",
+            "in": "path",
+            "description": "consumer group",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsumerView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/services/{s}/data/export": {
       "get": {
         "tags": [
@@ -3001,6 +3431,328 @@
         "responses": {
           "204": {
             "description": ""
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: unknown, or not visible to this key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/services/{s}/invocations": {
+      "get": {
+        "tags": [
+          "invocations"
+        ],
+        "operationId": "invocations_list",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "service id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "`pending` | `succeeded` | `failed` (default all).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size (default 50, max 200).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from a previous `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvocationList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: unknown, or not visible to this key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "invocations"
+        ],
+        "operationId": "invocations_purge",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "service id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "Only `failed` is accepted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: unknown, or not visible to this key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/services/{s}/invocations/redrive": {
+      "post": {
+        "tags": [
+          "invocations"
+        ],
+        "operationId": "invocations_redrive",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "service id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Redriven"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: unknown, or not visible to this key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/services/{s}/invocations/{id}": {
+      "get": {
+        "tags": [
+          "invocations"
+        ],
+        "operationId": "invocations_get",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "service id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "invocation id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvocationView"
+                }
+              }
+            }
           },
           "401": {
             "description": "missing, invalid, revoked or expired credential",
@@ -5972,6 +6724,650 @@
         }
       }
     },
+    "/v1/topics": {
+      "get": {
+        "tags": [
+          "topics"
+        ],
+        "summary": "Without `project` / `environment`: every topic the caller may see.",
+        "operationId": "topics_list",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicPage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "topics"
+        ],
+        "operationId": "topics_create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTopicBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/topics/{t}": {
+      "get": {
+        "tags": [
+          "topics"
+        ],
+        "operationId": "topics_get",
+        "parameters": [
+          {
+            "name": "t",
+            "in": "path",
+            "description": "topic id (`tpc_…`) or name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "topics"
+        ],
+        "summary": "Deletes the topic with its records, consumer cursors and dead letters.",
+        "operationId": "topics_delete",
+        "parameters": [
+          {
+            "name": "t",
+            "in": "path",
+            "description": "topic id (`tpc_…`) or name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "topics"
+        ],
+        "operationId": "topics_patch",
+        "parameters": [
+          {
+            "name": "t",
+            "in": "path",
+            "description": "topic id (`tpc_…`) or name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchTopicBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/topics/{t}/messages": {
+      "get": {
+        "tags": [
+          "topics"
+        ],
+        "operationId": "messages_read",
+        "parameters": [
+          {
+            "name": "t",
+            "in": "path",
+            "description": "topic id (`tpc_…`) or name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "partition",
+            "in": "query",
+            "description": "Required when the topic has more than one partition.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "`earliest` (default), `latest` or an offset.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from_time",
+            "in": "query",
+            "description": "RFC 3339: the first record at or after this time (instead of `from`).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "1..=100 (default 100).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordPage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "topics"
+        ],
+        "operationId": "messages_append",
+        "parameters": [
+          {
+            "name": "t",
+            "in": "path",
+            "description": "topic id (`tpc_…`) or name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppendBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppendedPage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/version": {
       "get": {
         "tags": [
@@ -6125,6 +7521,22 @@
             "description": "Instances kept warm and floor of the limit (`scaling.min_instances`, within the plan's\n`max_instances`; 0 = scales to zero when idle).",
             "minimum": 0
           },
+          "pred_background_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Predicted slot time (ms) of a background task (queue, stream, schedules); `null` before samples."
+          },
+          "pred_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Predicted slot time (ms) of an interactive task (HTTP, calls, pub/sub); `null` before samples."
+          },
           "queue_timeouts": {
             "type": "integer",
             "format": "int64",
@@ -6172,6 +7584,114 @@
           }
         }
       },
+      "AppendBody": {
+        "type": "object",
+        "description": "`POST /v1/topics/{t}/messages`.",
+        "required": [
+          "records"
+        ],
+        "properties": {
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AppendRecord"
+            },
+            "description": "1..=100 records, all or nothing."
+          }
+        },
+        "additionalProperties": false
+      },
+      "AppendRecord": {
+        "type": "object",
+        "description": "One record to append.",
+        "required": [
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "type": "object",
+            "description": "A JSON string is stored as its text, any other JSON value as its serialization."
+          },
+          "dedup_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The same id on the topic within 2 minutes returns the original offset."
+          },
+          "headers": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Records with the same key go to the same partition."
+          }
+        },
+        "additionalProperties": false
+      },
+      "AppendedPage": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AppendedView"
+            }
+          }
+        }
+      },
+      "AppendedView": {
+        "type": "object",
+        "description": "Where one appended record landed.",
+        "required": [
+          "partition",
+          "offset",
+          "duplicate"
+        ],
+        "properties": {
+          "duplicate": {
+            "type": "boolean",
+            "description": "`true` when `dedup_id` matched an earlier record (nothing was appended)."
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "partition": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
       "ClosedView": {
         "type": "object",
         "required": [
@@ -6182,6 +7702,117 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          }
+        }
+      },
+      "ConsumerList": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsumerView"
+            }
+          }
+        }
+      },
+      "ConsumerPartition": {
+        "type": "object",
+        "description": "One partition of a consumer.",
+        "required": [
+          "partition",
+          "committed",
+          "next",
+          "lag",
+          "attempt",
+          "state",
+          "next_at"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Failed deliveries of the record at `committed`.",
+            "minimum": 0
+          },
+          "committed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Next offset to deliver.",
+            "minimum": 0
+          },
+          "lag": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Offset of the next append to the partition.",
+            "minimum": 0
+          },
+          "next_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Not before (unix ms); `0` = now."
+          },
+          "partition": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "`active` | `blocked`."
+          }
+        }
+      },
+      "ConsumerView": {
+        "type": "object",
+        "description": "A `(topic, group)` consumer of a service.",
+        "required": [
+          "topic",
+          "group",
+          "declared",
+          "topic_exists",
+          "dead",
+          "partitions"
+        ],
+        "properties": {
+          "dead": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dead letters of the consumer.",
+            "minimum": 0
+          },
+          "declared": {
+            "type": "boolean",
+            "description": "In the service's `events.consume` block."
+          },
+          "group": {
+            "type": "string"
+          },
+          "partitions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsumerPartition"
+            }
+          },
+          "topic": {
+            "type": "string"
+          },
+          "topic_exists": {
+            "type": "boolean"
           }
         }
       },
@@ -6276,6 +7907,13 @@
             ],
             "description": "`public` | `key` | `internal`."
           },
+          "async": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Async invocation: `{\"enabled\": bool, \"max_attempts\": 1..=10, \"max_event_age_s\": 60..=86400}`."
+          },
           "call": {
             "type": [
               "object",
@@ -6309,6 +7947,13 @@
               "null"
             ],
             "description": "Environment label, `^[a-z][a-z0-9-]{0,31}$` (default `production`); one of the project's\nenvironments."
+          },
+          "events": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Pub/sub subscriptions and stream consumers: `{\"subscribe\": [{\"subject\", \"group\"?}],\n\"consume\": [{\"topic\", \"group\", \"start\", \"batch_size\", \"max_attempts\", \"on_exhausted\"}]}`.\nNeeds the plan to allow the `pubsub` / `stream` triggers; refused for durable services."
           },
           "ingress": {
             "type": [
@@ -6445,6 +8090,125 @@
               "type": "string"
             },
             "description": "Scopes such as `services:read`, `deploy`; each one the creating key holds."
+          }
+        }
+      },
+      "CreateTopicBody": {
+        "type": "object",
+        "description": "`POST /v1/topics`.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Default `production`."
+          },
+          "max_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Size cap of this topic in MiB; `0` (default) = only the tenant cap.",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "`[a-z0-9][a-z0-9._-]{0,62}`, not starting with `tpc_`."
+          },
+          "partitions": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Default 1, at most the plan's `max_topic_partitions`.",
+            "minimum": 0
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Project slug or `prj_…` id (default `default`)."
+          },
+          "retention_hours": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Default 24, at most the plan's `max_stream_retention_hours`.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeadList": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeadView"
+            }
+          }
+        }
+      },
+      "DeadView": {
+        "type": "object",
+        "description": "A record that failed `max_attempts` deliveries.",
+        "required": [
+          "partition",
+          "offset",
+          "headers",
+          "body",
+          "attempts",
+          "error",
+          "failed_at"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "body": {
+            "type": "object",
+            "description": "JSON when the body parses as JSON, else a string."
+          },
+          "error": {
+            "type": "string"
+          },
+          "failed_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "headers": {
+            "type": "object"
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "partition": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         }
       },
@@ -6674,6 +8438,132 @@
               "null"
             ],
             "description": "TXT value for `_rt-verify.<host>` while pending."
+          }
+        }
+      },
+      "InvocationCountsView": {
+        "type": "object",
+        "description": "Pending and failed records of a service.",
+        "required": [
+          "pending",
+          "failed"
+        ],
+        "properties": {
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pending": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "InvocationList": {
+        "type": "object",
+        "required": [
+          "items",
+          "counts"
+        ],
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/InvocationCountsView"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InvocationView"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "InvocationView": {
+        "type": "object",
+        "description": "One async invocation, without its request headers, body or query.",
+        "required": [
+          "id",
+          "state",
+          "method",
+          "path",
+          "has_query",
+          "attempts",
+          "body_bytes",
+          "created_at",
+          "updated_at",
+          "expires_at"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Deliveries started.",
+            "minimum": 0
+          },
+          "body_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "condition": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`success` | `retries_exhausted` | `event_age_exceeded` | `unreadable`."
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`status_5xx` | `status_429` | `guest_error` | `timeout` | `cpu_limit` | `oom` |\n`build_failed` | `crashed` | `sealed_unreadable`."
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "has_query": {
+            "type": "boolean",
+            "description": "The request had a query string (not shown)."
+          },
+          "id": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string",
+            "description": "The request path, without the query."
+          },
+          "state": {
+            "type": "string",
+            "description": "`pending` | `succeeded` | `failed`."
+          },
+          "status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Status of the last delivery that answered.",
+            "minimum": 0
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -7240,6 +9130,13 @@
               "null"
             ]
           },
+          "async": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Async invocation: `{\"enabled\": bool, \"max_attempts\": 1..=10, \"max_event_age_s\": 60..=86400}`."
+          },
           "call": {
             "type": [
               "object",
@@ -7273,6 +9170,13 @@
               "null"
             ],
             "description": "Environment label, `^[a-z][a-z0-9-]{0,31}$`; one of the service's project's environments."
+          },
+          "events": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Pub/sub subscriptions and stream consumers: `{\"subscribe\": [{\"subject\", \"group\"?}],\n\"consume\": [{\"topic\", \"group\", \"start\", \"batch_size\", \"max_attempts\", \"on_exhausted\"}]}`.\nNeeds the plan to allow the `pubsub` / `stream` triggers; refused for durable services."
           },
           "ingress": {
             "type": [
@@ -7363,6 +9267,29 @@
           }
         }
       },
+      "PatchTopicBody": {
+        "type": "object",
+        "description": "`PATCH /v1/topics/{t}`.",
+        "properties": {
+          "max_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "retention_hours": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "PlanView": {
         "type": "object",
         "description": "One plan from the node config (`GET /v1/plans`), or a tenant's effective plan (`GET /v1/me`).",
@@ -7440,6 +9367,46 @@
           }
         }
       },
+      "PublishBody": {
+        "type": "object",
+        "description": "Body of `POST /v1/pubsub/publish`.",
+        "required": [
+          "subject",
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "type": "object"
+          },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Default `production`."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Project slug or id (default `default`)."
+          },
+          "subject": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "PublishSdkBody": {
         "type": "object",
         "description": "`POST /v1/sdks`: one release of an SDK.",
@@ -7507,6 +9474,27 @@
           }
         },
         "additionalProperties": false
+      },
+      "Published": {
+        "type": "object",
+        "required": [
+          "receivers",
+          "dropped"
+        ],
+        "properties": {
+          "dropped": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Subscribers it was not delivered to (fan-out cap, quota, backlog, refused).",
+            "minimum": 0
+          },
+          "receivers": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Subscribers the message was handed to.",
+            "minimum": 0
+          }
+        }
       },
       "PutSecretBody": {
         "type": "object",
@@ -7587,6 +9575,71 @@
           }
         }
       },
+      "RecordPage": {
+        "type": "object",
+        "required": [
+          "items",
+          "next",
+          "end"
+        ],
+        "properties": {
+          "end": {
+            "type": "boolean",
+            "description": "`true` when `next` is the partition's head."
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecordView"
+            }
+          },
+          "next": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Offset to pass as `from` for the next page.",
+            "minimum": 0
+          }
+        }
+      },
+      "RecordView": {
+        "type": "object",
+        "required": [
+          "partition",
+          "offset",
+          "headers",
+          "body",
+          "timestamp"
+        ],
+        "properties": {
+          "body": {
+            "type": "object",
+            "description": "JSON when the body parses as JSON, else a string."
+          },
+          "headers": {
+            "type": "object"
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "partition": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "timestamp": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "Redriven": {
         "type": "object",
         "required": [
@@ -7599,6 +9652,29 @@
             "minimum": 0
           }
         }
+      },
+      "ResetBody": {
+        "type": "object",
+        "description": "Body of `POST /v1/services/{s}/consumers/{topic}/{group}/reset`.",
+        "required": [
+          "to"
+        ],
+        "properties": {
+          "partition": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "One partition; all when absent.",
+            "minimum": 0
+          },
+          "to": {
+            "type": "object",
+            "description": "`\"earliest\"`, `\"latest\"`, an offset (integer) or an RFC 3339 timestamp."
+          }
+        },
+        "additionalProperties": false
       },
       "ScheduleBody": {
         "type": "object",
@@ -8003,6 +10079,10 @@
           "access": {
             "type": "string"
           },
+          "async": {
+            "type": "object",
+            "description": "The `async` block; omitted while no knob is set."
+          },
           "call": {
             "type": "object",
             "description": "`{\"allowed_callers\": […]}`."
@@ -8029,6 +10109,10 @@
           "etag": {
             "type": "string",
             "description": "Also sent as the `ETag` header."
+          },
+          "events": {
+            "type": "object",
+            "description": "The `events` block; omitted while it has no subscription or consumer."
           },
           "id": {
             "type": "string"
@@ -8280,6 +10364,146 @@
         ],
         "description": "A key as `GET /v1/keys` lists it: the usual view plus the key that minted it."
       },
+      "TopicConsumer": {
+        "type": "object",
+        "description": "A consumer group of a service on the topic.",
+        "required": [
+          "service",
+          "slug",
+          "group",
+          "lag"
+        ],
+        "properties": {
+          "group": {
+            "type": "string"
+          },
+          "lag": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Records not yet committed, summed over partitions.",
+            "minimum": 0
+          },
+          "service": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        }
+      },
+      "TopicHead": {
+        "type": "object",
+        "description": "`first` = first retained offset, `next` = offset of the next append.",
+        "required": [
+          "partition",
+          "first",
+          "next"
+        ],
+        "properties": {
+          "first": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "next": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "partition": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "TopicPage": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TopicView"
+            }
+          }
+        }
+      },
+      "TopicView": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "project",
+          "project_id",
+          "environment",
+          "partitions",
+          "retention_hours",
+          "max_mb",
+          "bytes",
+          "created_at",
+          "heads"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "consumers": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/TopicConsumer"
+            },
+            "description": "Only on `GET /v1/topics/{t}`."
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "heads": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TopicHead"
+            }
+          },
+          "id": {
+            "type": "string"
+          },
+          "max_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "partitions": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "project": {
+            "type": "string"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "retention_hours": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "UsageView": {
         "type": "object",
         "required": [
@@ -8434,6 +10658,10 @@
     {
       "name": "observability",
       "description": "Logs, stats, events"
+    },
+    {
+      "name": "topics",
+      "description": "Persistent, replayable topic logs (`std:stream`)"
     }
   ]
 }

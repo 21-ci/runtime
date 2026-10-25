@@ -133,7 +133,7 @@ impl<'a, N: Node> Mcp<'a, N> {
     }
 }
 
-const ALL_TOOLS: [&str; 26] = [
+const ALL_TOOLS: [&str; 33] = [
     "whoami",
     "get_limits",
     "list_projects",
@@ -157,6 +157,13 @@ const ALL_TOOLS: [&str; 26] = [
     "get_stats",
     "set_env",
     "set_secret",
+    "list_topics",
+    "create_topic",
+    "read_topic",
+    "list_consumers",
+    "reset_consumer",
+    "list_invocations",
+    "redrive_invocations",
     "list_tokens",
     "create_token",
     "revoke_token",
@@ -169,7 +176,7 @@ const ALL_TOOLS: [&str; 26] = [
 node_test! {
 async fn ac_api_25_a_2025_11_25_client_initializes_lists_tools_and_calls_one() {
     let node = start_node().await;
-    let t = new_tenant_scopes(&node, "pro", &["services:read", "services:write", "deploy", "logs:read", "env:write", "secrets:write", "keys:write", "sockets:write"]).await;
+    let t = new_tenant_scopes(&node, "pro", &["services:read", "services:write", "deploy", "logs:read", "env:write", "secrets:write", "keys:write", "sockets:write", "queue:write"]).await;
 
     // initialize: the requested version is echoed, tools are the only capability, no session.
     let init = request("initialize", json!({"protocolVersion": "2025-11-25", "capabilities": {"roots": {}}, "clientInfo": {"name": "claude-code", "version": "2.1.0"}}));
