@@ -431,6 +431,11 @@ async fn ac_topics_api_07_consumers_view_reset_and_dlq() {
     let r = post(&node, &t.key, &format!("/v1/services/{svc}/consumers/ev/BAD%20G/reset"), json!({"to": "earliest"})).await;
     assert_eq!(r.s(), 422, "bad group: {}", r.text);
     assert_eq!(post(&node, &t.key, &format!("/v1/services/{svc}/consumers/missing/default/reset"), json!({"to": "earliest"})).await.s(), 404);
+    // A group the service never declared (and has no cursors for) is 404 and creates nothing.
+    let r = post(&node, &t.key, &format!("/v1/services/{svc}/consumers/ev/g2/reset"), json!({"to": "earliest"})).await;
+    assert_eq!(r.s(), 404, "undeclared group: {}", r.text);
+    let list = get(&node, &t.key, &format!("/v1/services/{svc}/consumers")).await;
+    assert_eq!(list.items().len(), 2, "no cursor for g2: {}", list.text);
 
     let dlq = get(&node, &t.key, &format!("/v1/services/{svc}/consumers/ev/g1/dlq?limit=5")).await;
     assert_eq!((dlq.s(), dlq.items().len()), (200, 0), "{}", dlq.text);

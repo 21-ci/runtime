@@ -304,6 +304,25 @@ async fn consumers_reset(
     check_group(&group)?;
     let to = parse_to(&b.to)?;
     let topic = require_topic(&s, &svc, &t).await?;
+    // Only a declared consumer, or one that already has cursors, may be reset: anything else
+    // would leave rows nobody consumes.
+    let declared = svc
+        .config
+        .events
+        .consume
+        .iter()
+        .any(|c| c.topic == topic.name && c.group == group);
+    if !declared {
+        let known = s
+            .streams
+            .cursors_on(topic.id)
+            .await?
+            .iter()
+            .any(|c| c.key.service == svc.id && c.key.group == group);
+        if !known {
+            return Err(ApiError::not_found());
+        }
+    }
     if let Some(p) = b.partition {
         if p >= topic.partitions {
             return Err(ApiError::invalid(format!(
