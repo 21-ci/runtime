@@ -319,6 +319,11 @@ fn pubsub_quota(quotas: Arc<dyn QuotaEnforcer>) -> PubsubQuota {
     )
 }
 
+/// Tenant quota check of each async delivery (one invocation per attempt).
+fn async_quota(quotas: Arc<dyn QuotaEnforcer>) -> rt_triggers::async_engine::AsyncQuota {
+    Arc::new(move |tenant: TenantId| quotas.check(tenant, rt_sec::QuotaOp::Invoke).is_ok())
+}
+
 /// Audit sink: `events` table (through the control plane writer), a log line, and the optional
 /// extra sink.
 /// The socket hub, bound once the scheduler exists (the host services are built before it).
@@ -1768,7 +1773,8 @@ pub async fn start_with(
             submit.clone(),
             clock.clone(),
         )
-        .with_metrics(metrics.clone()),
+        .with_metrics(metrics.clone())
+        .with_quota(async_quota(quotas.clone())),
     );
     let notify_stream: rt_triggers::events::StreamNotify = {
         let se = stream_engine.clone();

@@ -3,13 +3,15 @@
 //!
 //! - Lease: per service up to `max_concurrency` deliveries in flight, and at most
 //!   `inflight_node` ([`ASYNC_INFLIGHT_NODE`]) across the node. Lease visibility comes from
-//!   [`AsyncTaskFactory::visibility`] (queue timeout + wall + 10 s).
+//!   [`AsyncTaskFactory::visibility`] (queue timeout + build timeout + wall + 10 s).
 //! - Outcome ([`classify`]): `status >= 500` or `429`, a guest error, a kill (cpu / oom / wall) or
 //!   a build failure is a failed attempt, retried after [`async_backoff`] until the record's
 //!   `max_attempts`; any other status is a success. An admission refusal or a shutdown kill is not
 //!   an attempt: the lease is released with its attempt refunded after a throttle backoff.
 //! - Not routable (`Ok(None)` from the factory) is a throttle too: the record waits until the
 //!   service can run again or its `max_event_age` runs out (the sweep fails it).
+//! - Quota ([`AsyncEngine::with_quota`]): every delivery, retries and redrives included, takes
+//!   one tenant `invocations` token before it runs; over quota is a throttle (no attempt spent).
 //! - A payload the factory cannot unseal fails without running the handler and without backoff.
 //! - The response is dropped as soon as the outcome arrives (never buffered).
 //! - Every settle is fenced by the leased attempt: a late settle of an expired lease is ignored.
@@ -27,7 +29,7 @@ use rt_sched::Clock;
 use rt_store::queue::{InvocationState, InvocationStore, LeasedInvocation};
 use rt_store::StoreError;
 use rt_types::events::ASYNC_INFLIGHT_NODE;
-use rt_types::{KillReason, Outcome, ServiceId, TaskSpec};
+use rt_types::{KillReason, Outcome, ServiceId, TaskSpec, TenantId};
 use tokio::sync::Notify;
 
 use crate::queue_engine::counts_as_attempt;
@@ -36,6 +38,9 @@ use crate::Submitter;
 /// Error of a payload the factory could not unseal (fails at once, no retry).
 pub const SEALED_UNREADABLE: &str = "sealed_unreadable";
 
+/// Tenant quota check of one delivery (`QuotaOp::Invoke`): `false` = over quota (throttled).
+pub type AsyncQuota = Arc<dyn Fn(TenantId) -> bool + Send + Sync>;
+
 /// Builds the HTTP task of a leased invocation. Implemented by `rt-server`.
 pub trait AsyncTaskFactory: Send + Sync {
     /// `Ok(None)`: the service cannot take it now (no live version, plan forbids `http`,
@@ -43,7 +48,7 @@ pub trait AsyncTaskFactory: Send + Sync {
     /// be used (e.g. [`SEALED_UNREADABLE`]): the record fails without running.
     fn task_for(&self, inv: &LeasedInvocation) -> Result<Option<TaskSpec>, &'static str>;
 
-    /// Lease visibility for `service`: queue timeout + wall limit + 10 s.
+    /// Lease visibility for `service`: queue timeout + build timeout + wall limit + 10 s.
     fn visibility(&self, service: ServiceId) -> Duration;
 
     /// Deliveries of `service` in flight at once (`queue.max_concurrency`); `None` = the engine
@@ -176,6 +181,7 @@ pub struct AsyncEngine {
     tasks: Arc<dyn AsyncTaskFactory>,
     submit: Submitter,
     clock: Arc<dyn Clock>,
+    quota: Option<AsyncQuota>,
     hints: Mutex<BTreeSet<ServiceId>>,
     wake: Notify,
     draining: std::sync::atomic::AtomicBool,
@@ -199,6 +205,7 @@ impl AsyncEngine {
             tasks,
             submit,
             clock,
+            quota: None,
             hints: Mutex::new(BTreeSet::new()),
             wake: Notify::new(),
             draining: std::sync::atomic::AtomicBool::new(false),
@@ -209,6 +216,12 @@ impl AsyncEngine {
     /// `rt_async_failed_evicted_total`.
     pub fn with_metrics(mut self, m: Arc<rt_obs::Metrics>) -> Self {
         self.shared.metrics = Some(m);
+        self
+    }
+
+    /// Take a tenant quota token per delivery (each attempt, retries and redrives included).
+    pub fn with_quota(mut self, q: AsyncQuota) -> Self {
+        self.quota = Some(q);
         self
     }
 
@@ -313,6 +326,12 @@ impl AsyncEngine {
                     shared.settle(&inv, Settle::Throttled("not_routable")).await;
                     service
                 }),
+                Ok(Some(spec)) if self.quota.as_ref().is_some_and(|q| !q(spec.service.tenant)) => {
+                    Box::pin(async move {
+                        shared.settle(&inv, Settle::Throttled("quota")).await;
+                        service
+                    })
+                }
                 Ok(Some(spec)) => match (self.submit)(spec) {
                     Ok(handle) => Box::pin(async move {
                         let settle = {

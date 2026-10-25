@@ -409,3 +409,34 @@ async fn ac_async_eng_10_node_inflight_cap() {
     }
     assert_eq!(s.peak.load(Ordering::SeqCst), 3);
 }
+
+/// MINOR 2: every delivery (retries and redrives included) takes a tenant quota token; an
+/// over-quota delivery is a throttle (no attempt spent), so runs never exceed the tokens.
+#[tokio::test]
+async fn each_attempt_takes_a_quota_token_and_over_quota_is_a_throttle() {
+    let store = SqliteQueueStore::open_in_memory(5).unwrap();
+    let s = svc(1);
+    let id = accept(&store, s, 5, hour()).await;
+    let (sched, sub) = submitter(Duration::ZERO, |_| status(500));
+    let tokens = Arc::new(AtomicUsize::new(2));
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let (t2, a2) = (tokens.clone(), asked.clone());
+    let quota: rt_triggers::async_engine::AsyncQuota = Arc::new(move |tenant: TenantId| {
+        a2.lock().push(tenant);
+        t2.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    });
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let engine = Arc::new(AsyncEngine::new(cfg(), store.clone(), Factory::new(), sub, clock).with_quota(quota));
+    let e2 = engine.clone();
+    let task = tokio::spawn(async move { e2.run().await });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    task.abort();
+    assert_eq!(sched.submitted.load(Ordering::SeqCst), 2, "runs stay within the tokens");
+    let r = record(&store, s, id).await;
+    assert_eq!(r.state, InvocationState::Pending, "over quota is not a failed attempt");
+    assert_eq!(r.attempts, 2, "throttled deliveries refund their attempt");
+    let asked = asked.lock();
+    assert!(asked.len() > 2, "the quota is asked again after a throttle");
+    assert!(asked.iter().all(|t| *t == TenantId::from_u128(1)));
+}
