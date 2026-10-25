@@ -218,6 +218,7 @@ A schedule fire is skipped (and counted) while the previous run of the same sche
 | Read on a multi-partition topic | `partition` is required | `validation_failed` | fixed |
 | Dead letters per consumer | 1,000, kept 7 days | The oldest are dropped | fixed |
 | Stream appends | One tenant rate token per call | `429 rate_limited` | `plans.<name>.rps` |
+| Quota cost (`rps` and `invocations_per_day`) | A request: one token. An async invocation: one at accept and one per delivery attempt (retries and redrives included). A pub/sub publish: one per delivery, at least one (a publish with no receiver still costs one); a pub/sub request: one | `429 rate_limited` / `quota_exceeded`; a refused delivery is dropped (pub/sub) or retried later (async) | `plans.<name>.rps`, `plans.<name>.invocations_per_day` |
 | Async attempts (function errors and `429`, in total) | 1 to 10, default 3 | Invocation is `failed` (`retries_exhausted`) | `async.max_attempts` |
 | Async event age | 60 s to 86,400 s, default 3,600 | `event_age_exceeded` | `async.max_event_age_s` |
 | Failed async records | 1,000 per service, kept 7 days | The oldest are evicted | fixed |

@@ -239,7 +239,7 @@ topic the key cannot see is `404 not_found`.
 | GET | `/v1/topics/{t}/messages` | `services:read` | `?partition=N&from=<offset>\|earliest\|latest&from_time=<RFC3339>&limit=100` → `{items: [record], next, end}`. A page holds at most 100 records and 1 MiB. `partition` is required on a topic with more than one partition (`422 validation_failed`) |
 | POST | `/v1/pubsub/publish` | `queue:write` | `{subject, body, headers?, project?, environment?}` → `200 {receivers, dropped}`. `receivers` counts the services a delivery was queued for; `dropped` counts those skipped (fan-out cap of 100, per-service backlog, quota or admission refusal) |
 | GET | `/v1/services/{s}/consumers` | `services:read` | → `{items: [consumer]}` |
-| POST | `/v1/services/{s}/consumers/{topic}/{group}/reset` | `queue:write` | `{to: "earliest"\|"latest"\|<offset>\|"<RFC3339>", partition?}` → the consumer. Also unblocks a blocked consumer |
+| POST | `/v1/services/{s}/consumers/{topic}/{group}/reset` | `queue:write` | `{to: "earliest"\|"latest"\|<offset>\|"<RFC3339>", partition?}` → the consumer. Also unblocks a blocked consumer. `404` for a group that is neither declared in the service's `events.consume` nor has cursors (no cursor is created) |
 | GET | `/v1/services/{s}/consumers/{topic}/{group}/dlq` | `services:read` | `?limit=100` → `{items: [dead letter]}` |
 | DELETE | `/v1/services/{s}/consumers/{topic}/{group}/dlq` | `queue:write` | → `204` |
 | GET | `/v1/services/{s}/invocations` | `services:read` | `?state=pending\|succeeded\|failed&limit&cursor` → `{items: [invocation], next_cursor, counts: {pending, failed}}` |
@@ -289,7 +289,7 @@ Each code is explained in [Error reasons](reference/errors.md#control-api-codes)
 
 `ANY /s/{slug}` and `ANY /s/{slug}/{path…}` on `public` (or `internal`). The handler sees `/{path}?query`; the prefix is passed as `x-rt-base-path`. With a custom host or `{slug}.{base_domain}` the path is unchanged.
 
-Order of checks: route → the tenant's plan allows `http` (else `403 trigger_not_allowed`) → `access` (`key`: root token or key with `invoke` for this service, else `401`; 10 wrong `rtk_` keys per minute from one client, then `429 rate_limited`) → ingress rules (`405 method_not_allowed`, `403 forbidden`, `429`) → quotas → admission → run.
+Order of checks: route → the tenant's plan allows `http` (else `403 trigger_not_allowed`) → `access` (`key`: root token or key with `invoke` for this service, else `401`; 10 wrong `rtk_` keys per minute from one client, then `429 rate_limited`) → ingress rules (`405 method_not_allowed`, `403 forbidden`, `429`) → quotas → admission → run. The quota step takes one `rps`/daily token per request. An async invocation takes one at accept and one more per delivery attempt (retries and redrives included); a pub/sub publish takes one per delivery, at least one. See [Limits](reference/limits.md).
 
 | Added | Header |
 |---|---|

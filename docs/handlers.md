@@ -150,9 +150,8 @@ it answered:
 - **WebSockets and durable objects.** Socket event tasks and durable requests always use reuse when `ws.warm` is on
   (the default). With `0`, a warm object's instance, and the state its constructor set up, goes cold between events
   unless more events are waiting.
-- **Expiry timing.** A kept instance is released when its time runs out only when the node next looks at its pool. On a
-  node with no other work, an expired instance can therefore stay a little longer than `min_run_time_ms`. This is a
-  known limitation.
+- **Expiry timing.** A kept instance is released when its time runs out, also on a node with no other work: an idle
+  node wakes for the earliest expiry, so the instance goes at most about 50 ms after `min_run_time_ms`.
 - **Limits.** The value is an integer in milliseconds, `>= 0`. The node caps it at `sched.min_run_time_max_ms` (600000)
   and the plan at `limits_max.min_run_time_ms` (60000 by default). A larger value is refused with `422
   limit_exceeds_plan`.

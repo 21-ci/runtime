@@ -169,7 +169,7 @@ publishes them on host `127.0.0.1` only.
 
 | Scope | Allows |
 |---|---|
-| `services:read` | List and read services, projects, environments, versions, topics, consumers and invocations |
+| `services:read` | List and read services, projects, environments, versions, topics, consumers and invocations. This includes message payloads: `GET /v1/topics/{t}/messages`, a consumer's dead-letter list (with record headers and bodies) and the MCP `read_topic` tool |
 | `services:write` | Create, update and delete services, projects and topics |
 | `deploy` | Deploy, rebuild, roll back |
 | `invoke` | Call `access="key"` routes |
@@ -216,8 +216,9 @@ Every per-key, per-IP, per-tenant or per-service map on the request path has a c
 counters (credentials with no open stream dropped past 1024), per-service ingress buckets and `ip_allow` lists
 (dropped with their service on every route refresh), SDK caller gates (idle tenants dropped past 10k), lock slots
 (removed on release), socket tickets (swept), env bundles (idle TTL), usage counters (removed once flushed).
-Events: the pub/sub index (subscriptions × services, rebuilt per generation), round-robin counters per (namespace,
-group) and per topic (bounded by groups and topics), the stream engine's cursor cache and in-flight set (bounded by
+Events: the pub/sub index (subscriptions × services, rebuilt per generation), pub/sub round-robin counters per namespace
+(group, request and fan-out counters, pruned to the live namespaces whenever the subscription index changes), stream
+round-robin counters per topic (bounded by topics), the stream engine's cursor cache and in-flight set (bounded by
 consumers × partitions), and throttle counters per service (removed on success). Async in-flight attempts are capped
 at 256 per node.
 
@@ -267,6 +268,10 @@ with the `x-rt-tenant` header. Each tenant has a **plan**. These are the free pl
 - A service's `min_instances` and `max_instances` are clamped to the plan's `max_instances`. The sum of
   `min_instances` across a tenant must stay within `max_warm_floor_total`, otherwise `422 limit_exceeds_plan`.
   One tenant can't pin the node's memory with warm instances.
+- Re-entrant self-calls are the one exception to `max_instances`: a call from a service to itself may run on the
+  slot its waiting parent lends, so a service may exceed `max_instances` by one instance per waiting parent, and
+  pub/sub request replies to its own subject by at most 15 (the call depth limit). Each still takes the tenant's
+  per-depth call allowance, a `max_inflight` slot and its own memory reservation.
 - A per-service limit above `limits_max` is clamped and recorded as a plan conflict.
 - `scaling.min_run_time_ms` above the plan's `limits_max.min_run_time_ms` (or the node's `sched.min_run_time_max_ms`,
   whichever is lower) is refused with `422 limit_exceeds_plan`. If the plan is lowered later, the runtime clamps the
@@ -293,20 +298,29 @@ share the plan and the ingress checks, and each has its own caps.
   accepted. Revoking the key later does not cancel accepted invocations; purge them with `21ci invocation purge`. At run
   the runtime re-checks only the live version, `triggers.http` and the plan's `http` trigger.
 - **Stored async headers and body are sealed.** They are encrypted with the node's secret key (AES-256-GCM, additional
-  data = the invocation id and `h` or `b`), so `queue.db` holds only opaque bytes for them. The stored headers are the
+  data = the service id, the invocation id and `h` or `b`), so `queue.db` holds only opaque bytes for them. The
+  method and the `uri` (path **and query string**) are stored in plain text, kept 24 hours after success and 7 days on
+  failed records, and `request_hash` is an unsalted SHA-256 of method, uri and body: do not put tokens or personal data
+  in the query string of an async request (send them in a header or the body). The stored headers are the
   guest-visible set after ingress hygiene: runtime credentials (`rtk_…`, the root token) and client `x-rt-*` headers are
   already removed, and the guest's own `Authorization` and cookies are kept because the handler needs them. The
   sealed data is wiped when the invocation succeeds and kept on failed records (7 days, so they can be redriven). If
-  the key that sealed a record is gone, the record fails once with `sealed_unreadable` and is not retried. No API
-  returns headers or bodies of an invocation.
+  the key that sealed a record is gone, the record fails once with `sealed_unreadable` and is not retried. `rt secrets reseal` does not reseal async
+  invocations: drain pending and failed invocations (let them run, or purge them) before removing
+  `RT_MASTER_KEY_PREVIOUS` after a key rotation, otherwise they fail as `sealed_unreadable`. No API returns headers or
+  bodies of an invocation.
 - **Caps.** Pending async invocations: `plan.max_async_pending` per service (`429 async_backlog_full` above it). Failed
-  records: 1,000 per service, the oldest evicted. Async attempts: 256 in flight per node, `queue.max_concurrency` per
+  records: 1,000 per service, the oldest evicted. Async disk footprint: the sealed headers and body bytes of a
+  tenant's pending and failed invocations, across all its services, stay within `storage_mb` MiB (a separate budget
+  from the storage quota; `429 async_backlog_full` above it). Each accept and each delivery attempt (retries and
+  redrives included) takes one tenant rps/daily token. Async attempts: 256 in flight per node, `queue.max_concurrency` per
   service. Pub/sub: a publish reaches at most 100 receivers (the rest are counted as dropped), at most 64 deliveries in
   flight per subscriber service, nested publishes stop at depth 15, and each delivery is checked against the tenant
   quota before it is submitted. Deliveries go through admission (`max_queued`) and are dropped when it refuses them.
   Streams: each append call takes one tenant rate token; the tenant's byte cap counts records and dead letters
   (`max_stream_mb`); topics per tenant, partitions per topic and retention are capped by the plan; dead letters are
-  capped at 1,000 per consumer for 7 days. Reply and read pages are capped at 1 MiB; event bodies at 1 MiB.
+  capped at 1,000 per consumer for 7 days, and a dead-letter copy that would push the tenant over `max_stream_mb` is
+  kept without its body. Reply and read pages are capped at 1 MiB; event bodies at 1 MiB.
 - **Guest input.** Every number from a guest is bounded and saturating. Header names and values are validated (`x-rt-`
   is reserved; no CR, LF or NUL). Bodies are length-checked in the host and again in the store. Store SQL is
   parameterized, and no guest SQL reaches `streams.db`.
