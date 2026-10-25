@@ -375,7 +375,10 @@ async fn ac_stm_12_gen_fences_settles_after_reset() {
     assert_eq!(s.fail(&k, 0, 0, Duration::ZERO, "x").await.unwrap(), None);
     assert!(!s.defer(&k, 0, Duration::ZERO).await.unwrap());
     assert!(!s.block(&k, 0, "x").await.unwrap());
-    assert!(!s.dead_letter(&k, 0, &record(0, 0, "a"), 1, "x").await.unwrap());
+    assert!(!s
+        .dead_letter(&k, 0, &record(0, 0, "a"), 1, "x", u64::MAX)
+        .await
+        .unwrap());
     assert!(s.commit(&k, 1, 1).await.unwrap());
     let one = s
         .reset(t.id, svc(1), "default", Some(0), ReadFrom::Offset(1))
@@ -409,7 +412,7 @@ async fn ac_stm_13_dead_letter_moves_one_record_and_advances() {
     let mut r = record(0, 4, "poison");
     r.key = Some("k".into());
     r.headers = vec![("a".into(), "b".into())];
-    assert!(s.dead_letter(&k, 0, &r, 3, "status_500").await.unwrap());
+    assert!(s.dead_letter(&k, 0, &r, 3, "status_500", u64::MAX).await.unwrap());
     let c = s.cursor(&k, StartPosition::Earliest).await.unwrap();
     assert_eq!((c.committed, c.attempt), (5, 0));
     let dead = s.dead_list(t.id, svc(1), "default", 10).await.unwrap();
@@ -499,7 +502,9 @@ async fn ac_stm_17_trim_expires_dedup_and_old_dead_letters() {
     s.append(t.id, vec![r], BIG).await.unwrap();
     let k = key(&t, svc(1), 0);
     s.cursor(&k, StartPosition::Earliest).await.unwrap();
-    s.dead_letter(&k, 0, &record(0, 0, "x"), 1, "e").await.unwrap();
+    s.dead_letter(&k, 0, &record(0, 0, "x"), 1, "e", u64::MAX)
+        .await
+        .unwrap();
     let st = s.trim(now_ms() + 8 * 24 * HOUR as i64).await.unwrap();
     assert_eq!((st.dedup, st.dead), (1, 1));
     assert_eq!(s.dead_count(t.id, svc(1), "default").await.unwrap(), 0);
@@ -522,7 +527,9 @@ async fn ac_stm_18_delete_topic_and_purge_tenant_and_service_remove_everything()
 
     let k = key(&t2, svc(2), 0);
     s.cursor(&k, StartPosition::Earliest).await.unwrap();
-    s.dead_letter(&k, 0, &record(0, 0, "x"), 1, "e").await.unwrap();
+    s.dead_letter(&k, 0, &record(0, 0, "x"), 1, "e", u64::MAX)
+        .await
+        .unwrap();
     assert_eq!(s.purge_service(svc(2)).await.unwrap(), 2);
     assert!(s.cursors_on(t2.id).await.unwrap().is_empty());
     assert_eq!(s.topic_by_id(t2.id).await.unwrap().unwrap().dead_bytes, 0);
@@ -583,7 +590,9 @@ async fn ac_stm_22_dead_letters_count_toward_the_tenant_cap() {
     let t = topic(&s, "cap", 1).await;
     let k = key(&t, svc(1), 0);
     s.cursor(&k, StartPosition::Earliest).await.unwrap();
-    s.dead_letter(&k, 0, &record(0, 0, "12345678"), 1, "e").await.unwrap();
+    s.dead_letter(&k, 0, &record(0, 0, "12345678"), 1, "e", u64::MAX)
+        .await
+        .unwrap();
     assert_eq!(s.topic_by_id(t.id).await.unwrap().unwrap().dead_bytes, 8);
     let e = s.append(t.id, vec![rec("123")], 10).await.unwrap_err();
     assert!(matches!(e, StoreError::Conflict("stream_full")));
@@ -600,7 +609,9 @@ async fn ac_stm_23_dead_letters_beyond_1000_per_consumer_are_trimmed() {
     let k = key(&t, svc(1), 0);
     s.cursor(&k, StartPosition::Earliest).await.unwrap();
     for off in 0..DEAD_MAX_PER_CONSUMER + 5 {
-        s.dead_letter(&k, 0, &record(0, off, "x"), 1, "e").await.unwrap();
+        s.dead_letter(&k, 0, &record(0, off, "x"), 1, "e", u64::MAX)
+            .await
+            .unwrap();
     }
     assert_eq!(
         s.dead_count(t.id, svc(1), "default").await.unwrap(),
@@ -634,4 +645,42 @@ async fn stm_perf_append_throughput() {
         let secs = start.elapsed().as_secs_f64();
         println!("{per} per call: {:.0} appends/s", (calls * per) as f64 / secs);
     }
+}
+
+/// Dead-letter copies cannot push the tenant past its stream cap: once records plus dead letters
+/// would exceed it, the copy is kept without key, headers and body (the cursor still moves).
+#[tokio::test]
+async fn ac_stm_24_dead_letter_copies_respect_the_tenant_cap() {
+    let s = store();
+    let t = topic(&s, "amp", 1).await;
+    let cap = 32;
+    s.append(t.id, vec![rec("12345678"), rec("abcdefgh")], cap)
+        .await
+        .unwrap();
+    let a = key(&t, svc(1), 0);
+    let b = CursorKey {
+        group: "b".into(),
+        ..key(&t, svc(1), 0)
+    };
+    for k in [&a, &b] {
+        s.cursor(k, StartPosition::Earliest).await.unwrap();
+        let mut r0 = record(0, 0, "12345678");
+        r0.key = Some("k".into());
+        assert!(s.dead_letter(k, 0, &r0, 1, "e", cap).await.unwrap());
+        assert!(s
+            .dead_letter(k, 0, &record(0, 1, "abcdefgh"), 1, "e", cap)
+            .await
+            .unwrap());
+        assert_eq!(s.cursor(k, StartPosition::Earliest).await.unwrap().committed, 2);
+    }
+    let tp = s.topic_by_id(t.id).await.unwrap().unwrap();
+    assert!(tp.bytes + tp.dead_bytes <= cap, "{} + {}", tp.bytes, tp.dead_bytes);
+    assert_eq!(tp.dead_bytes, 9, "only group a's first copy (key + body) fits");
+    let dead_a = s.dead_list(t.id, svc(1), "default", 10).await.unwrap();
+    let dead_b = s.dead_list(t.id, svc(1), "b", 10).await.unwrap();
+    assert_eq!((dead_a.len(), dead_b.len()), (2, 2));
+    assert!(dead_b
+        .iter()
+        .all(|d| d.record.body.is_empty() && d.record.key.is_none()));
+    assert!(dead_b.iter().all(|d| d.error == "e" && d.attempts == 1));
 }

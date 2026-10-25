@@ -30,7 +30,7 @@ use rt_types::events::{
     Namespace, OnExhausted, StartPosition, StreamBatch, StreamRecord, DELIVERY_BATCH_MAX_BYTES, READ_LIMIT_MAX,
     STREAM_FAIL_AT_HEADER, STREAM_INFLIGHT_PER_SERVICE,
 };
-use rt_types::{KillReason, Outcome, ServiceId, TaskSpec, TopicId};
+use rt_types::{KillReason, Outcome, ServiceId, TaskSpec, TenantId, TopicId};
 use tokio::sync::Notify;
 
 use crate::queue_engine::{counts_as_attempt, throttle_delay};
@@ -86,6 +86,11 @@ pub trait StreamTaskFactory: Send + Sync {
     fn consumers(&self) -> Vec<ConsumerDecl>;
     /// `None` = the service cannot take the batch now (throttled, no attempt).
     fn task_for(&self, service: ServiceId, batch: StreamBatch) -> Option<TaskSpec>;
+    /// The tenant's stream byte cap (records plus dead letters, `max_stream_mb`): dead-letter
+    /// copies beyond it are kept without their body. The default is no cap.
+    fn stream_cap(&self, _tenant: TenantId) -> u64 {
+        u64::MAX
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -588,6 +593,7 @@ impl StreamEngine {
         let last = batch.records[batch.records.len() - 1].offset;
         let job = Job {
             store: self.store.clone(),
+            stream_cap: self.tasks.stream_cap(decl.ns.tenant),
             metrics: self.metrics.clone(),
             key: key.clone(),
             gen: cursor.gen,
@@ -676,6 +682,8 @@ fn classify(o: &Outcome, first: u64, last: u64) -> Verdict {
 /// What a batch needs to settle once its outcome arrives.
 struct Job {
     store: Arc<dyn StreamStore>,
+    /// The tenant's stream cap, for dead-letter copies.
+    stream_cap: u64,
     metrics: Option<Arc<rt_obs::Metrics>>,
     key: CursorKey,
     gen: u64,
@@ -759,7 +767,10 @@ impl Job {
         };
         let res = match self.decl.on_exhausted {
             OnExhausted::Dlq => {
-                let r = self.store.dead_letter(key, self.gen, record, attempt, &error).await;
+                let r = self
+                    .store
+                    .dead_letter(key, self.gen, record, attempt, &error, self.stream_cap)
+                    .await;
                 if matches!(r, Ok(true)) {
                     tracing::warn!(
                         partition = key.partition,
