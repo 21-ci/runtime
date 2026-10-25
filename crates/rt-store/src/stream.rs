@@ -189,7 +189,9 @@ pub trait StreamStore: Send + Sync {
     async fn fail(&self, key: &CursorKey, gen: u64, at: u64, delay: Duration, error: &str) -> Result<Option<u16>>;
     /// Not before `now + delay`, no attempt counted.
     async fn defer(&self, key: &CursorKey, gen: u64, delay: Duration) -> Result<bool>;
-    /// Copy `record` to the consumer's dead letters and move the cursor past it.
+    /// Copy `record` to the consumer's dead letters and move the cursor past it. When the tenant's
+    /// records plus dead letters would exceed `tenant_max_bytes`, the copy keeps only its position,
+    /// attempts and error (no key, headers or body), so dead letters never grow past the cap.
     async fn dead_letter(
         &self,
         key: &CursorKey,
@@ -197,6 +199,7 @@ pub trait StreamStore: Send + Sync {
         record: &StreamRecord,
         attempts: u16,
         error: &str,
+        tenant_max_bytes: u64,
     ) -> Result<bool>;
     async fn block(&self, key: &CursorKey, gen: u64, error: &str) -> Result<bool>;
     /// Move the group's cursors (one partition or all; created when missing): gen + 1, active,
@@ -1014,6 +1017,7 @@ impl StreamStore for SqliteStreamStore {
         record: &StreamRecord,
         attempts: u16,
         error: &str,
+        tenant_max_bytes: u64,
     ) -> Result<bool> {
         let key = key.clone();
         let record = record.clone();
@@ -1034,7 +1038,7 @@ impl StreamStore for SqliteStreamStore {
                 let topic = key.topic.to_string();
                 let service = key.service.to_string();
                 let headers = headers_blob(&record.headers)?;
-                let size = i(record_size(record.key.as_deref(), headers.as_deref(), &record.body));
+                let full = record_size(record.key.as_deref(), headers.as_deref(), &record.body);
                 let old: Option<i64> = c
                     .query_row(
                         "SELECT size FROM dead WHERE topic_id = ?1 AND service_id = ?2 AND grp = ?3 AND part = ?4 AND off = ?5",
@@ -1042,6 +1046,19 @@ impl StreamStore for SqliteStreamStore {
                         |r| r.get(0),
                     )
                     .optional()?;
+                let tenant: String =
+                    c.query_row("SELECT tenant_id FROM topics WHERE id = ?1", [&topic], |r| r.get(0))?;
+                let used: i64 = c
+                    .prepare_cached("SELECT coalesce(sum(bytes + dead_bytes), 0) FROM topics WHERE tenant_id = ?1")?
+                    .query_row([&tenant], |r| r.get(0))?;
+                // A replaced copy frees its old size first.
+                let fits = u(used).saturating_sub(u(old.unwrap_or(0))).saturating_add(full) <= tenant_max_bytes;
+                let (rkey, headers, body, size) = if fits {
+                    (record.key.clone(), headers, record.body.clone(), i(full))
+                } else {
+                    tracing::warn!(partition = record.partition, offset = record.offset, "stream: dead letter stored without body (tenant stream cap)");
+                    (None, None, Bytes::new(), 0)
+                };
                 c.execute(
                     "INSERT OR REPLACE INTO dead (topic_id, service_id, grp, part, off, ts, key, headers, body, size, \
                      attempts, error, failed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
@@ -1052,9 +1069,9 @@ impl StreamStore for SqliteStreamStore {
                         record.partition,
                         i(record.offset),
                         record.ts_ms,
-                        record.key,
+                        rkey,
                         headers,
-                        &record.body[..],
+                        &body[..],
                         size,
                         attempts,
                         error,

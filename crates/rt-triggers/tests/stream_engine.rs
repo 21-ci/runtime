@@ -48,6 +48,7 @@ fn decl(service: u128, topic: &str, group: &str) -> ConsumerDecl {
 
 struct Factory {
     consumers: Mutex<Vec<ConsumerDecl>>,
+    cap: Mutex<u64>,
 }
 
 impl StreamTaskFactory for Factory {
@@ -56,6 +57,9 @@ impl StreamTaskFactory for Factory {
     }
     fn consumers(&self) -> Vec<ConsumerDecl> {
         self.consumers.lock().clone()
+    }
+    fn stream_cap(&self, _tenant: TenantId) -> u64 {
+        *self.cap.lock()
     }
     fn task_for(&self, service: ServiceId, batch: StreamBatch) -> Option<TaskSpec> {
         let sref = ServiceRef {
@@ -203,6 +207,7 @@ fn rig(cfg: StreamEngineConfig, store: Arc<SqliteStreamStore>, consumers: Vec<Co
     let metrics = rt_obs::Metrics::new(rt_obs::MetricsOptions::default()).unwrap();
     let factory = Arc::new(Factory {
         consumers: Mutex::new(consumers),
+        cap: Mutex::new(u64::MAX),
     });
     let dyn_clock: Arc<dyn Clock> = Arc::new(clock.clone());
     let engine =
@@ -733,5 +738,33 @@ async fn ac_stm_eng_15_trim_runs_on_its_interval() {
     assert!(first > 0, "trim ran after 60 s");
     assert_eq!(r.metrics.stream_trimmed_total.get(), first);
     let _ = &r.factory;
+    run.abort();
+}
+
+/// A dead letter that would push the tenant past its stream cap keeps its offset, attempts and
+/// error but no body; the cursor still moves on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_stm_eng_dlq_copy_over_the_tenant_cap_drops_the_body() {
+    let store = SqliteStreamStore::open_in_memory().unwrap();
+    let t = topic(&store, "orders", 1, 0).await;
+    let mut d = decl(1, "orders", "default");
+    d.max_attempts = 1;
+    let r = rig(cfg(), store, vec![d]);
+    *r.factory.cap.lock() = 10; // exactly the two records
+    r.append(&t, &["poison", "fine"]).await;
+    r.sched.set(|b| {
+        if b.records[0].body.as_ref() == b"poison" {
+            done(Outcome::GuestError)
+        } else {
+            done(ok())
+        }
+    });
+    let run = r.start();
+    r.until_committed(1, 0, 2).await;
+    let dead = r.store.dead_list(t.id, svc(1), "default", 10).await.unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!((dead[0].record.offset, dead[0].attempts), (0, 1));
+    assert!(dead[0].record.body.is_empty());
+    assert_eq!(r.store.topic_by_id(t.id).await.unwrap().unwrap().dead_bytes, 0);
     run.abort();
 }
