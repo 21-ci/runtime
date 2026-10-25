@@ -730,7 +730,14 @@ impl AsyncTaskFactory for AsyncTasks {
         let plan = specs.plans.plan_arc(entry.tenant);
         let eff = specs.config.load().service_effective(svc.profile, &svc.config, &plan);
         let knobs = eff.knobs(&plan);
-        knobs.queue_timeout + eff.limits_for(&Trigger::Http).wall + Duration::from_secs(10)
+        // A first run may wait on a build (or a cold start) before the handler starts: the lease
+        // must outlast it, or the record is leased again and runs twice.
+        let config = specs.config.load();
+        let build = match entry.runtime {
+            rt_types::RuntimeKind::Wasm => config.build.wasm_timeout,
+            _ => config.build.timeout,
+        };
+        knobs.queue_timeout + build + eff.limits_for(&Trigger::Http).wall + Duration::from_secs(10)
     }
 }
 
@@ -1166,5 +1173,25 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("no warning: {}", logs.text());
+    }
+
+    /// MINOR 6: a first run that waits on a build is not leased again before the build can end.
+    #[test]
+    fn async_visibility_covers_the_build_timeout_of_the_service_runtime() {
+        let (specs, sid) = specs_with(rt_types::TriggerSwitches::default());
+        let mut config = Config::default();
+        config.build.wasm_timeout = Duration::from_secs(600);
+        config.build.timeout = Duration::from_secs(5);
+        specs.config.store(Arc::new(config));
+        let tasks = AsyncTasks {
+            specs: Arc::new(specs),
+            secrets: Arc::new(rt_sec::LocalSecrets::new(&rt_sec::MasterKey::from_bytes([1; 32]))),
+        };
+        assert!(
+            tasks.visibility(sid) > Duration::from_secs(600),
+            "visibility {:?} must outlast the wasm build timeout",
+            tasks.visibility(sid)
+        );
+        assert_eq!(tasks.visibility(ServiceId::from_u128(77)), Duration::from_secs(60));
     }
 }
