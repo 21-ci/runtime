@@ -83,12 +83,13 @@ request to be queued instead of run now:
 |---|---|
 | `Prefer: respond-async` | Queued if async is allowed. Otherwise ignored and the request runs synchronously. A body over the limit (1 MiB or the service's body limit, whichever is smaller) runs synchronously |
 | `X-Rt-Invocation-Type: Event` | Queued, and required: refused with `403 async_not_allowed` when async is off, or with `413 too_large` when the body is over the limit |
-| `X-Rt-Invocation-Type: RequestResponse` | Synchronous (the default). Any other value is `400 bad_request` |
+| `X-Rt-Invocation-Type: RequestResponse` | Synchronous (the default). Any other value is `400 bad_request` when async is on, and ignored when it is off |
 | `Idempotency-Key: <1..255 visible ASCII>` | Same key on the same service while its record exists: the original `202` again, with `x-rt-idempotent-replay: true`. Same key with a different request is `409 idempotency_mismatch` |
 
 The accepted request answers `202 Accepted` with `{"id":"inv_…","state":"pending"}` and `x-rt-invocation-id`. The
 request's headers and body are stored sealed (encrypted) in the node's queue database and are read back only to run
-the invocation. A full backlog answers `429 async_backlog_full` with `Retry-After: 1`.
+the invocation. A full backlog answers `429 async_backlog_full` with `Retry-After: 1`: the service holds `max_async_pending` pending
+invocations, or the tenant's pending and failed invocations would hold more than its plan `storage_mb` of stored bytes.
 
 The invocation runs the same `fetch` handler with `ctx.trigger = "http"`, the same method, path, query, headers and
 body as accepted, plus `x-rt-invocation-id` and `x-rt-invocation-attempt` (1-based), and `ctx.invocation = { id,

@@ -427,8 +427,14 @@ async fn accept_async(s: &ApiState, a: AsyncAccept, request: (String, String, Ve
         max_attempts: a.max_attempts,
         idempotency_key: a.idempotency_key,
     };
-    let max_pending = s.plans.plan_arc(a.tenant).max_async_pending;
-    let (id, state, replay) = match s.invocations.accept(new, max_pending).await {
+    let plan = s.plans.plan_arc(a.tenant);
+    let limits = rt_store::queue::AcceptLimits {
+        tenant: Some(a.tenant),
+        max_pending: plan.max_async_pending,
+        // The tenant's async backlog (pending + failed, sealed bytes) gets its own `storage_mb`.
+        max_tenant_bytes: plan.storage_mb.saturating_mul(1024 * 1024),
+    };
+    let (id, state, replay) = match s.invocations.accept_with(new, limits).await {
         Ok(rt_store::queue::Accepted::New(id)) => {
             s.node.notify(crate::state::ControlEvent::AsyncAccepted(a.service));
             (id, rt_store::queue::InvocationState::Pending, false)
@@ -652,14 +658,27 @@ async fn invoke(State(s): State<ApiState>, Extension(listener): Extension<Listen
         }
     }
 
+    // An unknown `X-Rt-Invocation-Type` is refused (before the quota token) only where async is
+    // on; a service without async ignores the header as it always did.
+    let mode = match mode {
+        Ok(m) => m,
+        Err(()) => {
+            let async_on = s
+                .service_table
+                .load()
+                .get(&entry.service)
+                .is_some_and(|v| v.config.async_invoke.enabled());
+            if async_on {
+                return plain_error(400, "bad_request");
+            }
+            AsyncMode::Sync
+        }
+    };
+
     // 4. quotas (tenant RPS bucket, invocations per day)
     if let Err(e) = s.quotas.check(entry.tenant, QuotaOp::Invoke) {
         return quota_response(&e);
     }
-
-    let Ok(mode) = mode else {
-        return plain_error(400, "bad_request");
-    };
 
     // 5. header hygiene
     let mut headers = guest_headers(&parts.headers, internal, strip_authorization, &route.base_path, client);

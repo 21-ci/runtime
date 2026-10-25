@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rt_types::events::{ASYNC_FAILED_MAX_PER_SERVICE, ASYNC_FAILED_RETENTION_MS, ASYNC_SUCCEEDED_RETENTION_MS};
-use rt_types::{InvocationId, ServiceId};
+use rt_types::{InvocationId, ServiceId, TenantId};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +47,17 @@ pub struct NewInvocation {
     pub idempotency_key: Option<String>,
     /// Lowercase hex sha256 of `method + "\n" + uri + "\n" + body`.
     pub request_hash: String,
+}
+
+/// Admission caps of [`InvocationStore::accept_with`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcceptLimits {
+    /// Owner of the service; `None` = no tenant byte budget.
+    pub tenant: Option<TenantId>,
+    /// Pending records per service (plan `max_async_pending`).
+    pub max_pending: u64,
+    /// Sealed headers + body bytes of the tenant's pending and failed records (plan `storage_mb`).
+    pub max_tenant_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -148,7 +159,20 @@ pub trait InvocationStore: Send + Sync {
     /// Persist `inv`. `Conflict("async_backlog_full")` when the service already has
     /// `max_pending` pending records, `Conflict("idempotency_mismatch")` when its idempotency key
     /// names a record with another request hash.
-    async fn accept(&self, inv: NewInvocation, max_pending: u64) -> Result<Accepted>;
+    async fn accept(&self, inv: NewInvocation, max_pending: u64) -> Result<Accepted> {
+        self.accept_with(
+            inv,
+            AcceptLimits {
+                tenant: None,
+                max_pending,
+                max_tenant_bytes: u64::MAX,
+            },
+        )
+        .await
+    }
+    /// [`Self::accept`] with a tenant byte budget too: `Conflict("async_backlog_full")` when the
+    /// tenant's pending and failed records plus this one exceed `max_tenant_bytes`.
+    async fn accept_with(&self, inv: NewInvocation, limits: AcceptLimits) -> Result<Accepted>;
     /// Lease up to `max` due pending records for `visibility` (each lease is one attempt).
     async fn lease_invocations(
         &self,
@@ -185,8 +209,9 @@ pub trait InvocationStore: Send + Sync {
         limit: usize,
         cursor: Option<String>,
     ) -> Result<InvocationPage>;
-    /// Failed records back to pending (attempts 0, a new age window); returns how many.
-    async fn redrive_invocations(&self, service: ServiceId) -> Result<u64>;
+    /// Failed records back to pending (attempts 0, a new age window), oldest first, so the
+    /// service has at most `max_pending` pending; `unreadable` records stay failed. Returns how many.
+    async fn redrive_invocations(&self, service: ServiceId, max_pending: u64) -> Result<u64>;
     async fn purge_failed(&self, service: ServiceId) -> Result<u64>;
     /// Services with a due pending record.
     async fn services_with_invocations(&self) -> Result<Vec<ServiceId>>;
@@ -258,7 +283,7 @@ fn record(r: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationRecord> {
     })
 }
 
-fn accept_tx(c: &mut Connection, inv: NewInvocation, max_pending: u64) -> Result<Accepted> {
+fn accept_tx(c: &mut Connection, inv: NewInvocation, limits: AcceptLimits) -> Result<Accepted> {
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let service = inv.service.to_string();
     if let Some(key) = &inv.idempotency_key {
@@ -284,15 +309,29 @@ fn accept_tx(c: &mut Connection, inv: NewInvocation, max_pending: u64) -> Result
         [&service],
         |r| r.get(0),
     )?;
-    if pending.max(0) as u64 >= max_pending {
+    if pending.max(0) as u64 >= limits.max_pending {
         return Err(StoreError::Conflict("async_backlog_full"));
+    }
+    let stored = inv.sealed_headers.len().saturating_add(inv.sealed_body.len()) as u64;
+    let tenant = limits.tenant.map(|t| t.to_string());
+    if let Some(t) = &tenant {
+        let used: i64 = tx.query_row(
+            "SELECT coalesce(sum(stored_bytes), 0) FROM invocations \
+             WHERE tenant_id = ?1 AND state != 'succeeded'",
+            [t],
+            |r| r.get(0),
+        )?;
+        if (used.max(0) as u64).saturating_add(stored) > limits.max_tenant_bytes {
+            return Err(StoreError::Conflict("async_backlog_full"));
+        }
     }
     let now = now_ms();
     let max_age = ms(inv.max_age);
     tx.execute(
         "INSERT INTO invocations (id, service_id, state, method, uri, headers, body, body_bytes, attempts, \
          max_attempts, leased, visible_at, max_age_ms, created_at, updated_at, expires_at, idempotency_key, \
-         request_hash) VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, 0, ?8, 0, ?9, ?10, ?9, ?9, ?11, ?12, ?13)",
+         request_hash, tenant_id, stored_bytes) \
+         VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, 0, ?8, 0, ?9, ?10, ?9, ?9, ?11, ?12, ?13, ?14, ?15)",
         params![
             inv.id.to_string(),
             service,
@@ -307,6 +346,8 @@ fn accept_tx(c: &mut Connection, inv: NewInvocation, max_pending: u64) -> Result
             now.saturating_add(max_age),
             inv.idempotency_key,
             inv.request_hash,
+            tenant,
+            i64::try_from(stored).unwrap_or(i64::MAX),
         ],
     )?;
     tx.commit()?;
@@ -471,8 +512,8 @@ fn parse_cursor(cursor: &str) -> Result<(i64, String)> {
 
 #[async_trait]
 impl InvocationStore for SqliteQueueStore {
-    async fn accept(&self, inv: NewInvocation, max_pending: u64) -> Result<Accepted> {
-        self.db.call(move |c| accept_tx(c, inv, max_pending)).await
+    async fn accept_with(&self, inv: NewInvocation, limits: AcceptLimits) -> Result<Accepted> {
+        self.db.call(move |c| accept_tx(c, inv, limits)).await
     }
 
     async fn lease_invocations(
@@ -607,15 +648,23 @@ impl InvocationStore for SqliteQueueStore {
             .await
     }
 
-    async fn redrive_invocations(&self, service: ServiceId) -> Result<u64> {
+    async fn redrive_invocations(&self, service: ServiceId, max_pending: u64) -> Result<u64> {
         self.db
             .write(move |c| {
                 let now = now_ms();
+                let key = service.to_string();
+                let pending: i64 = c.query_row(
+                    "SELECT count(*) FROM invocations WHERE service_id = ?1 AND state = 'pending'",
+                    [&key],
+                    |r| r.get(0),
+                )?;
+                let room = max_pending.saturating_sub(pending.max(0) as u64);
                 let n = c.execute(
                     "UPDATE invocations SET state = 'pending', attempts = 0, leased = 0, visible_at = ?2, \
                      condition = NULL, error = NULL, status = NULL, updated_at = ?2, expires_at = ?2 + max_age_ms \
-                     WHERE service_id = ?1 AND state = 'failed'",
-                    params![service.to_string(), now],
+                     WHERE id IN (SELECT id FROM invocations WHERE service_id = ?1 AND state = 'failed' \
+                     AND coalesce(condition, '') != 'unreadable' ORDER BY updated_at, id LIMIT ?3)",
+                    params![key, now, i64::try_from(room).unwrap_or(i64::MAX)],
                 )?;
                 Ok(n as u64)
             })

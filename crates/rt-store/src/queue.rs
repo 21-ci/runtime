@@ -27,6 +27,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/queue_0001_init.sql")),
     (2, include_str!("../migrations/queue_0002_delayed.sql")),
     (3, include_str!("../migrations/queue_0003_invocations.sql")),
+    (4, include_str!("../migrations/queue_0004_invocation_bytes.sql")),
 ];
 
 #[path = "invocations.rs"]

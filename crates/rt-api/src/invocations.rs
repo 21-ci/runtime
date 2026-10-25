@@ -174,7 +174,8 @@ async fn invocations_get(
 async fn invocations_redrive(State(s): State<ApiState>, a: Auth, Path(id): Path<String>) -> R<Redriven> {
     a.require_scope(Scope::QueueWrite)?;
     let svc = load_service(&s, &a, &id).await?;
-    let n = s.invocations.redrive_invocations(svc.id).await?;
+    let max_pending = s.plans.plan_arc(svc.tenant_id).max_async_pending;
+    let n = s.invocations.redrive_invocations(svc.id, max_pending).await?;
     if n > 0 {
         s.node.notify(ControlEvent::AsyncAccepted(svc.id));
     }

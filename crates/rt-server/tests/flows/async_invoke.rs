@@ -284,8 +284,9 @@ async fn ac_async_e2e_06_disabled_or_durable_runs_sync_for_prefer_and_403_for_ev
     assert_eq!(r.header("preference-applied"), None);
     let r = invoke_with(&node, &slug, Method::POST, "/sync", &event(&[]), "").await;
     assert_eq!((r.s(), reason(&r)), (403, "async_not_allowed".to_string()), "{}", r.text);
+    // Async off: an unknown invocation type is ignored, as before async existed (MINOR 7).
     let r = invoke_with(&node, &slug, Method::POST, "/sync", &[("x-rt-invocation-type", "DryRun")], "").await;
-    assert_eq!(r.s(), 400, "{}", r.text);
+    assert_eq!((r.s(), r.text.as_str()), (200, "done"), "{}", r.text);
     let r = invoke_with(&node, &slug, Method::POST, "/sync", &[("x-rt-invocation-type", "RequestResponse")], "").await;
     assert_eq!(r.s(), 200, "{}", r.text);
     assert_eq!(invocations(&node, &t.key, &svc).await.items().len(), 0);
@@ -376,6 +377,51 @@ async fn ac_async_e2e_09_backlog_full_is_429() {
     let b = invoke_with(&node, &slug, Method::POST, "/slow?sleep=3000", &event(&[]), "").await;
     assert_eq!((b.s(), reason(&b)), (429, "async_backlog_full".to_string()), "{}", b.text);
     assert_eq!(b.header("retry-after").as_deref(), Some("1"));
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// MINOR 7: with async on, an unknown `X-Rt-Invocation-Type` is `400 bad_request` and runs nothing.
+async fn minor7_unknown_invocation_type_is_400_only_with_async_on() {
+    let node = start_node().await;
+    let t = new_tenant(&node, "pro").await;
+    let slug = uniq("asyncdry");
+    let svc = ship(&node, &t.key, &slug, RECORDER).await;
+    enable_async(&node, &t.key, &svc, json!({})).await;
+    let r = invoke_with(&node, &slug, Method::POST, "/x", &[("x-rt-invocation-type", "DryRun")], "").await;
+    assert_eq!((r.s(), reason(&r)), (400, "bad_request".to_string()), "{}", r.text);
+    assert!(runs(&node, &slug).await.is_empty());
+    assert_eq!(invocations(&node, &t.key, &svc).await.items().len(), 0);
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// B1: the tenant's pending + failed async bytes are capped by plan `storage_mb`, across its
+/// services: past it the accept is `429 async_backlog_full` and nothing new is stored.
+async fn b1_async_bytes_over_storage_mb_are_429_across_services() {
+    let node = start_node_with(|c| {
+        if let Some(p) = c.plans.get_mut("pro") {
+            p.storage_mb = 1;
+        }
+    })
+    .await;
+    let t = new_tenant(&node, "pro").await;
+    let a_slug = uniq("asyncbytesa");
+    let a = ship(&node, &t.key, &a_slug, RECORDER).await;
+    enable_async(&node, &t.key, &a, json!({})).await;
+    let b_slug = uniq("asyncbytesb");
+    let b = ship(&node, &t.key, &b_slug, RECORDER).await;
+    enable_async(&node, &t.key, &b, json!({})).await;
+    let body = "x".repeat(700 * 1024);
+    let first = invoke_with(&node, &a_slug, Method::POST, "/slow?sleep=5000", &event(&[]), &body).await;
+    assert_eq!(first.s(), 202, "{}", first.text);
+    let second = invoke_with(&node, &b_slug, Method::POST, "/slow?sleep=5000", &event(&[]), &body).await;
+    assert_eq!((second.s(), reason(&second)), (429, "async_backlog_full".to_string()), "{}", second.text);
+    assert_eq!(invocations(&node, &t.key, &b).await.items().len(), 0, "nothing stored");
+    let small = invoke_with(&node, &b_slug, Method::POST, "/small", &event(&[]), "x").await;
+    assert_eq!(small.s(), 202, "a small one still fits: {}", small.text);
     node.shutdown().await;
 }
 }
