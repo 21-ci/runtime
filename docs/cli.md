@@ -909,10 +909,10 @@ inv_01M3XM4ZQ8JX2T4V3K9D7R5E1A
 
 A topic is a persistent, replayable log of records in one project environment (`std:stream` in [handlers](handlers.md)); services consume it through their `events.consume` block. A name (`[a-z0-9][a-z0-9._-]{0,62}`, not starting with `tpc_`) resolves in `--project` (slug or `prj_…`, default `default`) and `--env` (default `production`); a `tpc_…` id needs neither. `--partitions` is fixed at create (default 1); `--retention` is in whole hours (`24h`, `7d`; else exit 2 "retention must be a whole number of hours"; default 24h); `--max-mb` caps the topic's size, oldest records first (0 = only the plan's cap). Plan limits: more topics than `max_topics` is `403 quota_exceeded`; partitions, retention or size over the plan is `422 limit_exceeds_plan`; a taken name is `409 topic_exists`. `delete` removes the records, cursors and dead letters; it asks on a terminal and needs `--yes` otherwise.
 
-`append` writes one record (`--body` is JSON inline, `@file` or `-`); records with the same `--key` go to the same partition, in order; `--dedup` drops a record whose id was appended before. A full topic is `429 stream_full`. `read` lists records of one partition from `--from` (an offset, `earliest`, `latest`) or `--from-time`; `--partition` is required when the topic has more than one (`422 validation_failed`) and is sent only when given. A page that does not reach the end prints `(more records: --from N)`.
+`append` writes one record (`--body` is JSON inline, `@file` or `-`); records with the same `--key` go to the same partition, in order; `--dedup` stores a record once per id: an id appended again within 2 minutes returns the first record's position (printed with `duplicate`) and stores nothing new. A full topic is `429 stream_full`. `read` lists records of one partition from `--from` (an offset, `earliest`, `latest`) or `--from-time`; `--partition` is required when the topic has more than one (`422 validation_failed`) and is sent only when given. A page that does not reach the end prints `(more records: --from N)`.
 
 ```console
-$ 21ci topic create orders --partitions 4 --retention 7d
+$ 21ci topic create orders --partitions 4 --retention 48h
 $ 21ci topic append orders --body '{"id":1}' --key cust-1
 Appended to orders: partition 2, offset 0.
 $ 21ci topic read orders --partition 2 --from earliest
@@ -1175,7 +1175,7 @@ Every operation of `openapi/openapi.json` and the command that calls it.
 | `GET`, `PUT …/env` | `env get`, `env set`, `env unset` |
 | `GET …/secrets`, `PUT`, `DELETE …/secrets/{name}` | `secret list`, `secret set`, `secret delete` |
 | `GET …/hosts`, `GET`, `PUT`, `DELETE …/hosts/{host}` | `host list`; `host get`; `host attach`; `host detach` |
-| `GET`, `POST …/schedules`, `PATCH`, `DELETE …/schedules/{id}` | `schedule list`, `schedule add`, `schedule update`, `schedule rm` |
+| `GET`, `POST …/schedules`, `GET …/schedules/once`, `PATCH`, `DELETE …/schedules/{id}` | `schedule list` (also the one-off schedules), `schedule add`, `schedule update`, `schedule rm` |
 | `POST`, `GET …/queue` | `queue send`, `queue stats` |
 | `GET`, `DELETE …/dlq`, `POST …/dlq/redrive` | `queue dlq`, `queue dlq --purge`, `queue dlq --redrive` |
 | `POST`, `GET /v1/topics`, `GET`, `PATCH`, `DELETE /v1/topics/{t}` | `topic create`, `topic list`, `topic get`, `topic update`, `topic delete` |
