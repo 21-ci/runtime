@@ -621,6 +621,11 @@ impl PubsubTaskFactory for Specs {
 }
 
 impl StreamTaskFactory for Specs {
+    /// The same cap the event bus passes to append (`max_stream_mb`).
+    fn stream_cap(&self, tenant: TenantId) -> u64 {
+        self.plans.plan_arc(tenant).max_stream_mb.saturating_mul(1024 * 1024)
+    }
+
     fn generation(&self) -> u64 {
         // A deleted topic sends no control event: a 30 s epoch makes the engine re-resolve its
         // topics (and drop the cursors of a missing one) at least that often.
