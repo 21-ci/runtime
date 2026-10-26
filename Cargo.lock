@@ -4976,7 +4976,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
- "toml",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -4990,7 +4990,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
- "toml",
+ "toml 1.1.8+spec-1.1.0",
  "tracing",
  "zeroize",
 ]
@@ -5245,7 +5245,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
- "toml",
+ "toml 1.1.8+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -6632,7 +6632,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
@@ -6897,6 +6897,21 @@ dependencies = [
  "toml_parser",
  "toml_writer",
  "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml"
+version = "1.1.8+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20489e00e4d8741d6be680764cc12e270655e375a20d1011e844a9c3379e678d"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime 1.1.2+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.4",
 ]
 
 [[package]]
@@ -7653,7 +7668,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "sha2",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
  "wasmtime-environ",
  "windows-sys 0.61.2",
  "zstd",
