@@ -96,7 +96,7 @@ hickory-resolver = { version = "0.26.3", default-features = false, features = ["
 
 # --- OpenAPI ---------------------------------------------------------------
 utoipa = { version = "5.4.0", features = ["axum_extras"] }
-utoipa-axum = "0.2.0"
+utoipa-axum = "0.3.0"
 utoipa-scalar = { version = "0.3.0", features = ["axum"] }
 
 # --- serialization / config ------------------------------------------------
