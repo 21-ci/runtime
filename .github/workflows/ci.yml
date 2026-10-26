@@ -102,7 +102,7 @@ jobs:
           targets: wasm32-wasip2
           cache-key: fixtures
       # wasm-tools derives multimem.wasm (a two-memory component the executor must refuse) from hello.wasm.
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: wasm-tools
       - run: scripts/build-fixtures.sh
@@ -223,7 +223,7 @@ jobs:
         with:
           targets: wasm32-wasip2
           cache-key: coverage
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-llvm-cov@0.9.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -294,7 +294,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: image
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-auditable@0.7.7
       - name: Release build of rt and 21ci (cargo-auditable embeds the dependency list for scanners)
