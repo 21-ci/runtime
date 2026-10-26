@@ -138,7 +138,7 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 subtle = "2.6.1"
 
 # --- ids / data structures / concurrency -----------------------------------
-ulid = { version = "1.2.1", features = ["serde"] }
+ulid = { version = "3.0.0", features = ["serde"] }
 semver = "1.0.28"
 dashmap = "6.1.0"
 arc-swap = "1.7.1"
