@@ -113,6 +113,7 @@ compile = "lazy"
 [deploy]
 retain_versions = 3             # Keep fewer versions
 auto_rollback = true
+drain_max = "15m"
 
 [storage]
 blob_backend = "local"

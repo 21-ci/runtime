@@ -724,6 +724,12 @@
         "default": true,
         "help": "Automatically rollback on deploy failure",
         "profile_scoped": false
+      },
+      "drain_max": {
+        "type": "duration",
+        "default": "15m",
+        "help": "Longest a superseded version may keep a switch in draining, bounded 1s to 24h; the drain deadline is the longest task wall or queue timeout plus 30s, capped by this.",
+        "profile_scoped": false
       }
     }
   },

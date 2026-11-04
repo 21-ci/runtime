@@ -530,6 +530,34 @@ class TestProfilesAndDefconfigs(unittest.TestCase):
             self.assertEqual(self.manager.get_defaults(name)["node"]["default_profile"], "balanced")
 
 
+class TestDeployDrainMax(unittest.TestCase):
+    """`deploy.drain_max`: a restart-only duration, default 15m, bounded 1s..24h in validate.rs."""
+
+    def setUp(self):
+        self.schema = json.loads((ROOT / "config" / "schema.json").read_text())
+        self.spec = self.schema["deploy"]["keys"]["drain_max"]
+
+    def test_schema_entry_is_a_restart_only_duration_defaulting_to_15m(self):
+        self.assertEqual(self.spec["type"], "duration")
+        self.assertEqual(self.spec["default"], "15m")
+        self.assertIs(self.spec["profile_scoped"], False)
+        self.assertNotIn("profile_defaults", self.spec)
+
+    def test_validator_accepts_human_durations_and_rejects_garbage_naming_the_key(self):
+        validator = ConfigValidator(self.schema)
+        for good in ("15m", "1s", "24h", "90s", 600):
+            self.assertEqual(validator.validate({"deploy": {"drain_max": good}}), [], good)
+        for bad in ("soon", "15 parsecs", -5, 1.5):
+            errors = validator.validate({"deploy": {"drain_max": bad}})
+            self.assertTrue(any("deploy.drain_max" in str(e) for e in errors), (bad, errors))
+
+    def test_every_defconfig_states_the_same_drain_max_default(self):
+        for name in SHIPPED:
+            with open(DEFCONFIG_DIR / f"{name}.toml", "rb") as f:
+                value = tomllib.load(f)["deploy"]["drain_max"]
+            self.assertEqual(value, "15m", name)
+
+
 class TestTomlEmitter(unittest.TestCase):
     def test_nested_tables_plans_and_rows_round_trip(self):
         config = {

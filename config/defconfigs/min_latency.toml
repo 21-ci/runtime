@@ -113,6 +113,7 @@ compile = "eager"               # Eager compilation
 [deploy]
 retain_versions = 10
 auto_rollback = true
+drain_max = "15m"
 
 [storage]
 blob_backend = "local"

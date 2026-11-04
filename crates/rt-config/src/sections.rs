@@ -456,6 +456,10 @@ section! {
     pub struct DeployConfig {
         pub retain_versions: u32,
         pub auto_rollback: bool,
+        /// Upper bound on how long a superseded version's tasks may keep a switch in `draining`.
+        /// Bounds the drain deadline (the wall or queue timeout plus margin is capped by this).
+        #[serde(with = "serde_duration")]
+        pub drain_max: Duration,
     }
 }
 impl Default for DeployConfig {
@@ -463,6 +467,7 @@ impl Default for DeployConfig {
         Self {
             retain_versions: 10,
             auto_rollback: true,
+            drain_max: Duration::from_secs(15 * 60),
         }
     }
 }

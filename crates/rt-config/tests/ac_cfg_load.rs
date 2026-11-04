@@ -629,6 +629,37 @@ fn ingress_backlog_defaults_to_4096_loads_from_file_and_env_and_must_be_positive
     assert!(validation_messages(&cfg).iter().any(|m| m.contains("ingress.backlog")));
 }
 
+/// `deploy.drain_max` defaults to 15 minutes, parses as a human duration from the file and the
+/// environment, and is bounded to 1 s .. 24 h (inclusive); one past either edge is refused with
+/// the key named.
+#[test]
+fn deploy_drain_max_defaults_to_15m_loads_and_is_bounded() {
+    assert_eq!(Config::default().deploy.drain_max, Duration::from_secs(15 * 60));
+    assert_eq!(
+        ok("[deploy]\ndrain_max = \"30m\"\n", &[]).deploy.drain_max,
+        Duration::from_secs(30 * 60)
+    );
+    assert_eq!(
+        ok("", &[("RT__DEPLOY__DRAIN_MAX", "2h")]).deploy.drain_max,
+        Duration::from_secs(2 * 3600)
+    );
+
+    let with = |d: Duration| {
+        let mut cfg = Config::default();
+        cfg.deploy.drain_max = d;
+        validation_messages(&cfg)
+    };
+    for bad in [Duration::ZERO, Duration::from_millis(999), Duration::from_secs(86_401)] {
+        let v = with(bad);
+        assert!(v.iter().any(|m| m.starts_with("deploy.drain_max")), "{bad:?}: {v:?}");
+    }
+    for good in [Duration::from_secs(1), Duration::from_secs(86_400)] {
+        let mut cfg = Config::default();
+        cfg.deploy.drain_max = good;
+        cfg.validate().unwrap_or_else(|e| panic!("{good:?} is in bounds: {e}"));
+    }
+}
+
 #[test]
 fn validate_rejects_kind_minimums_exceeding_the_processors() {
     let mut cfg = Config::default();

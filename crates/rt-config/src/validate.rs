@@ -2,6 +2,7 @@
 //! names each by its dotted key. Bounds mirror `config/schema.json`.
 
 use std::net::{IpAddr, Ipv6Addr};
+use std::time::Duration;
 
 use crate::Config;
 
@@ -173,6 +174,13 @@ pub(crate) fn problems(cfg: &Config) -> Vec<String> {
         u64::from(cfg.deploy.retain_versions),
         1,
     );
+    let drain = cfg.deploy.drain_max;
+    if drain < Duration::from_secs(1) || drain > Duration::from_secs(24 * 3600) {
+        p.push(format!(
+            "deploy.drain_max must be between 1s and 24h (got {})",
+            humantime::format_duration(drain)
+        ));
+    }
     at_least(&mut p, "storage.max_open_dbs", u64::from(cfg.storage.max_open_dbs), 1);
     if cfg.storage.readers_per_db > 64 {
         p.push(format!(
