@@ -15,6 +15,7 @@
 #![warn(clippy::await_holding_lock, clippy::mem_forget, clippy::undocumented_unsafe_blocks)]
 
 pub mod auth;
+pub mod branches;
 pub mod consumers;
 pub mod control;
 pub mod dto;

@@ -460,6 +460,8 @@ section! {
         /// Bounds the drain deadline (the wall or queue timeout plus margin is capped by this).
         #[serde(with = "serde_duration")]
         pub drain_max: Duration,
+        /// The most data a branch's `copy_data` may copy, database and blobs together, in MiB.
+        pub dry_run_max_mb: u32,
     }
 }
 impl Default for DeployConfig {
@@ -468,6 +470,7 @@ impl Default for DeployConfig {
             retain_versions: 10,
             auto_rollback: true,
             drain_max: Duration::from_secs(15 * 60),
+            dry_run_max_mb: 256,
         }
     }
 }

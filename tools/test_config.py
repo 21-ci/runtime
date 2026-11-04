@@ -558,6 +558,17 @@ class TestDeployDrainMax(unittest.TestCase):
             self.assertEqual(value, "15m", name)
 
 
+class TestDeployDryRunMaxMb(unittest.TestCase):
+    """`deploy.dry_run_max_mb`: the cap of a branch's `copy_data`, restart-only, at least 1."""
+
+    def test_schema_and_every_defconfig_state_the_same_default(self):
+        spec = json.loads((ROOT / "config" / "schema.json").read_text())["deploy"]["keys"]["dry_run_max_mb"]
+        self.assertEqual(spec["default"], 256)
+        for name in SHIPPED:
+            with open(DEFCONFIG_DIR / f"{name}.toml", "rb") as f:
+                self.assertEqual(tomllib.load(f)["deploy"]["dry_run_max_mb"], 256, name)
+
+
 class TestTomlEmitter(unittest.TestCase):
     def test_nested_tables_plans_and_rows_round_trip(self):
         config = {

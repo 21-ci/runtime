@@ -31,9 +31,11 @@ pub fn status_for_code(code: &str) -> StatusCode {
         | "topic_exists"
         | "switch_in_progress"
         | "switch_not_open"
+        | "branch_exists"
+        | "not_a_branch"
         | "rollback_target_gone" => StatusCode::CONFLICT,
         "precondition_failed" => StatusCode::PRECONDITION_FAILED,
-        "too_large" | "storage_quota" | "egress_quota" => StatusCode::PAYLOAD_TOO_LARGE,
+        "too_large" | "storage_quota" | "egress_quota" | "copy_data_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
         // Guest-data errors a control route can meet (data export, KV/SQL inspection): the
         // request was understood but the data refuses it (QUOTA-013).
         "sql_error" | "sql_not_authorized" | "sql_result_too_large" | "kv_not_integer" | "kv_overflow" => {

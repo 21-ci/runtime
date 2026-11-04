@@ -1932,6 +1932,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "include",
+            "in": "query",
+            "description": "`scratch`: list branches too. They are left out otherwise, unless `slug` names one.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -2265,6 +2274,301 @@
             }
           },
           "412": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/services/{s}/branches": {
+      "get": {
+        "tags": [
+          "services"
+        ],
+        "summary": "The branches of `{s}` the key may see.",
+        "operationId": "branches_list",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "the parent service",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size (default 50, max 200).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from a previous `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicePage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "services"
+        ],
+        "operationId": "branches_create",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "the parent service",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBranchBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/services/{s}/branches/{name}": {
+      "delete": {
+        "tags": [
+          "services"
+        ],
+        "summary": "Deletes the branch service and its data; the parent keeps its own.",
+        "operationId": "branches_delete",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "the parent service",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "branch name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
             "description": "",
             "content": {
               "application/json": {
@@ -8221,6 +8525,57 @@
           }
         }
       },
+      "CreateBranchBody": {
+        "type": "object",
+        "description": "`POST /v1/services/{s}/branches`.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "copy_data": {
+            "type": "boolean",
+            "description": "Copy the parent's data and blobs (`data:admin`; forces `access: key`). Default empty."
+          },
+          "egress_of_parent": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Keep the parent's egress rules (default); `false` allows no host."
+          },
+          "env_names_from_parent": {
+            "type": "boolean",
+            "description": "Add the names of the parent's env and secrets with empty values. Never a value."
+          },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One of the project's environments; default a new label `br-<name>`, removed with the branch."
+          },
+          "expires_at": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/i64",
+                "description": "Delete the branch and its data after this time (unix ms)."
+              }
+            ]
+          },
+          "name": {
+            "type": "string",
+            "description": "`^[a-z][a-z0-9-]{0,23}$` without `--`; the service's slug is `<parent-slug>-br-<name>`."
+          },
+          "schedules": {
+            "type": "boolean",
+            "description": "Let interval and cron triggers run. Default off."
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateKeyBody": {
         "type": "object",
         "required": [
@@ -10562,6 +10917,10 @@
           "scaling": {
             "type": "object"
           },
+          "scratch": {
+            "type": "object",
+            "description": "`{\"of\": \"svc_…\", \"kind\": \"branch\", \"name\": …, \"expires_at\": …, \"copied_data\": …}` of a branch;\nomitted otherwise."
+          },
           "slug": {
             "type": "string"
           },
@@ -11271,6 +11630,10 @@
             "description": "What activating this version could not finish; empty and absent normally."
           }
         }
+      },
+      "i64": {
+        "type": "integer",
+        "format": "int64"
       }
     }
   },

@@ -88,6 +88,10 @@ pub struct ServiceFilter {
     pub project_ids: Option<Vec<ProjectId>>,
     /// A key's scope: only services in these environments (`None` = any environment).
     pub environments: Option<Vec<String>>,
+    /// Leave out branches and previews. An exact `slug` always finds its service.
+    pub hide_scratch: bool,
+    /// Only the scratch services of this parent.
+    pub scratch_of: Option<ServiceId>,
 }
 
 /// A tenant-wide bound on warm floors: `scaling.min_instances` summed over the tenant's services,
@@ -312,6 +316,13 @@ pub trait MetaStore: Send + Sync {
         cap: WarmFloorCap,
     ) -> Result<Service>;
     async fn delete_service(&self, scope: TenantScope, id: ServiceId, keep_data: bool) -> Result<()>;
+    /// Scratch services whose `expires_at` has passed, at most `limit`, of any tenant.
+    async fn expired_scratch(&self, now: UnixMs, limit: u32) -> Result<Vec<Service>>;
+    /// Add `environment` to the project (one transaction, so concurrent adds keep each other's).
+    /// `true` when it was added here; a project past its environment cap is `Invalid`.
+    async fn add_project_environment(&self, tenant: TenantId, project: &str, environment: &str) -> Result<bool>;
+    /// Remove `environment` from the project unless a service is still in it.
+    async fn drop_project_environment(&self, tenant: TenantId, project: &str, environment: &str) -> Result<()>;
 
     async fn add_version(&self, id: ServiceId, v: NewVersion) -> Result<Version>;
     async fn get_version(&self, id: ServiceId, v: VersionNo) -> Result<Option<Version>>;
@@ -1743,6 +1754,7 @@ impl MetaStore for SqliteMetaStore {
                     sql.push_str(" AND tenant_id = ?");
                     args.push(Box::new(t.to_string()));
                 }
+                let has_slug = filter.slug.is_some();
                 if let Some(slug) = filter.slug {
                     sql.push_str(" AND slug = ?");
                     args.push(Box::new(slug));
@@ -1765,6 +1777,13 @@ impl MetaStore for SqliteMetaStore {
                 if let Some(envs) = &filter.environments {
                     sql.push_str(" AND environment IN (SELECT value FROM json_each(?))");
                     args.push(Box::new(to_json(envs)?));
+                }
+                if filter.hide_scratch && !has_slug {
+                    sql.push_str(" AND json_extract(config, '$.scratch') IS NULL");
+                }
+                if let Some(of) = filter.scratch_of {
+                    sql.push_str(" AND json_extract(config, '$.scratch.of') = ?");
+                    args.push(Box::new(of.to_string()));
                 }
                 sql.push_str(" ORDER BY id LIMIT ?");
                 args.push(Box::new(limit as i64 + 1));
@@ -1867,6 +1886,7 @@ impl MetaStore for SqliteMetaStore {
             if let Some(v) = patch.async_invoke {
                 config.async_invoke = v;
             }
+            config.enforce_scratch_policy();
             if patch.environment.as_deref().is_some_and(|e| !rt_types::valid_environment(e)) {
                 return Err(StoreError::Invalid("environment must match ^[a-z][a-z0-9-]{0,31}$".into()));
             }
@@ -1896,6 +1916,66 @@ impl MetaStore for SqliteMetaStore {
                 ],
             )?;
             Ok(svc)
+        })
+        .await
+    }
+
+    async fn expired_scratch(&self, now: UnixMs, limit: u32) -> Result<Vec<Service>> {
+        self.db
+            .read(move |c| {
+                let sql = format!(
+                    "SELECT {SERVICE_COLS} FROM services WHERE json_extract(config, '$.scratch.expires_at') <= ?1 \
+                     ORDER BY id LIMIT ?2"
+                );
+                let rows = c
+                    .prepare_cached(&sql)?
+                    .query_map(params![now, i64::from(limit)], service_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    async fn add_project_environment(&self, tenant: TenantId, project: &str, environment: &str) -> Result<bool> {
+        let (project, environment) = (project.to_string(), environment.to_string());
+        self.write(move |c| {
+            let cur = match project_by_slug(c, tenant, &project)? {
+                Some(p) => p,
+                None if project == rt_types::DEFAULT_PROJECT => {
+                    let p = default_project_row(tenant, now_ms());
+                    insert_project(c, &p)?;
+                    p
+                }
+                None => return Err(StoreError::NotFound),
+            };
+            if cur.environments.contains(&environment) {
+                return Ok(false);
+            }
+            let mut envs = cur.environments;
+            envs.push(environment);
+            rt_types::check_project_environments(&envs).map_err(StoreError::Invalid)?;
+            set_project_environments(c, cur.id, &envs)?;
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn drop_project_environment(&self, tenant: TenantId, project: &str, environment: &str) -> Result<()> {
+        let (project, environment) = (project.to_string(), environment.to_string());
+        self.write(move |c| {
+            let Some(cur) = project_by_slug(c, tenant, &project)? else {
+                return Ok(());
+            };
+            let used: i64 = c.query_row(
+                "SELECT count(*) FROM services WHERE project_id = ?1 AND environment = ?2",
+                params![cur.id.to_string(), environment],
+                |r| r.get(0),
+            )?;
+            if used > 0 || !cur.environments.contains(&environment) {
+                return Ok(());
+            }
+            let envs: Vec<String> = cur.environments.into_iter().filter(|e| *e != environment).collect();
+            set_project_environments(c, cur.id, &envs)
         })
         .await
     }

@@ -46,8 +46,6 @@ const REPAIR_EVERY: Duration = Duration::from_secs(1);
 const DRAIN_POLL: Duration = Duration::from_millis(250);
 /// Added to the longest a task can take.
 const DRAIN_MARGIN_MS: u64 = 30_000;
-/// The cap of a drain, until `deploy.drain_max` exists (§9 T6).
-const DRAIN_MAX_MS: u64 = 15 * 60 * 1000;
 
 /// Re-read the routes and the service table.
 #[async_trait]
@@ -212,15 +210,12 @@ impl Promoter {
     /// The longest the previous version's tasks can take, from now.
     fn drain_deadline(&self, svc: &Service, asked: Option<Duration>) -> UnixMs {
         let plan = self.deps.plans.plan_for(svc.tenant_id);
-        let eff = self
-            .deps
-            .config
-            .load()
-            .service_effective(svc.profile, &svc.config, &plan);
+        let cfg = self.deps.config.load();
+        let eff = cfg.service_effective(svc.profile, &svc.config, &plan);
         let longest = eff.wall_ms.value.max(eff.queue_timeout.value.as_millis() as u64);
         let wait = asked
             .map_or(longest.saturating_add(DRAIN_MARGIN_MS), |d| d.as_millis() as u64)
-            .min(DRAIN_MAX_MS);
+            .min(cfg.deploy.drain_max.as_millis() as u64);
         self.deps.clock.unix_ms().saturating_add(wait as i64)
     }
 

@@ -37,10 +37,10 @@ pub use model::{
     default_environment, scope_admits, valid_environment, valid_service_slug, Access, ApiKey, BuildState, CallAccess,
     CallTarget, Caller, DenoServiceConfig, EgressRules, EnvBundle, Etag, HostMapping, HostStatus, IngressRules,
     KeySecret, LimitsConfig, NewKey, NewSchedule, NewService, NewSwitch, NewTenant, NewVersion, NodeEvent, RateLimit,
-    RouteEntry, RouteSnapshot, ScalingConfig, Schedule, ScheduleKind, Scope, Scopes, Service, ServiceConfig,
-    ServicePatch, Switch, SwitchKind, SwitchPatch, SwitchState, Tenant, TriggerSwitches, UnixMs, UsageBatch,
-    UsageDelta, Version, VersionOrigin, WasmServiceConfig, WsServiceConfig, DEFAULT_ENVIRONMENT, MAX_ALLOWED_CALLERS,
-    MAX_ENVIRONMENT_LEN,
+    RouteEntry, RouteSnapshot, ScalingConfig, Schedule, ScheduleKind, Scope, Scopes, ScratchConfig, ScratchKind,
+    Service, ServiceConfig, ServicePatch, Switch, SwitchKind, SwitchPatch, SwitchState, Tenant, TriggerSwitches,
+    UnixMs, UsageBatch, UsageDelta, Version, VersionOrigin, WasmServiceConfig, WsServiceConfig, DEFAULT_ENVIRONMENT,
+    MAX_ALLOWED_CALLERS, MAX_ENVIRONMENT_LEN,
 };
 pub use outcome::{BuildFailReason, BuildFailure, Diagnostic, KillReason, Outcome, RejectReason, Reply, TaskTimings};
 pub use plan::{EgressDefault, Plan, PlanLimitsMax, TriggerKind};

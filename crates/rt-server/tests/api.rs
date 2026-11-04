@@ -10,6 +10,8 @@ mod common;
 
 #[path = "api/access.rs"]
 mod access;
+#[path = "api/branches.rs"]
+mod branches;
 #[path = "api/control.rs"]
 mod control;
 #[path = "api/edge_control.rs"]

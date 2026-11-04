@@ -296,8 +296,9 @@ async fn every_form_of_from_works() {
     assert!(own.json.get("source").is_none(), "{}", own.text);
 
     // `{branch}` names `<parent-slug>-br-<name>`.
-    let slug = format!("{}-br-staging", r.parent_slug);
-    let branch = create_in(&r.node, &r.t.key, &slug, "staging", "deno").await;
+    let made = post(&r.node, &r.t.key, &format!("/v1/services/{}/branches", r.parent), json!({"name": "staging"})).await;
+    assert_eq!(made.s(), 201, "{}", made.text);
+    let branch = made.json["id"].as_str().expect("id").to_string();
     built(&r.node, &r.t.key, &branch, &guest("named")).await;
     let named = r.switch(&r.t.key, json!({"from": {"branch": "staging"}})).await;
     assert_eq!(named.json["source"]["service"], json!(branch), "{}", named.text);
@@ -306,6 +307,43 @@ async fn every_form_of_from_works() {
     assert_refused(&none, 404, "not_found");
     r.node.shutdown().await;
 }
+}
+
+/// A deadline is at most `deploy.drain_max` away, whatever the switch asked for or the service's
+/// longest task would need.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_drain_deadline_is_capped_by_deploy_drain_max() {
+    let node = start_node_with(|c| c.deploy.drain_max = Duration::from_secs(2)).await;
+    let t = new_tenant(&node, "pro").await;
+    let id = create_service(&node, &t.key, &uniq("cap"), "deno").await;
+    built(&node, &t.key, &id, &guest("v1")).await;
+    built(&node, &t.key, &id, &guest("v2")).await;
+    let first = get(&node, &t.key, &format!("/v1/services/{id}")).await;
+    let live = first.json["live_version"].as_u64().expect("live");
+    let path = format!("/v1/services/{id}/switch");
+    for (asked, version) in [(json!("1h"), live - 1), (Value::Null, live)] {
+        let mut body = json!({"from": {"version": version}});
+        if !asked.is_null() {
+            body["drain_timeout"] = asked;
+        }
+        let up = post(&node, &t.key, &path, body).await;
+        assert_eq!(up.s(), 202, "{}", up.text);
+        let room =
+            up.json["drain_deadline"].as_i64().expect("deadline") - up.json["updated_at"].as_i64().expect("time");
+        assert!((0..=2_000).contains(&room), "{room}: {}", up.text);
+    }
+    // Under the cap the request is honoured.
+    let up = post(
+        &node,
+        &t.key,
+        &path,
+        json!({"from": {"version": live - 1}, "drain_timeout": "1s"}),
+    )
+    .await;
+    assert_eq!(up.s(), 202, "{}", up.text);
+    let room = up.json["drain_deadline"].as_i64().expect("deadline") - up.json["updated_at"].as_i64().expect("time");
+    assert!((0..=1_000).contains(&room), "{room}: {}", up.text);
+    node.shutdown().await;
 }
 
 node_test! {

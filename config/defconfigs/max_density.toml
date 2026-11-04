@@ -114,6 +114,7 @@ compile = "lazy"
 retain_versions = 10
 auto_rollback = true
 drain_max = "15m"
+dry_run_max_mb = 256
 
 [storage]
 blob_backend = "local"

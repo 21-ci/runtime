@@ -181,6 +181,7 @@ pub(crate) fn problems(cfg: &Config) -> Vec<String> {
             humantime::format_duration(drain)
         ));
     }
+    at_least(&mut p, "deploy.dry_run_max_mb", u64::from(cfg.deploy.dry_run_max_mb), 1);
     at_least(&mut p, "storage.max_open_dbs", u64::from(cfg.storage.max_open_dbs), 1);
     if cfg.storage.readers_per_db > 64 {
         p.push(format!(

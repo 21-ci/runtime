@@ -94,6 +94,8 @@ const STORAGE_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const KV_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// How often warm floors are reconciled with the live services.
 const FLOOR_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+/// Cadence of the sweep of expired branches.
+const SCRATCH_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Cadence of the orphaned-artifact sweep.
 const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 /// T2 disk garbage collection cadence, in 100 ms maintenance ticks (60 s).
@@ -692,6 +694,13 @@ impl NodeInfo for NodeImpl {
         })
     }
 
+    fn schedule_running(&self, service: ServiceId) -> bool {
+        self.sched_services
+            .lock()
+            .iter()
+            .any(|(id, s)| *s == service && self.schedules.is_running(*id))
+    }
+
     fn notify(&self, ev: ControlEvent) {
         match ev {
             ControlEvent::ScheduleUpserted(s) => {
@@ -726,6 +735,17 @@ impl NodeInfo for NodeImpl {
                 tokio::spawn(async move { purge_queue_rows(&q, svc).await });
                 let st = self.streams.clone();
                 tokio::spawn(async move { purge_stream_rows(&*st, svc).await });
+            }
+            ControlEvent::PreloadArtifact { digest, runtime } => {
+                let key = |engine_fp| PreparedKey {
+                    digest,
+                    kind: runtime,
+                    engine_fp,
+                };
+                match runtime {
+                    RuntimeKind::Deno => self.deno_cache.preload(&[key(self.deno_fp)]),
+                    RuntimeKind::Wasm => self.wasm_cache.preload(&[key(self.wasm_fp)]),
+                }
             }
             ControlEvent::QueueEnqueued(svc) => self.queue_engine.notify(svc),
             ControlEvent::BuildRequested {
@@ -2292,6 +2312,16 @@ pub async fn start_with(
                     Err(e) => tracing::warn!(error = %e, "expired-KV sweep failed"),
                 }
             }
+        });
+        background.push(task);
+        periodic.push(pass);
+    }
+    {
+        // Branches past their `expires_at`, with their data.
+        let state = state.clone();
+        let (task, pass) = spawn_periodic(SCRATCH_SWEEP_INTERVAL, true, move |_| {
+            let state = state.clone();
+            async move { rt_api::branches::sweep_expired(&state).await }
         });
         background.push(task);
         periodic.push(pass);

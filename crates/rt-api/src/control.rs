@@ -179,7 +179,7 @@ pub(crate) fn rfc3339_ms(s: &str) -> Result<i64, ApiError> {
         .map_err(|_| ApiError::invalid(format!("`{s}` is not an RFC 3339 timestamp")))
 }
 
-fn block<T: DeserializeOwned>(name: &str, v: Option<Value>) -> Result<Option<T>, ApiError> {
+pub(crate) fn block<T: DeserializeOwned>(name: &str, v: Option<Value>) -> Result<Option<T>, ApiError> {
     match v {
         None | Some(Value::Null) => Ok(None),
         Some(v) => serde_json::from_value(v)
@@ -204,7 +204,7 @@ fn scaling_block(v: Option<Value>) -> Result<Option<ScalingConfig>, ApiError> {
 /// plan's per-service `max_instances`. The meta store checks it in the transaction that writes the
 /// service (two requests at once cannot both fit); refused with 422 `limit_exceeds_plan`. A plan
 /// downgrade can leave a tenant above it: the node then keeps only the floors that fit (D-B2).
-fn warm_floor_cap(plan: &rt_types::Plan) -> WarmFloorCap {
+pub(crate) fn warm_floor_cap(plan: &rt_types::Plan) -> WarmFloorCap {
     WarmFloorCap {
         total: plan.max_warm_floor_total,
         per_service: plan.max_instances,
@@ -227,7 +227,7 @@ fn parse_profile(s: &str) -> Result<Profile, ApiError> {
 }
 
 /// An environment label (D-A1): a short slug.
-fn parse_environment(s: &str) -> Result<String, ApiError> {
+pub(crate) fn parse_environment(s: &str) -> Result<String, ApiError> {
     if rt_types::valid_environment(s) {
         Ok(s.to_string())
     } else {
@@ -245,7 +245,7 @@ fn parse_call(v: Option<Value>) -> Result<Option<CallAccess>, ApiError> {
     Ok(call)
 }
 
-fn valid_slug(s: &str) -> bool {
+pub(crate) fn valid_slug(s: &str) -> bool {
     let b = s.as_bytes();
     (2..=63).contains(&b.len())
         && b[0].is_ascii_lowercase()
@@ -265,7 +265,7 @@ fn valid_secret_name(n: &str) -> bool {
 
 /// `scaling.min_run_time_ms` may not exceed `min(plan.limits_max.min_run_time_ms, node max)`
 /// (`sched.min_run_time_max_ms`): refused with 422 `limit_exceeds_plan` instead of being clamped.
-fn check_scaling_bounds(plan: &Plan, node_max: u64, sc: &ScalingConfig) -> Result<(), ApiError> {
+pub(crate) fn check_scaling_bounds(plan: &Plan, node_max: u64, sc: &ScalingConfig) -> Result<(), ApiError> {
     if let Some(v) = sc.min_run_time_ms {
         let max = plan.limits_max.min_run_time_ms.min(node_max);
         if v > max {
@@ -300,7 +300,11 @@ fn async_block(v: Option<Value>) -> Result<Option<rt_types::events::AsyncInvokeC
 /// A service's `events` block against its durability and plan: durable services cannot subscribe
 /// or consume (422 `validation_failed`); subscriptions need the `pubsub` trigger and consumers the
 /// `stream` trigger of the plan (403 `trigger_not_allowed`).
-fn check_events_allowed(plan: &Plan, durable: bool, ev: &rt_types::events::EventsConfig) -> Result<(), ApiError> {
+pub(crate) fn check_events_allowed(
+    plan: &Plan,
+    durable: bool,
+    ev: &rt_types::events::EventsConfig,
+) -> Result<(), ApiError> {
     if ev.is_unset() {
         return Ok(());
     }
@@ -322,7 +326,7 @@ fn check_events_allowed(plan: &Plan, durable: bool, ev: &rt_types::events::Event
     Ok(())
 }
 
-fn check_limits(plan: &Plan, l: &LimitsConfig) -> Result<(), ApiError> {
+pub(crate) fn check_limits(plan: &Plan, l: &LimitsConfig) -> Result<(), ApiError> {
     let over = |field: &str, requested: u64, max: u64| {
         ApiError::new(
             "limit_exceeds_plan",
@@ -467,7 +471,7 @@ async fn scoped_service_ids(
     }
 }
 
-fn json_resp<T: serde::Serialize>(status: StatusCode, v: &T) -> Response {
+pub(crate) fn json_resp<T: serde::Serialize>(status: StatusCode, v: &T) -> Response {
     let value = serde_json::to_value(v).unwrap_or(Value::Null);
     value_resp(status, &value)
 }
@@ -655,7 +659,7 @@ fn schedule_view(sch: &Schedule, now_ms: i64) -> ScheduleView {
     }
 }
 
-async fn service_view(s: &ApiState, svc: &Service) -> Result<ServiceView, ApiError> {
+pub(crate) async fn service_view(s: &ApiState, svc: &Service) -> Result<ServiceView, ApiError> {
     let versions = s.meta.list_versions(svc.id).await?;
     Ok(service_view_of(s, svc, &versions))
 }
@@ -727,6 +731,7 @@ fn service_view_of(s: &ApiState, svc: &Service, versions: &[Version]) -> Service
         } else {
             blk(&svc.config.async_invoke)
         },
+        scratch: svc.config.scratch.as_ref().map_or(Value::Null, |c| json!(c)),
         status: ServiceStatus {
             build_state,
             tier: tier.to_string(),
@@ -1494,6 +1499,7 @@ async fn services_create(
                     ws,
                     events,
                     async_invoke,
+                    scratch: None,
                 },
             },
             warm_floor_cap(&plan),
@@ -1533,6 +1539,8 @@ async fn services_list(State(s): State<ApiState>, a: Auth, ApiQuery(q): ApiQuery
         environment: q.environment,
         project_ids,
         environments,
+        hide_scratch: q.include.as_deref() != Some("scratch"),
+        scratch_of: None,
     };
     let page = s
         .meta
@@ -1679,14 +1687,8 @@ async fn services_delete(
     a.require_scope(Scope::ServicesWrite)?;
     let svc = load_service(&s, &a, &id).await?;
     let keep = truthy(q.keep_data.as_deref());
-    s.meta.delete_service(a.scope, svc.id, keep).await?;
-    if !keep {
-        // Retired, not only purged: a task of the deleted service that is still running must not
-        // re-create its files (KV-024).
-        let _ = s.data.retire(svc.id);
-    }
-    refresh_routes(&s).await?;
-    s.node.notify(ControlEvent::ServiceDeleted(svc.id));
+    crate::branches::refuse_with_branches(&s, &svc).await?;
+    remove_service(&s, a.scope, &svc, keep).await?;
     audit(
         &s,
         &a,
@@ -1696,6 +1698,30 @@ async fn services_delete(
         json!({"keep_data": keep}),
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Everything a deleted service leaves behind goes, after the row (a failure here is a row gone and
+/// a table to refresh, not a service half there).
+pub(crate) async fn remove_service(
+    s: &ApiState,
+    scope: TenantScope,
+    svc: &Service,
+    keep: bool,
+) -> Result<(), ApiError> {
+    s.meta.delete_service(scope, svc.id, keep).await?;
+    if !keep {
+        // Retired, not only purged: a task of the deleted service that is still running must not
+        // re-create its files (KV-024).
+        let _ = s.data.retire(svc.id);
+    }
+    if svc.config.scratch.as_ref().is_some_and(|c| c.own_environment) {
+        s.meta
+            .drop_project_environment(svc.tenant_id, &svc.project, &svc.environment)
+            .await?;
+    }
+    refresh_routes(s).await?;
+    s.node.notify(ControlEvent::ServiceDeleted(svc.id));
+    Ok(())
 }
 
 /// A durable WASM service takes its events and alarms through `std:host/socket-handler`:
@@ -2261,28 +2287,31 @@ fn wire_name<T: serde::Serialize>(v: T) -> String {
         .unwrap_or_default()
 }
 
-fn is_system_service(svc: &Service) -> bool {
+pub(crate) fn is_system_service(svc: &Service) -> bool {
     rt_types::is_system_tenant(svc.tenant_id) || svc.slug.starts_with(rt_types::SYSTEM_SLUG_PREFIX)
 }
 
 /// The parent of a switch: `403 reserved` for system services.
-fn not_system_parent(svc: &Service) -> Result<(), ApiError> {
+pub(crate) fn not_system_parent(svc: &Service) -> Result<(), ApiError> {
     if is_system_service(svc) {
         return Err(ApiError::new("reserved", "system services are not switched"));
     }
     Ok(())
 }
 
-fn valid_branch_name(n: &str) -> bool {
+/// `^[a-z][a-z0-9-]{0,23}$`, and `--` stays reserved.
+pub(crate) fn valid_branch_name(n: &str) -> bool {
     let b = n.as_bytes();
     (1..=24).contains(&b.len())
         && b[0].is_ascii_lowercase()
         && b.iter()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        && !n.contains("--")
 }
 
-/// `<parent-slug>-br-<name>`, if the caller may see it. `404` otherwise, like any source.
-async fn load_branch(s: &ApiState, a: &Auth, parent: &Service, name: &str) -> Result<Service, ApiError> {
+/// `<parent-slug>-br-<name>`, if the caller may see it: `404` otherwise, like any source. A service
+/// that only carries such a slug is `not_a_branch`.
+pub(crate) async fn load_branch(s: &ApiState, a: &Auth, parent: &Service, name: &str) -> Result<Service, ApiError> {
     if !valid_branch_name(name) {
         return Err(ApiError::new(
             "branch_name_invalid",
@@ -2298,7 +2327,15 @@ async fn load_branch(s: &ApiState, a: &Auth, parent: &Service, name: &str) -> Re
         .list_services(TenantScope::Tenant(parent.tenant_id), filter, page_req(Some(1), None))
         .await?;
     let found = page.items.first().ok_or_else(ApiError::not_found)?;
-    load_service(s, a, &found.id.to_string()).await
+    let branch = load_service(s, a, &found.id.to_string()).await?;
+    let is_ours = |c: &rt_types::ScratchConfig| c.kind == rt_types::ScratchKind::Branch && c.of == parent.id;
+    if !branch.config.scratch.as_ref().is_some_and(is_ours) {
+        return Err(ApiError::new(
+            "not_a_branch",
+            "this service is not a branch of that service",
+        ));
+    }
+    Ok(branch)
 }
 
 /// Which service and version a switch takes. Refusals follow §5 step 1; another service is held to
@@ -2463,6 +2500,12 @@ async fn services_switch(
         check_version_socket_handler(&s, &source, version.number).await?;
     }
     let mut warnings = switch_warnings(&s, &svc, &source).await?;
+    if s.node.schedule_running(svc.id) {
+        warnings.push(SwitchWarning {
+            code: "schedule_tick_skipped".to_string(),
+            names: Vec::new(),
+        });
+    }
     let origin = (source.id != svc.id).then_some(VersionOrigin {
         service: source.id,
         version: version.number,
@@ -2503,6 +2546,11 @@ async fn services_switch(
         return Ok(json_resp(StatusCode::OK, &view));
     }
 
+    // Same bytes, same cache key: the source's artifact is what the first request will want.
+    s.node.notify(ControlEvent::PreloadArtifact {
+        digest: version.source_digest,
+        runtime: svc.runtime,
+    });
     let req = match origin {
         Some(o) => PromoteReq::adopt(o),
         None => PromoteReq::new(version.number).kind(SwitchKind::Switch),
@@ -3557,6 +3605,7 @@ pub fn api_doc() -> utoipa::openapi::OpenApi {
     let mut doc = ApiDoc::openapi();
     doc.merge(crate::topics::Doc::openapi());
     doc.merge(crate::consumers::Doc::openapi());
+    doc.merge(crate::branches::Doc::openapi());
     doc.merge(crate::invocations::Doc::openapi());
     // the event modules' operations get the common errors too: the modifier on `ApiDoc` ran before the merge
     utoipa::Modify::modify(&CommonErrors, &mut doc);
@@ -3726,6 +3775,7 @@ pub fn control_router(state: ApiState) -> Router {
         // event modules (feature stubs until their owners fill them in)
         .merge(crate::topics::routes())
         .merge(crate::consumers::routes())
+        .merge(crate::branches::routes())
         .merge(crate::invocations::routes())
         .route("/v1/openapi.json", get(openapi_json))
         .fallback(not_found_fallback)
@@ -3863,7 +3913,7 @@ mod tests {
             .iter()
             .filter_map(|p| p["name"].as_str())
             .collect();
-        assert_eq!(names, ["limit", "cursor", "slug", "project", "environment"]);
+        assert_eq!(names, ["limit", "cursor", "slug", "project", "environment", "include"]);
     }
 
     #[test]

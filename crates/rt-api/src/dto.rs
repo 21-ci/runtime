@@ -30,6 +30,8 @@ pub struct ServicesQuery {
     pub project: Option<String>,
     /// Only services in this environment.
     pub environment: Option<String>,
+    /// `scratch`: list branches too. They are left out otherwise, unless `slug` names one.
+    pub include: Option<String>,
 }
 
 // ---- node ------------------------------------------------------------------------------------
@@ -543,6 +545,11 @@ pub struct ServiceView {
     #[serde(rename = "async", skip_serializing_if = "serde_json::Value::is_null")]
     #[schema(value_type = Object)]
     pub async_invoke: serde_json::Value,
+    /// `{"of": "svc_…", "kind": "branch", "name": …, "expires_at": …, "copied_data": …}` of a branch;
+    /// omitted otherwise.
+    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
+    #[schema(value_type = Object)]
+    pub scratch: serde_json::Value,
     pub status: ServiceStatus,
     /// Each value with its source: `{"cpu_ms": {"value": 1000, "source": "profile:balanced"}}`.
     #[schema(value_type = Object)]

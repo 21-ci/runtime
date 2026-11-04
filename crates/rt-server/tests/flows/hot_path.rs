@@ -54,6 +54,31 @@ impl CountingMeta {
 
 #[async_trait]
 impl MetaStore for CountingMeta {
+    async fn expired_scratch(&self, now: rt_types::UnixMs, limit: u32) -> Result<Vec<rt_types::Service>> {
+        self.hit("expired_scratch");
+        self.inner.expired_scratch(now, limit).await
+    }
+
+    async fn add_project_environment(
+        &self,
+        tenant: rt_types::TenantId,
+        project: &str,
+        environment: &str,
+    ) -> Result<bool> {
+        self.hit("add_project_environment");
+        self.inner.add_project_environment(tenant, project, environment).await
+    }
+
+    async fn drop_project_environment(
+        &self,
+        tenant: rt_types::TenantId,
+        project: &str,
+        environment: &str,
+    ) -> Result<()> {
+        self.hit("drop_project_environment");
+        self.inner.drop_project_environment(tenant, project, environment).await
+    }
+
     async fn adopt_version(&self, parent: ServiceId, source: ServiceId, source_version: VersionNo) -> Result<Version> {
         self.hit("adopt_version");
         self.inner.adopt_version(parent, source, source_version).await

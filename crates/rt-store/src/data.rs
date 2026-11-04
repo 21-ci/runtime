@@ -170,6 +170,10 @@ pub trait SqlBackend: Send + Sync {
     async fn export(&self) -> Result<Bytes>;
     /// Current database size in bytes (storage quota accounting).
     async fn size_bytes(&self) -> Result<u64>;
+    /// A consistent copy of this service's data for the new service `to`, which has no data yet:
+    /// the database (the `export` snapshot, on disk) and its blobs. Timers are left behind, since
+    /// they belong to the running service. Returns the bytes copied.
+    async fn copy_into(&self, to: ServiceId) -> Result<u64>;
 }
 
 // ---- Blob ------------------------------------------------------------------------------------
@@ -2620,6 +2624,63 @@ impl SqlBackend for SqlHandle {
                 })();
                 let _ = std::fs::remove_file(&tmp);
                 Ok(Bytes::from(res?))
+            })
+            .await
+    }
+
+    async fn copy_into(&self, to: ServiceId) -> Result<u64> {
+        self.shared.unpurge(self.svc);
+        let root = self.shared.opts.root.clone();
+        let from = self.svc;
+        self.shared
+            .with(self.svc, move |conn| {
+                let dir = service_dir(&root, to);
+                private_dirs(&dir)?;
+                let tmp = dir.join(format!("copy-{}.tmp", unique_name()));
+                let res = (|| -> Result<u64> {
+                    conn.c
+                        .execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()])
+                        .map_err(map_internal_err)?;
+                    let copy = Connection::open(&tmp)?;
+                    copy.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get::<_, String>(0))?;
+                    let has_alarms: i64 = copy.query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE name = '_rt_durable_alarm'",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if has_alarms > 0 {
+                        copy.execute("DELETE FROM _rt_durable_alarm", [])?;
+                    }
+                    // The writer of the source is ours for this whole job, so no blob row goes away
+                    // under the walk; a file already missing loses its row, as a read would.
+                    let rows = copy
+                        .prepare("SELECT key, file FROM _rt_blobs")?
+                        .query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let (src, dst) = (
+                        blob_dir(&root, from).join("objects"),
+                        blob_dir(&root, to).join("objects"),
+                    );
+                    let mut bytes = 0;
+                    if !rows.is_empty() {
+                        private_dirs(&dst)?;
+                    }
+                    for (key, file) in rows {
+                        match std::fs::copy(src.join(&file), dst.join(&file)) {
+                            Ok(n) => bytes += n,
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                copy.execute("DELETE FROM _rt_blobs WHERE key = ?1", [key])?;
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    drop(copy);
+                    bytes += std::fs::metadata(&tmp)?.len();
+                    std::fs::rename(&tmp, dir.join("data.db"))?;
+                    Ok(bytes)
+                })();
+                let _ = std::fs::remove_file(&tmp);
+                res
             })
             .await
     }

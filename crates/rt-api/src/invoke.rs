@@ -852,6 +852,16 @@ async fn invoke(State(s): State<ApiState>, Extension(listener): Extension<Listen
         );
     }
     let mut resp = outcome_response(outcome, task, entry.version);
+    if s.service_table
+        .load()
+        .get(&entry.service)
+        .is_some_and(|svc| svc.config.scratch.is_some())
+    {
+        resp.headers_mut().insert(
+            HeaderName::from_static("x-robots-tag"),
+            HeaderValue::from_static("noindex"),
+        );
+    }
     if capacity {
         if let Ok(v) = HeaderValue::from_str(&retry_after_secs(s.scheduler.retry_after_hint()).max(1).to_string()) {
             resp.headers_mut().insert(header::RETRY_AFTER, v);

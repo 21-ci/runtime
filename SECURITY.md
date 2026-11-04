@@ -896,7 +896,7 @@ target `rt::audit`.
 
 | Area | Events |
 |---|---|
-| Tenants, services | `tenant.created/updated/deleted`, `service.created/updated/deleted`, `service.environment_changed` |
+| Tenants, services | `tenant.created/updated/deleted`, `service.created/updated/deleted`, `service.environment_changed`, `scratch.created/deleted`, `scratch.copied_data` (source and bytes, never data) |
 | Versions | `deploy`, `rebuild`, `rollback`, `live.changed` |
 | Config | `env.written` (names only), `secret.written`, `secret.deleted` |
 | Hosts | `host.attached/detached/verified/expired` |

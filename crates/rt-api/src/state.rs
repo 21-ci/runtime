@@ -61,6 +61,11 @@ pub enum ControlEvent {
     AsyncAccepted(ServiceId),
     /// A consumer cursor of the service was reset: drop the stream engine's cached positions.
     ConsumersReset(ServiceId),
+    /// A version is about to go live: bring its prepared artifact into memory ahead of traffic.
+    PreloadArtifact {
+        digest: Digest,
+        runtime: RuntimeKind,
+    },
 }
 
 /// Facts and actions only the server knows (cache, V8 build, readiness, live config apply).
@@ -91,6 +96,12 @@ pub trait NodeInfo: Send + Sync {
     /// Build the `TaskSpec` of an HTTP invocation (config resolution: limits, knobs, plan).
     /// `None` when the service cannot be run (e.g. unknown plan).
     fn http_task(&self, entry: &RouteEntry, req: HttpRequest, trace: Option<TraceCtx>) -> Option<TaskSpec>;
+
+    /// A run of one of the service's schedules has not finished.
+    fn schedule_running(&self, service: ServiceId) -> bool {
+        let _ = service;
+        false
+    }
 
     /// Cache tier (`T1`/`T2`/`T3`) of the live artifact of `entry`.
     fn tier(&self, entry: &RouteEntry) -> &'static str {

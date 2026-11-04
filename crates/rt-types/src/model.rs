@@ -533,6 +533,56 @@ pub struct ServiceConfig {
     /// Async invocation (`Prefer: respond-async`). Omitted from JSON while unset.
     #[serde(rename = "async", skip_serializing_if = "AsyncInvokeConfig::is_unset")]
     pub async_invoke: AsyncInvokeConfig,
+    /// Set on a branch or preview service, by its route only. Omitted from JSON otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<ScratchConfig>,
+}
+
+impl ServiceConfig {
+    /// What a scratch service may not change: written at create and after every `PATCH`. A service
+    /// that is not scratch is left alone.
+    pub fn enforce_scratch_policy(&mut self) {
+        let Some(scratch) = &self.scratch else { return };
+        self.scaling.min_instances = Some(0);
+        if !scratch.schedules {
+            self.triggers.interval = false;
+            self.triggers.cron = false;
+        }
+        // `internal` has no public route at all, so it stays: only a public door is closed.
+        if scratch.copied_data && self.access == Access::Public {
+            self.access = Access::Key;
+        }
+    }
+}
+
+/// What kind of short-lived copy of a service this is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScratchKind {
+    Branch,
+    Preview,
+}
+
+/// Identity of a scratch service (`services.config.scratch`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScratchConfig {
+    /// The service this one is a scratch copy of.
+    pub of: ServiceId,
+    pub kind: ScratchKind,
+    pub name: String,
+    /// The sweep deletes it, with its data, after this time. `None`: until deleted.
+    #[serde(default)]
+    pub expires_at: Option<UnixMs>,
+    /// It holds a copy of the parent's data.
+    #[serde(default)]
+    pub copied_data: bool,
+    /// Its timed triggers may run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub schedules: bool,
+    /// Its environment label was made for it, and goes with it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own_environment: bool,
 }
 
 /// Per-service WebSocket knobs (`config.ws`, docs/handlers.md "WebSockets").
