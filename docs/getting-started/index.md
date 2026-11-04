@@ -67,8 +67,8 @@ The [concepts overview](../concepts/index.md) has the full glossary.
 | `curl` and `jq` | The examples on these pages and the `sample/scripts/*.sh` helpers |
 | Rust 1.95 with the `wasm32-wasip2` target | Building `21ci` and the node from source, and WASM services in Rust |
 
-There are no published binaries or images yet: you build from the repository. A tenant who only deploys to someone else's
-node needs just a key and the two URLs, plus `21ci` or `curl`; start at [Get access](../guides/access.md).
+Releases publish the binaries, the `ghcr.io/21-ci/rt` image and the packages (see the [README quickstart](https://github.com/21-ci/runtime#quickstart)).
+Building from the repository is the development path. A tenant who only deploys to someone else's node needs just a key and the two URLs, plus `21ci` or `curl`; start at [Get access](../guides/access.md).
 
 ## See also
 

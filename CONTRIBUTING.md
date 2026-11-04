@@ -138,7 +138,7 @@ repository, so do not link to them. Agent skills for service authors live in [sk
 ## Coding agents
 
 Claude Code skills for contributors live in `.claude/skills/` (security review, performance, adding a guest API,
-control API changes, testing, config changes); [AGENTS.md](AGENTS.md) is the entry point for any coding agent. Agent-written
+control API changes, storage schema, testing, config changes); [AGENTS.md](AGENTS.md) is the entry point for any coding agent. Agent-written
 changes follow the same rules as everyone else's: tests that cover the logic, docs, DCO sign-off by the human who submits them.
 
 ## License

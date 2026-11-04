@@ -6,7 +6,7 @@ Docs site: https://21-ci.github.io/runtime/ . Source: https://github.com/21-ci/r
 
 ## Docs
 
-- [README](https://github.com/21-ci/runtime/blob/main/README.md): features, listeners, quickstart (docker compose), CLI, configuration, development, layout
+- [README](https://github.com/21-ci/runtime/blob/main/README.md): features, listeners, quickstart (Homebrew, Docker, install script, apt), CLI, configuration, development, layout
 - [Guest code reference](https://github.com/21-ci/runtime/blob/main/docs/handlers.md): handler forms, `ctx`, triggers, request rules, `std:*` modules, WebSockets, durable objects, WASM contract, limits, invoke outcomes
 - [Events, topics and async invocations](https://github.com/21-ci/runtime/blob/main/docs/guides/events-and-streams.md): pub/sub subjects, durable topics and consumer groups, async HTTP invocations, which one to use
 - [Control API](https://github.com/21-ci/runtime/blob/main/docs/api.md): auth and scopes, routes, service config blocks, error codes, invoke API, plans

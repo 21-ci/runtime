@@ -559,9 +559,9 @@ network, or ask your operator what route exists.
 
 === "21ci"
 
-    The `21ci` binary must be on the runner. There are no published binaries yet; build it from the runtime
-    repository (`make cli-install`, see [Install](../getting-started/install.md#install-the-cli)) or ask your operator for
-    one.
+    The `21ci` binary must be on the runner. Install a published release (Homebrew, apt, or the install script, see the
+    [README quickstart](https://github.com/21-ci/runtime#quickstart)), build it from the runtime repository
+    (`make cli-install`, see [Install](../getting-started/install.md#install-the-cli)), or ask your operator for one.
 
     ```yaml title=".github/workflows/deploy.yml"
     jobs:

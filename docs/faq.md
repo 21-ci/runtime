@@ -37,7 +37,7 @@ setup works too: create one tenant for yourself. Start with [Get started](gettin
 ### Is it ready for production?
 
 The core path is implemented and tested: both executors, all triggers, storage, the scheduler, the control API and
-the CLI. The current version is 0.1.0 and there is no tagged release yet. Some hardening from the design is not in
+the CLI. The current version is 0.1.1, the first public release (tag `v0.1.1`). Some hardening from the design is not in
 this release: the V8 sandbox, the supervisor/executor process split and a seccomp filter. The node is also a single
 machine with no clustering or failover.
 
