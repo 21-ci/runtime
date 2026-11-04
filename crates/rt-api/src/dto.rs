@@ -389,9 +389,23 @@ pub struct LimitChangeView {
     pub ago_ms: u64,
 }
 
+/// A flip committed, but one of its follow-ups did not finish.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct SwitchWarning {
+    /// `routes_refresh_delayed`: the new version is committed and reaches traffic once the node
+    /// re-reads its routes, which it keeps trying.
+    pub code: String,
+}
+
 /// `GET /v1/services/{s}`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ServiceView {
+    /// The switch this flip wrote (`PUT /v1/services/{s}/live` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_id: Option<String>,
+    /// What the flip could not finish; empty and absent normally.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SwitchWarning>,
     pub id: String,
     pub tenant_id: String,
     pub slug: String,
@@ -488,6 +502,9 @@ pub struct TypesQuery {
 /// `GET …/versions/{v}` (plus `lock_digest`, `failure`, `created_at`).
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct VersionView {
+    /// What activating this version could not finish; empty and absent normally.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SwitchWarning>,
     pub version: u32,
     pub source_digest: String,
     pub lock_digest: Option<String>,

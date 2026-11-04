@@ -27,6 +27,7 @@ pub mod invoke;
 pub mod limits;
 pub mod mcp;
 pub mod projects;
+pub mod promote;
 pub mod sdks;
 pub mod serve;
 pub mod sockets;

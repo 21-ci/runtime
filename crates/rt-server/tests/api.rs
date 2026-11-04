@@ -30,6 +30,8 @@ mod mcp;
 mod openapi;
 #[path = "api/projects.rs"]
 mod projects;
+#[path = "api/promote.rs"]
+mod promote;
 #[path = "api/sdk.rs"]
 mod sdk;
 #[path = "api/tenancy.rs"]

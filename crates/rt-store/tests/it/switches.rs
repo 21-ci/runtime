@@ -667,3 +667,133 @@ async fn a_populated_v1_database_upgrades_in_place() {
     assert_eq!(adopted.number, VersionNo(2));
     m.create_switch(parent.id, promote(2)).await.expect("switch");
 }
+
+// ---- the flip -----------------------------------------------------------------------------------
+
+/// §5 step 5: the live version and the row change together; the row records what was live.
+#[tokio::test]
+async fn flip_sets_live_and_moves_the_row_to_draining_with_from_and_deadline() {
+    let (m, _t, s, _b) = family().await;
+    mk_versions(&m, s.id, 50, 2).await;
+    m.set_live(s.id, VersionNo(1), None).await.expect("live");
+    let row = m.create_switch(s.id, promote(2)).await.expect("create");
+
+    let (svc, flipped) = m.flip_switch(s.id, row.id, None, 5_000).await.expect("flip");
+
+    assert_eq!(svc.live_version, Some(VersionNo(2)));
+    assert_eq!(flipped.state, SwitchState::Draining);
+    assert_eq!(flipped.from_version, Some(VersionNo(1)));
+    assert_eq!(flipped.drain_deadline_ms, Some(5_000));
+    assert_eq!(m.get_switch(s.id, row.id).await.expect("get"), Some(flipped));
+    let got = m
+        .get_service(TenantScope::Operator, s.id)
+        .await
+        .expect("get")
+        .expect("svc");
+    assert_eq!(got.live_version, Some(VersionNo(2)));
+    assert_eq!(got.etag, svc.etag);
+}
+
+/// Nothing was running on another version, so there is nothing to drain.
+#[tokio::test]
+async fn flip_with_nothing_to_drain_completes_at_once() {
+    let (m, _t, s, _b) = family().await;
+    mk_versions(&m, s.id, 50, 1).await;
+    let first = m.create_switch(s.id, promote(1)).await.expect("create");
+    let (_, row) = m.flip_switch(s.id, first.id, None, 5_000).await.expect("first flip");
+    assert_eq!((row.state, row.from_version), (SwitchState::Completed, None));
+
+    let same = m.create_switch(s.id, promote(1)).await.expect("create");
+    let (_, row) = m.flip_switch(s.id, same.id, None, 5_000).await.expect("same version");
+    assert_eq!(row.state, SwitchState::Completed);
+    assert_eq!(row.from_version, Some(VersionNo(1)));
+}
+
+/// A refused flip changes neither the live version nor the row: both are one transaction.
+#[tokio::test]
+async fn a_refused_flip_changes_nothing() {
+    let (m, _t, s, _b) = family().await;
+    mk_versions(&m, s.id, 50, 2).await;
+    m.set_live(s.id, VersionNo(1), None).await.expect("live");
+    let row = m.create_switch(s.id, promote(2)).await.expect("create");
+
+    let stale = rt_types::Etag(s.etag.0 + 1000);
+    assert!(matches!(
+        m.flip_switch(s.id, row.id, Some(stale), 5_000).await,
+        Err(StoreError::PreconditionFailed)
+    ));
+    m.set_build_state(
+        s.id,
+        VersionNo(2),
+        BuildState::Failed,
+        Some(BuildFailure::new(BuildFailReason::Internal, "x")),
+        None,
+    )
+    .await
+    .expect("failed");
+    assert!(matches!(
+        m.flip_switch(s.id, row.id, None, 5_000).await,
+        Err(StoreError::Conflict("version_not_ready"))
+    ));
+
+    let got = m
+        .get_service(TenantScope::Operator, s.id)
+        .await
+        .expect("get")
+        .expect("svc");
+    assert_eq!(got.live_version, Some(VersionNo(1)));
+    let unchanged = m.get_switch(s.id, row.id).await.expect("get").expect("row");
+    assert_eq!(
+        (unchanged.state, unchanged.from_version),
+        (SwitchState::Preparing, None)
+    );
+}
+
+/// A store failure at the commit point leaves the previous version live.
+#[tokio::test]
+async fn a_flip_the_store_fails_leaves_the_previous_version_live() {
+    let (m, _t, s, _b) = family().await;
+    mk_versions(&m, s.id, 50, 2).await;
+    m.set_live(s.id, VersionNo(1), None).await.expect("live");
+    let row = m.create_switch(s.id, promote(2)).await.expect("create");
+    let faults = Faults::new();
+    m.inject_faults(faults.clone());
+    faults.fail_next(1, Fault::Io);
+    assert!(m.flip_switch(s.id, row.id, None, 5_000).await.is_err());
+    let got = m
+        .get_service(TenantScope::Operator, s.id)
+        .await
+        .expect("get")
+        .expect("svc");
+    assert_eq!(got.live_version, Some(VersionNo(1)));
+    assert_eq!(
+        m.get_switch(s.id, row.id).await.expect("get").expect("row").state,
+        SwitchState::Preparing
+    );
+}
+
+/// A row that already flipped, failed, or is another service's cannot flip.
+#[tokio::test]
+async fn only_an_open_row_of_the_service_can_flip() {
+    let (m, _t, s, b) = family().await;
+    mk_versions(&m, s.id, 50, 2).await;
+    mk_versions(&m, b.id, 60, 1).await;
+    let row = m.create_switch(s.id, promote(1)).await.expect("create");
+    assert!(matches!(
+        m.flip_switch(b.id, row.id, None, 5_000).await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        m.flip_switch(s.id, SwitchId::new(), None, 5_000).await,
+        Err(StoreError::NotFound)
+    ));
+    m.flip_switch(s.id, row.id, None, 5_000).await.expect("flip");
+    assert!(matches!(
+        m.flip_switch(s.id, row.id, None, 5_000).await,
+        Err(StoreError::Conflict("switch_not_open"))
+    ));
+    assert!(matches!(
+        m.flip_switch(ServiceId::from_u128(77), row.id, None, 5_000).await,
+        Err(StoreError::NotFound)
+    ));
+}

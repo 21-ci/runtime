@@ -76,6 +76,8 @@ use crate::build_exec::{BuildDeps, BuildExecutor, BuildSink};
 use crate::control_plane::{InProcControlPlane, MeteredQuotas};
 use crate::policy::PlanPolicy;
 use crate::specs::{KeyCache, Specs, SystemWall, TenantPlans};
+use rt_api::control::ApiRouteRefresh;
+use rt_api::promote::{Promoter, PromoterDeps, RouteRefresh};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -179,6 +181,10 @@ pub struct StartOptions {
     pub meta_layer: Option<MetaLayer>,
     /// Failure plans attached to the opened stores (tests make store operations fail on demand).
     pub faults: StartFaults,
+    /// The clock of drain deadlines (tests step it); the node's clock by default.
+    pub promote_clock: Option<Arc<dyn Clock>>,
+    /// Wraps the route refresh of `promote()` (tests make it fail on demand).
+    pub route_refresh_layer: Option<RouteRefreshLayer>,
 }
 
 /// See [`StartOptions::faults`]: a plan per store; production never sets one.
@@ -191,6 +197,9 @@ pub struct StartFaults {
 
 /// See [`StartOptions::meta_layer`].
 pub type MetaLayer = Box<dyn FnOnce(Arc<dyn MetaStore>) -> Arc<dyn MetaStore> + Send>;
+
+/// See [`StartOptions::route_refresh_layer`].
+pub type RouteRefreshLayer = Box<dyn FnOnce(Arc<dyn RouteRefresh>) -> Arc<dyn RouteRefresh> + Send>;
 
 /// Where the node listens (actual addresses after binding `:0`).
 #[derive(Clone, Debug)]
@@ -1331,6 +1340,12 @@ pub async fn start_with(
         None => meta,
     };
 
+    // A crash leaves switches open; their tasks died with the process.
+    let closed = meta.recover_switches().await.map_err(startup("recover switches"))?;
+    if closed > 0 {
+        tracing::info!(closed, "closed switches interrupted by the last stop");
+    }
+
     // 4. security services and tables. The system tenant owns the operator SDK services.
     meta.ensure_tenant(
         rt_types::system_tenant(),
@@ -1839,7 +1854,32 @@ pub async fn start_with(
     });
 
     // 10. API state and routers
+    let buckets = Arc::new(IngressBuckets::default());
+    let ingress = Arc::new(IngressCache::default());
+    let refresher: Arc<dyn RouteRefresh> = Arc::new(ApiRouteRefresh {
+        meta: meta.clone(),
+        routes: routes.clone(),
+        buckets: buckets.clone(),
+        ingress: ingress.clone(),
+        service_table: service_table.clone(),
+        node: node.clone(),
+    });
+    let refresher = match opts.route_refresh_layer {
+        Some(layer) => layer(refresher),
+        None => refresher,
+    };
+    let promoter = Promoter::new(PromoterDeps {
+        meta: meta.clone(),
+        scheduler: scheduler.clone(),
+        config: config.clone(),
+        plans: plans.clone(),
+        clock: opts.promote_clock.unwrap_or_else(|| clock.clone()),
+        events: control.event_sender(),
+        refresher,
+    });
+    control.set_promoter(&promoter);
     let state = ApiState {
+        promoter,
         config: config.clone(),
         meta: meta.clone(),
         artifacts: artifacts.clone(),
@@ -1865,10 +1905,10 @@ pub async fn start_with(
         node: node.clone(),
         idem: Arc::new(IdemStore::default()),
         sse: Arc::new(SseLimiter::default()),
-        buckets: Arc::new(IngressBuckets::default()),
+        buckets,
         service_table: service_table.clone(),
         tenant_table: tenant_table.clone(),
-        ingress: Arc::new(IngressCache::default()),
+        ingress,
         sockets: sockets.clone(),
         uploads: Arc::new(tokio::sync::Semaphore::new(rt_api::MAX_CONCURRENT_UPLOADS)),
     };

@@ -19,8 +19,8 @@ pub mod wiring;
 pub use cli::{Cli, Command, Role, SecretsCommand};
 pub use control_plane::InProcControlPlane;
 pub use wiring::{
-    start, start_with, MetaLayer, NodeSignal, NodeSignals, RunningServer, ServerAddrs, ServerError, StartFaults,
-    StartOptions,
+    start, start_with, MetaLayer, NodeSignal, NodeSignals, RouteRefreshLayer, RunningServer, ServerAddrs, ServerError,
+    StartFaults, StartOptions,
 };
 
 /// Engine versions this binary was built with (reported by `GET /v1/node/status`).

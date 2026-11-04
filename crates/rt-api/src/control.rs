@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -25,7 +26,8 @@ use axum::{Json, Router};
 use futures_util::stream::{self, Stream, StreamExt};
 use rt_obs::{LogCursor, LogKind, LogLevel, LogQuery, LogRecord, Window};
 use rt_sec::{secret_aad, AuditEvent, Principal, QuotaOp};
-use rt_store::{PageReq, ServiceFilter, StoreError, TenantPatch, TenantScope, WarmFloorCap};
+use rt_store::{MetaStore, PageReq, ServiceFilter, StoreError, TenantPatch, TenantScope, WarmFloorCap};
+use rt_triggers::RouteTable;
 use rt_types::{
     Access, BuildState, CallAccess, CompileMode, DegradationMode, DenoServiceConfig, Digest, EgressRules, Etag,
     HostMapping, HostStatus, IngressRules, LimitsConfig, NewSchedule, NewService, NewTenant, NewVersion, Plan, Profile,
@@ -48,7 +50,11 @@ use crate::projects::{
     check_environment_in_project, environments_get, find_project, project_slug_of, projects_create, projects_delete,
     projects_get, projects_list, projects_patch,
 };
-use crate::state::{ApiState, ControlEvent, IdemEntry, NodeConfigUpdate, SseSlot, IDEMPOTENCY_TTL};
+use crate::promote::PromoteReq;
+use crate::state::{
+    ApiState, ControlEvent, IdemEntry, IngressBuckets, IngressCache, NodeConfigUpdate, NodeInfo, SseSlot,
+    IDEMPOTENCY_TTL,
+};
 use crate::tokens::{issue_key, revoke_key, tokens_create, tokens_delete, tokens_list};
 
 type R<T> = Result<Json<T>, ApiError>;
@@ -345,33 +351,64 @@ fn check_limits(plan: &Plan, l: &LimitsConfig) -> Result<(), ApiError> {
 /// Re-read the route snapshot and the service table after a control change. Called by every
 /// mutating handler before it answers, so a request right after the response sees the change.
 pub async fn refresh_routes(s: &ApiState) -> Result<(), ApiError> {
-    let snap = s.meta.route_snapshot().await?;
-    s.routes.swap(&snap);
-    let mut table = std::collections::HashMap::new();
-    let mut cursor = None;
-    loop {
-        let page = s
-            .meta
-            .list_services(
-                TenantScope::Operator,
-                ServiceFilter::default(),
-                PageReq { limit: 200, cursor },
-            )
-            .await?;
-        for svc in page.items {
-            table.insert(svc.id, Arc::new(svc));
-        }
-        match page.next_cursor {
-            Some(c) => cursor = Some(c),
-            None => break,
-        }
-    }
-    // Per-service ingress state of deleted services goes with them.
-    s.buckets.retain_services(|id| table.contains_key(id));
-    s.ingress.retain_services(|id| table.contains_key(id));
-    s.service_table.store(Arc::new(table));
-    s.node.notify(ControlEvent::RoutesRefreshed);
+    s.promoter.refresh().await?;
+    let table = s.service_table.load();
+    s.promoter.retain_services(|id| table.contains_key(id));
     Ok(())
+}
+
+/// Who a switch row names: the key id, or `operator`. Never a secret.
+fn switch_actor(a: &Auth) -> String {
+    match a.actor() {
+        rt_sec::Actor::Key { key_id, .. } => key_id,
+        rt_sec::Actor::Operator => "operator".to_string(),
+        _ => "system".to_string(), // LCOV_EXCL_LINE: control routes authenticate as a key or the operator
+    }
+}
+
+/// What [`refresh_routes`] reads and replaces. Built without the rest of [`ApiState`], so that the
+/// [`crate::promote::Promoter`] inside the state can hold it.
+pub struct ApiRouteRefresh {
+    pub meta: Arc<dyn MetaStore>,
+    pub routes: Arc<RouteTable>,
+    pub buckets: Arc<IngressBuckets>,
+    pub ingress: Arc<IngressCache>,
+    pub service_table: Arc<ArcSwap<std::collections::HashMap<ServiceId, Arc<Service>>>>,
+    pub node: Arc<dyn NodeInfo>,
+}
+
+#[async_trait::async_trait]
+impl crate::promote::RouteRefresh for ApiRouteRefresh {
+    async fn refresh(&self) -> Result<(), ApiError> {
+        let s = self;
+        let snap = s.meta.route_snapshot().await?;
+        s.routes.swap(&snap);
+        let mut table = std::collections::HashMap::new();
+        let mut cursor = None;
+        loop {
+            let page = s
+                .meta
+                .list_services(
+                    TenantScope::Operator,
+                    ServiceFilter::default(),
+                    PageReq { limit: 200, cursor },
+                )
+                .await?;
+            for svc in page.items {
+                table.insert(svc.id, Arc::new(svc));
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        // Per-service ingress state of deleted services goes with them.
+        s.buckets.retain_services(|id| table.contains_key(id));
+        s.ingress.retain_services(|id| table.contains_key(id));
+        s.service_table.store(Arc::new(table));
+        s.node.notify(ControlEvent::RoutesRefreshed);
+        Ok(())
+    }
 }
 
 pub(crate) fn audit(
@@ -580,6 +617,7 @@ fn build_state_str(b: BuildState) -> String {
 
 fn version_view(v: &Version) -> VersionView {
     VersionView {
+        warnings: Vec::new(),
         version: v.number.0,
         source_digest: v.source_digest.to_string(),
         lock_digest: v.lock_digest.map(|d| d.to_string()),
@@ -618,10 +656,15 @@ fn schedule_view(sch: &Schedule, now_ms: i64) -> ScheduleView {
 }
 
 async fn service_view(s: &ApiState, svc: &Service) -> Result<ServiceView, ApiError> {
+    let versions = s.meta.list_versions(svc.id).await?;
+    Ok(service_view_of(s, svc, &versions))
+}
+
+/// No store access: it also answers after a flip committed, when an error would be a lie.
+fn service_view_of(s: &ApiState, svc: &Service, versions: &[Version]) -> ServiceView {
     let plan = s.plans.plan_for(svc.tenant_id);
     let cfg = s.config.load();
     let eff = cfg.service_effective(svc.profile, &svc.config, &plan);
-    let versions = s.meta.list_versions(svc.id).await?;
     let live = svc.live_version.and_then(|n| versions.iter().find(|v| v.number == n));
     let latest = versions.iter().max_by_key(|v| v.number);
     let shown = live.or(latest);
@@ -634,7 +677,9 @@ async fn service_view(s: &ApiState, svc: &Service) -> Result<ServiceView, ApiErr
     let blk = |v: &dyn erased::Ser| v.to_value();
     let admission = admission_view(s, svc.id);
     let inflight = admission.as_ref().map_or(0, |a| a.running);
-    Ok(ServiceView {
+    ServiceView {
+        switch_id: None,
+        warnings: Vec::new(),
         id: svc.id.to_string(),
         tenant_id: svc.tenant_id.to_string(),
         slug: svc.slug.clone(),
@@ -690,7 +735,7 @@ async fn service_view(s: &ApiState, svc: &Service) -> Result<ServiceView, ApiErr
             admission,
         },
         effective: serde_json::to_value(&eff).unwrap_or_else(|_| json!({})),
-    })
+    }
 }
 
 /// Milliseconds with microsecond precision.
@@ -1851,9 +1896,13 @@ async fn versions_upload(
     }
     let activate = truthy(q.activate.as_deref());
     let close_sockets = activate && truthy(q.close_sockets.as_deref());
+    let mut warnings = Vec::new();
     if activate {
-        s.meta.set_live(svc.id, version.number, None).await?;
-        refresh_routes(&s).await?;
+        warnings = s
+            .promoter
+            .promote(&svc, PromoteReq::new(version.number).by(switch_actor(&a)))
+            .await?
+            .warnings;
     }
     // Sockets survive a deploy (the next event runs the new version) unless asked otherwise.
     let closed = if close_sockets {
@@ -1869,12 +1918,14 @@ async fn versions_upload(
         Some(svc.id),
         json!({"version": version.number.0, "digest": digest.to_string(), "activated": activate, "sockets_closed": closed}),
     );
-    let status = if eager {
+    let status = if eager || !warnings.is_empty() {
         StatusCode::ACCEPTED
     } else {
         StatusCode::CREATED
     };
-    let view = serde_json::to_value(version_view(&version)).unwrap_or(Value::Null);
+    let mut view = version_view(&version);
+    view.warnings = warnings;
+    let view = serde_json::to_value(view).unwrap_or(Value::Null);
     idem_store(&s, &a, &h, fp, status, &view);
     Ok(value_resp(status, &view))
 }
@@ -2150,7 +2201,9 @@ async fn versions_build_logs(
 /// `409 version_not_ready` for a failed version; `pending` is accepted (API-10).
 #[utoipa::path(put, path = "/v1/services/{s}/live", tag = "services", request_body = SetLiveBody,
     params(("s" = String, Path, description = "service id")),
-    responses((status = 200, body = ServiceView), (status = 409, body = ErrorEnvelope), (status = 412, body = ErrorEnvelope)))]
+    responses((status = 200, body = ServiceView),
+        (status = 202, description = "the flip committed, the route refresh is delayed: see `warnings`", body = ServiceView),
+        (status = 409, body = ErrorEnvelope), (status = 412, body = ErrorEnvelope)))]
 async fn services_set_live(
     State(s): State<ApiState>,
     a: Auth,
@@ -2164,8 +2217,15 @@ async fn services_set_live(
     if svc.config.durable && svc.runtime == RuntimeKind::Wasm {
         check_version_socket_handler(&s, &svc, target).await?;
     }
-    let updated = s.meta.set_live(svc.id, target, if_match(&h)?).await?;
-    refresh_routes(&s).await?;
+    // Read before the flip: from its commit on, this handler has no way left to fail.
+    let versions = s.meta.list_versions(svc.id).await?;
+    let done = s
+        .promoter
+        .promote(
+            &svc,
+            PromoteReq::new(target).if_match(if_match(&h)?).by(switch_actor(&a)),
+        )
+        .await?;
     let closed = if b.close_sockets {
         s.sockets.close_service(svc.id, None, None, 1012, "service restart")
     } else {
@@ -2180,7 +2240,15 @@ async fn services_set_live(
         Some(svc.id),
         json!({"from": svc.live_version.map(|v| v.0), "to": target.0, "sockets_closed": closed}),
     );
-    Ok(json_resp(StatusCode::OK, &service_view(&s, &updated).await?))
+    let mut view = service_view_of(&s, &done.service, &versions);
+    view.switch_id = Some(done.switch.id.to_string());
+    let status = if done.warnings.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    view.warnings = done.warnings;
+    Ok(json_resp(status, &view))
 }
 
 // ---- env, secrets, hosts ---------------------------------------------------------------------

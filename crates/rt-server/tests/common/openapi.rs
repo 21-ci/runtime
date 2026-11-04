@@ -81,6 +81,7 @@ pub const ERROR_CODES: &[(&str, u16)] = &[
     ("slug_taken", 409),
     ("host_taken", 409),
     ("version_not_ready", 409),
+    ("switch_in_progress", 409),
     ("project_slug_taken", 409),
     ("project_not_empty", 409),
     ("environment_in_use", 409),

@@ -19,9 +19,8 @@ pub fn status_for_code(code: &str) -> StatusCode {
         | "async_not_allowed" => StatusCode::FORBIDDEN,
         "not_found" => StatusCode::NOT_FOUND,
         "slug_taken" | "host_taken" | "host_cooldown" | "version_not_ready" | "tenant_not_empty"
-        | "project_slug_taken" | "project_not_empty" | "environment_in_use" | "sdk_release_exists" | "topic_exists" => {
-            StatusCode::CONFLICT
-        }
+        | "project_slug_taken" | "project_not_empty" | "environment_in_use" | "sdk_release_exists" | "topic_exists"
+        | "switch_in_progress" | "switch_not_open" => StatusCode::CONFLICT,
         "precondition_failed" => StatusCode::PRECONDITION_FAILED,
         "too_large" | "storage_quota" | "egress_quota" => StatusCode::PAYLOAD_TOO_LARGE,
         // Guest-data errors a control route can meet (data export, KV/SQL inspection): the

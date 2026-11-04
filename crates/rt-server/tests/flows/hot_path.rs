@@ -54,6 +54,52 @@ impl CountingMeta {
 
 #[async_trait]
 impl MetaStore for CountingMeta {
+    async fn adopt_version(&self, parent: ServiceId, source: ServiceId, source_version: VersionNo) -> Result<Version> {
+        self.hit("adopt_version");
+        self.inner.adopt_version(parent, source, source_version).await
+    }
+
+    async fn create_switch(&self, id: ServiceId, s: rt_types::NewSwitch) -> Result<rt_types::Switch> {
+        self.hit("create_switch");
+        self.inner.create_switch(id, s).await
+    }
+
+    async fn flip_switch(
+        &self,
+        id: ServiceId,
+        switch: rt_types::SwitchId,
+        if_match: Option<rt_types::Etag>,
+        drain_deadline_ms: i64,
+    ) -> Result<(Service, rt_types::Switch)> {
+        self.hit("flip_switch");
+        self.inner.flip_switch(id, switch, if_match, drain_deadline_ms).await
+    }
+
+    async fn update_switch(
+        &self,
+        id: ServiceId,
+        switch: rt_types::SwitchId,
+        patch: rt_types::SwitchPatch,
+    ) -> Result<rt_types::Switch> {
+        self.hit("update_switch");
+        self.inner.update_switch(id, switch, patch).await
+    }
+
+    async fn get_switch(&self, id: ServiceId, switch: rt_types::SwitchId) -> Result<Option<rt_types::Switch>> {
+        self.hit("get_switch");
+        self.inner.get_switch(id, switch).await
+    }
+
+    async fn list_switches(&self, id: ServiceId, page: PageReq) -> Result<Page<rt_types::Switch>> {
+        self.hit("list_switches");
+        self.inner.list_switches(id, page).await
+    }
+
+    async fn recover_switches(&self) -> Result<u64> {
+        self.hit("recover_switches");
+        self.inner.recover_switches().await
+    }
+
     async fn schema_version(&self) -> Result<u32> {
         self.hit("schema_version");
         self.inner.schema_version().await

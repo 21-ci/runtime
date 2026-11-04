@@ -119,7 +119,7 @@ A project groups a tenant's services and lists their environments. Every tenant 
 | GET | `/v1/services/{s}` | `services:read` | | service + `ETag` |
 | PATCH | `/v1/services/{s}` | `services:write` | any of `name, profile, environment, limits, scaling, access, triggers, ingress, egress, call, deno, wasm`; `If-Match` | service. Each provided block **replaces** that block |
 | DELETE | `/v1/services/{s}` | `services:write` | `?keep_data=1` | `204` |
-| PUT | `/v1/services/{s}/live` | `deploy` | `{version, close_sockets?}`; `If-Match` | service; `409 version_not_ready` for a `failed` version (`pending` is accepted); rollback = point it at an older version. Open WebSockets stay and their next events run the new version; `close_sockets: true` closes them with 1012 |
+| PUT | `/v1/services/{s}/live` | `deploy` | `{version, close_sockets?}`; `If-Match` | service; `409 version_not_ready` for a `failed` version (`pending` is accepted); rollback = point it at an older version. Open WebSockets stay and their next events run the new version; `close_sockets: true` closes them with 1012. The response has `switch_id`. `202` with `warnings: [{"code": "routes_refresh_delayed"}]`: the flip committed, the node keeps re-reading its routes, do not retry. An upload with `activate` reports the same way. Events `service.switch.started\|flipped\|drained\|drain_timed_out\|failed` follow the drain of the previous version; a drain ending in `drain_timed_out` with `error: drain_unknown` could not be counted (three versions busy at once, or a flip back to the version), so its tasks may still have been running |
 | GET | `/v1/services/{s}/data/export` | `data:admin` | | SQLite snapshot (`application/vnd.sqlite3`) |
 
 ### WebSockets and objects
@@ -270,7 +270,7 @@ Each code is explained in [Error reasons](reference/errors.md#control-api-codes)
 | `unauthorized` | 401 |
 | `insufficient_scope`, `quota_exceeded`, `trigger_not_allowed`, `binding_not_allowed`, `host_not_allowed`, `reserved` (the system tenant) | 403 |
 | `not_found` | 404 |
-| `slug_taken`, `host_taken`, `host_cooldown`, `topic_exists`, `version_not_ready`, `tenant_not_empty`, `project_slug_taken`, `project_not_empty` (also with topics), `environment_in_use` (also with topics), `sdk_release_exists` | 409 |
+| `slug_taken`, `host_taken`, `host_cooldown`, `topic_exists`, `version_not_ready`, `tenant_not_empty`, `project_slug_taken`, `project_not_empty` (also with topics), `environment_in_use` (also with topics), `sdk_release_exists`, `switch_in_progress` | 409 |
 | `precondition_failed` | 412 |
 | `too_large`, `storage_quota`, `egress_quota` | 413 |
 | `sql_error`, `sql_not_authorized`, `sql_result_too_large`, `kv_not_integer`, `kv_overflow` (guest data, e.g. on export) | 422 |

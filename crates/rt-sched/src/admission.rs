@@ -490,6 +490,9 @@ impl TenantSlot {
     }
 }
 
+/// Versions remembered per service as not countable; the oldest make way (long finished by then).
+const LOST_VERSIONS_CAP: usize = 16;
+
 /// A cell of [`VersionCells`]: `version << 32 | count`.
 const fn cell(version: u32, count: u32) -> u64 {
     (version as u64) << 32 | count as u64
@@ -517,6 +520,9 @@ const fn cell_count(c: u64) -> u32 {
 struct VersionCells {
     cur: AtomicU64,
     prev: AtomicU64,
+    /// Versions pushed out with tasks running: their count cannot be trusted any more. Touched
+    /// only when a third version arrives, never per task once the cells hold the live versions.
+    lost: Mutex<Vec<u32>>,
 }
 
 impl VersionCells {
@@ -536,11 +542,22 @@ impl VersionCells {
                 }
                 continue;
             }
+            // An idle `cur` makes way before a `prev` with tasks: going back to a version leaves it
+            // in `prev`, and the next flip's drain watches it.
+            if cell_count(c) == 0 && cell_count(p) > 0 {
+                if self.cur.compare_exchange(c, cell(version, 1), SeqCst, SeqCst).is_ok() {
+                    return;
+                }
+                continue;
+            }
             // Strong: a failed swap means another thread counted or rotated, so read again.
-            if self.prev.compare_exchange(p, c, SeqCst, SeqCst).is_ok()
-                && self.cur.compare_exchange(c, cell(version, 1), SeqCst, SeqCst).is_ok()
-            {
-                return;
+            if self.prev.compare_exchange(p, c, SeqCst, SeqCst).is_ok() {
+                if cell_count(p) > 0 {
+                    self.mark_lost(cell_version(p));
+                }
+                if self.cur.compare_exchange(c, cell(version, 1), SeqCst, SeqCst).is_ok() {
+                    return;
+                }
             }
         }
     }
@@ -569,6 +586,24 @@ impl VersionCells {
                 return;
             }
         }
+    }
+
+    fn mark_lost(&self, version: u32) {
+        let mut lost = self.lost.lock();
+        if !lost.contains(&version) {
+            if lost.len() == LOST_VERSIONS_CAP {
+                lost.remove(0);
+            }
+            lost.push(version);
+        }
+    }
+
+    /// `None` once `version` was pushed out with tasks running.
+    fn known_count_of(&self, version: u32) -> Option<u32> {
+        if self.lost.lock().contains(&version) {
+            return None;
+        }
+        Some(self.count_of(version))
     }
 
     /// `cur` first, then `prev`: a rotation moves a version in that order.
@@ -1129,6 +1164,15 @@ impl<T> Admission<T> {
             .read()
             .get(&service)
             .map_or(0, |s| s.versions.count_of(version))
+    }
+
+    /// [`Admission::inflight_of`], or `None` when `version` was pushed out by newer versions with
+    /// tasks running, so that its tasks cannot be counted any more (until the process restarts).
+    pub fn inflight_known(&self, service: ServiceId, version: u32) -> Option<u32> {
+        self.services[shard_of(u128::from(service.ulid()))]
+            .read()
+            .get(&service)
+            .map_or(Some(0), |s| s.versions.known_count_of(version))
     }
 
     /// Tasks admitted and not finished (running + waiting).
@@ -1955,6 +1999,53 @@ mod edge_tests {
         // A ticket of the forgotten version touches nothing.
         c.dec(1);
         assert_eq!((c.count_of(2), c.count_of(3)), (1, 1));
+    }
+
+    /// Pushed out with tasks running: not countable, even if the version comes back.
+    #[test]
+    fn version_cells_mark_a_version_pushed_out_with_tasks_as_unknown() {
+        let c = VersionCells::default();
+        c.inc(1);
+        c.inc(2);
+        assert_eq!(c.known_count_of(1), Some(1));
+        c.inc(3);
+        assert_eq!(c.known_count_of(1), None);
+        assert_eq!((c.known_count_of(2), c.known_count_of(3)), (Some(1), Some(1)));
+        c.inc(1);
+        assert_eq!(c.known_count_of(1), None, "the new count misses the old task");
+        c.inc(1); // already marked: not twice
+        assert_eq!(c.lost.lock().len(), 2, "1 and then 2 were pushed out");
+    }
+
+    /// Going back leaves a version in `prev`; an idle `cur` goes first, so it stays counted.
+    #[test]
+    fn version_cells_evict_an_idle_cur_before_a_prev_with_tasks() {
+        let c = VersionCells::default();
+        c.inc(1);
+        c.inc(2);
+        c.dec(2);
+        c.inc(1); // back on 1, which is `prev`
+        c.inc(3);
+        assert_eq!(c.known_count_of(1), Some(2));
+        assert_eq!(c.known_count_of(3), Some(1));
+        assert_eq!(c.known_count_of(2), Some(0), "idle when it left: nothing was lost");
+    }
+
+    /// An idle version leaves without a mark, and the list of marks stays bounded.
+    #[test]
+    fn version_cells_keep_the_lost_list_bounded() {
+        let c = VersionCells::default();
+        for v in 1..=(LOST_VERSIONS_CAP as u32 + 4) {
+            c.inc(v);
+        }
+        assert_eq!(c.lost.lock().len(), LOST_VERSIONS_CAP);
+        assert_eq!(c.known_count_of(1), Some(0), "the oldest mark made way");
+    }
+
+    #[test]
+    fn inflight_known_is_zero_without_state() {
+        let a = Admission::<u32>::new(AdmissionLimits::resolve(1000, 0, 0, 1 << 30));
+        assert_eq!(a.inflight_known(ServiceId::from_u128(9), 1), Some(0));
     }
 
     #[test]

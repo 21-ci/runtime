@@ -5,13 +5,14 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures_util::stream::{self, StreamExt};
 use parking_lot::Mutex;
+use rt_api::promote::{PromoteReq, Promoter};
 use rt_sec::{secret_aad, QuotaEnforcer, QuotaError, QuotaOp, Sealed, SecretsBackend};
 use rt_store::{MetaStore, PageReq, ServiceFilter, TenantScope};
 use rt_triggers::RouteTable;
@@ -100,6 +101,9 @@ pub struct InProcControlPlane {
     env: DashMap<ServiceId, Arc<EnvSlot>>,
     events: mpsc::UnboundedSender<NodeEvent>,
     auto_rollback: bool,
+    /// Set once the node is wired. Weak: the promoter lives in the API state, which reaches back
+    /// here through the node facts.
+    promoter: OnceLock<Weak<Promoter>>,
 }
 
 impl InProcControlPlane {
@@ -115,9 +119,15 @@ impl InProcControlPlane {
             env: DashMap::new(),
             events,
             auto_rollback: true,
+            promoter: OnceLock::new(),
         };
         me.spawn_event_writer(rx);
         me
+    }
+
+    /// The flips of [`Self::auto_rollback`] go through it, like every other flip.
+    pub fn set_promoter(&self, promoter: &Arc<Promoter>) {
+        let _ = self.promoter.set(Arc::downgrade(promoter));
     }
 
     pub fn with_plans(self, plans: BTreeMap<String, rt_types::Plan>) -> Self {
@@ -457,10 +467,14 @@ impl InProcControlPlane {
         else {
             return;
         };
-        if self.meta.set_live(service, prev.number, None).await.is_ok() {
-            if let Ok(snap) = self.meta.route_snapshot().await {
-                self.routes.swap(&snap);
-            }
+        let Some(promoter) = self.promoter.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        if promoter
+            .promote(&svc, PromoteReq::new(prev.number).by("auto_rollback"))
+            .await
+            .is_ok()
+        {
             let mut ev = NodeEvent::new("rollback.auto", chrono::Utc::now().timestamp_millis());
             ev.service = Some(service);
             ev.data = serde_json::json!({"from": failed.0, "to": prev.number.0});
@@ -620,7 +634,30 @@ mod tests {
     // ---- the rest of the ControlPlane contract -------------------------------------------------
 
     /// A control plane over a meta store that can be made to fail.
+    struct AnyPlan;
+
+    impl rt_sec::PlanSource for AnyPlan {
+        fn plan_for(&self, _tenant: TenantId) -> rt_types::Plan {
+            rt_types::Plan::default()
+        }
+    }
+
+    /// The route table only: enough to see that a flip reaches it.
+    struct RoutesOnly {
+        meta: Arc<SqliteMetaStore>,
+        routes: Arc<RouteTable>,
+    }
+
+    #[async_trait]
+    impl rt_api::promote::RouteRefresh for RoutesOnly {
+        async fn refresh(&self) -> Result<(), rt_api::ApiError> {
+            self.routes.swap(&self.meta.route_snapshot().await?);
+            Ok(())
+        }
+    }
+
     struct Faulty {
+        _promoter: Arc<Promoter>,
         _dir: tempfile::TempDir,
         meta: Arc<SqliteMetaStore>,
         faults: Arc<rt_store::Faults>,
@@ -657,8 +694,32 @@ mod tests {
             .create_service(TenantScope::Operator, t.id, new)
             .await
             .expect("service");
-        let cp = InProcControlPlane::new(meta.clone(), secrets, RouteTable::new(None));
+        let routes = RouteTable::new(None);
+        let cp = InProcControlPlane::new(meta.clone(), secrets, routes.clone());
+        let clock: Arc<dyn rt_sched::Clock> = Arc::new(rt_sched::SystemClock::new());
+        let mem: Arc<dyn rt_mem::MemoryGovernor> = rt_testkit::TestGovernor::new(1 << 30);
+        let promoter = Promoter::new(rt_api::promote::PromoterDeps {
+            meta: meta.clone(),
+            scheduler: rt_sched::Scheduler::builder(rt_sched::SchedConfig::default(), clock.clone(), mem)
+                .executor(
+                    || rt_testkit::MockDenoExecutor::new(rt_testkit::ScriptBook::new()),
+                    Arc::new(rt_sched::UnitSource),
+                    0,
+                )
+                .build()
+                .expect("scheduler"),
+            config: Arc::new(arc_swap::ArcSwap::from_pointee(rt_config::Config::default())),
+            plans: Arc::new(AnyPlan),
+            clock,
+            events: cp.event_sender(),
+            refresher: Arc::new(RoutesOnly {
+                meta: meta.clone(),
+                routes,
+            }),
+        });
+        cp.set_promoter(&promoter);
         Faulty {
+            _promoter: promoter,
             _dir: dir,
             meta,
             faults,
@@ -794,6 +855,49 @@ mod tests {
             .expect("ready");
         f.cp.auto_rollback(f.service, v2).await;
         assert_eq!(live(&f).await, Some(v1));
+        let rows = f
+            .meta
+            .list_switches(
+                f.service,
+                PageReq {
+                    limit: 10,
+                    cursor: None,
+                },
+            )
+            .await
+            .expect("rows");
+        assert_eq!(rows.items.len(), 1, "the rollback goes through promote()");
+        assert_eq!(rows.items[0].kind, rt_types::SwitchKind::Promote);
+        assert_eq!(rows.items[0].created_by.as_deref(), Some("auto_rollback"));
+        assert_eq!(rows.items[0].from_version, Some(v2));
+    }
+
+    /// A control plane the node never gave a promoter (or already dropped) cannot flip anything.
+    #[tokio::test]
+    async fn without_a_promoter_a_rollback_changes_nothing() {
+        let f = faulty().await;
+        let secrets: Arc<dyn SecretsBackend> =
+            Arc::new(LocalSecrets::new(&MasterKey::from_hex(&"11".repeat(32)).expect("key")));
+        let bare = InProcControlPlane::new(f.meta.clone(), secrets, RouteTable::new(None));
+        let version = |n: u8| rt_types::NewVersion {
+            source_digest: rt_types::Digest::of(&[n]),
+            compile: Default::default(),
+        };
+        let v1 = f.meta.add_version(f.service, version(1)).await.expect("v1").number;
+        let v2 = f.meta.add_version(f.service, version(2)).await.expect("v2").number;
+        f.meta
+            .set_build_state(f.service, v1, BuildState::Ready, None, None)
+            .await
+            .expect("ready");
+        f.meta.set_live(f.service, v2, None).await.expect("live");
+        bare.auto_rollback(f.service, v2).await;
+        let svc = f
+            .meta
+            .get_service(TenantScope::Operator, f.service)
+            .await
+            .expect("get")
+            .expect("svc");
+        assert_eq!(svc.live_version, Some(v2));
     }
 
     #[tokio::test]
@@ -828,7 +932,7 @@ mod tests {
             .expect("ready");
         f.meta.set_live(f.service, v2, None).await.expect("live");
         f.faults.pass_next(2); // get_service, list_versions
-        f.faults.fail_next(1, rt_store::Fault::Io); // set_live
+        f.faults.fail_next(1, rt_store::Fault::Io); // the switch row
         f.cp.auto_rollback(f.service, v2).await;
         let live = f
             .meta
@@ -843,6 +947,7 @@ mod tests {
     #[tokio::test]
     async fn the_event_writer_ends_and_lets_go_of_the_store_when_the_control_plane_is_dropped() {
         let f = faulty().await;
+        drop(f._promoter); // holds the store and the event sender in a real node, too
         let held_by_plane_and_writer = Arc::strong_count(&f.meta);
         drop(f.cp);
         for _ in 0..200 {

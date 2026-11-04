@@ -31,6 +31,8 @@ mod instances;
 mod lock_schedule;
 #[path = "flows/obs.rs"]
 mod obs;
+#[path = "flows/promote.rs"]
+mod promote;
 #[path = "flows/restart.rs"]
 mod restart;
 #[path = "flows/sdk.rs"]

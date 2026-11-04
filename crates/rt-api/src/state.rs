@@ -393,6 +393,8 @@ pub struct ApiState {
     /// Async invocations (`queue.db`).
     pub invocations: Arc<dyn InvocationStore>,
     pub scheduler: Scheduler,
+    /// Every flip of a live version (`promote.rs`).
+    pub promoter: Arc<crate::promote::Promoter>,
     pub routes: Arc<RouteTable>,
     pub auth: Arc<dyn Authenticator>,
     pub quotas: Arc<dyn QuotaEnforcer>,

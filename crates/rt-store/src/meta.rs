@@ -337,39 +337,33 @@ pub trait MetaStore: Send + Sync {
     /// taken from a caller. Reuses the row when that origin was already adopted. `NotFound` when
     /// `source` is missing or in another tenant or project, `Conflict("version_not_ready")` unless
     /// the source is `ready`, `Conflict("runtime_mismatch")` across runtimes.
-    // LCOV_EXCL_START: defaults for test wrappers of the trait; SqliteMetaStore overrides them all
-    async fn adopt_version(
-        &self,
-        _parent: ServiceId,
-        _source: ServiceId,
-        _source_version: VersionNo,
-    ) -> Result<Version> {
-        Err(StoreError::Invalid("adopt_version is not supported".into()))
-    }
+    async fn adopt_version(&self, parent: ServiceId, source: ServiceId, source_version: VersionNo) -> Result<Version>;
     /// Start a tracked flip in `preparing`. `NotFound` without the service or `to_version`,
     /// `Conflict("switch_in_progress")` while another is `preparing` or `migrating`.
-    async fn create_switch(&self, _id: ServiceId, _s: NewSwitch) -> Result<Switch> {
-        Err(StoreError::Invalid("create_switch is not supported".into()))
-    }
+    async fn create_switch(&self, id: ServiceId, s: NewSwitch) -> Result<Switch>;
+    /// The commit point of a flip, one writer transaction: the row's `to_version` becomes live and
+    /// the row records what was live before. With another version to wait for the row is
+    /// `draining` until `drain_deadline_ms`; otherwise (nothing live before, or the same version)
+    /// it is `completed`. Refusals change nothing: the errors of [`MetaStore::set_live`],
+    /// `NotFound` unless the switch belongs to `id`, `Conflict("switch_not_open")` unless the row
+    /// is `preparing` or `migrating`.
+    async fn flip_switch(
+        &self,
+        id: ServiceId,
+        switch: SwitchId,
+        if_match: Option<Etag>,
+        drain_deadline_ms: UnixMs,
+    ) -> Result<(Service, Switch)>;
     /// `NotFound` unless the switch belongs to `id`.
-    async fn update_switch(&self, _id: ServiceId, _switch: SwitchId, _patch: SwitchPatch) -> Result<Switch> {
-        Err(StoreError::Invalid("update_switch is not supported".into()))
-    }
+    async fn update_switch(&self, id: ServiceId, switch: SwitchId, patch: SwitchPatch) -> Result<Switch>;
     /// `None` unless the switch belongs to `id`.
-    async fn get_switch(&self, _id: ServiceId, _switch: SwitchId) -> Result<Option<Switch>> {
-        Err(StoreError::Invalid("get_switch is not supported".into()))
-    }
+    async fn get_switch(&self, id: ServiceId, switch: SwitchId) -> Result<Option<Switch>>;
     /// Newest first; the cursor is the last id returned.
-    async fn list_switches(&self, _id: ServiceId, _page: PageReq) -> Result<Page<Switch>> {
-        Err(StoreError::Invalid("list_switches is not supported".into()))
-    }
+    async fn list_switches(&self, id: ServiceId, page: PageReq) -> Result<Page<Switch>>;
     /// At startup, close what a crash left open: `preparing|migrating` become `failed` with
     /// `error = interrupted`, `draining` becomes `completed`, both flagged `interrupted`. The live
     /// version is not touched. Returns how many rows changed.
-    async fn recover_switches(&self) -> Result<u64> {
-        Err(StoreError::Invalid("recover_switches is not supported".into()))
-    }
-    // LCOV_EXCL_STOP
+    async fn recover_switches(&self) -> Result<u64>;
     /// True while any version (source or lock) or any recorded lock (module) still references
     /// `digest` (artifact refcount is computed live).
     async fn digest_referenced(&self, digest: &Digest) -> Result<bool>;
@@ -682,6 +676,46 @@ fn switch_kind_str(k: SwitchKind) -> &'static str {
         SwitchKind::Switch => "switch",
         SwitchKind::Rollback => "rollback",
     }
+}
+
+/// The live flag and the service's etag, inside the caller's transaction.
+fn set_live_tx(c: &Connection, id: ServiceId, v: VersionNo, if_match: Option<Etag>) -> Result<Service> {
+    let cur = require_service(c, id)?;
+    if if_match.is_some_and(|e| e != cur.etag) {
+        return Err(StoreError::PreconditionFailed);
+    }
+    let state: Option<String> = c
+        .query_row(
+            "SELECT build_state FROM versions WHERE service_id = ?1 AND number = ?2",
+            params![id.to_string(), v.0],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match state.as_deref() {
+        None => return Err(StoreError::NotFound),
+        Some("failed") => return Err(StoreError::Conflict("version_not_ready")),
+        Some(_) => {}
+    }
+    let now = now_ms();
+    // One live version per service (`versions_one_live`): clear the old flag first.
+    c.execute(
+        "UPDATE versions SET is_live = 0 WHERE service_id = ?1 AND is_live = 1",
+        [id.to_string()],
+    )?;
+    c.execute(
+        "UPDATE versions SET is_live = 1 WHERE service_id = ?1 AND number = ?2",
+        params![id.to_string(), v.0],
+    )?;
+    c.execute(
+        "UPDATE services SET etag = etag + 1, updated_at = ?2 WHERE id = ?1",
+        params![id.to_string(), now],
+    )?;
+    Ok(Service {
+        live_version: Some(v),
+        etag: Etag(cur.etag.0 + 1),
+        updated_at_ms: now,
+        ..cur
+    })
 }
 
 fn switch_state_str(s: SwitchState) -> &'static str {
@@ -2053,6 +2087,50 @@ impl MetaStore for SqliteMetaStore {
         .await
     }
 
+    async fn flip_switch(
+        &self,
+        id: ServiceId,
+        switch: SwitchId,
+        if_match: Option<Etag>,
+        drain_deadline_ms: UnixMs,
+    ) -> Result<(Service, Switch)> {
+        self.write(move |c| {
+            let key = id.to_string();
+            let read_row = |c: &Connection| {
+                c.query_row(
+                    &format!("SELECT {SWITCH_COLS} FROM version_switches WHERE id = ?1 AND service_id = ?2"),
+                    params![switch.to_string(), key],
+                    switch_row,
+                )
+                .optional()
+            };
+            let row = read_row(c)?.ok_or(StoreError::NotFound)?;
+            if !matches!(row.state, SwitchState::Preparing | SwitchState::Migrating) {
+                return Err(StoreError::Conflict("switch_not_open"));
+            }
+            let from = require_service(c, id)?.live_version;
+            let service = set_live_tx(c, id, row.to_version, if_match)?;
+            let state = match from {
+                Some(v) if v != row.to_version => SwitchState::Draining,
+                _ => SwitchState::Completed,
+            };
+            c.execute(
+                "UPDATE version_switches SET state = ?2, from_version = ?3, drain_deadline = ?4, updated_at = ?5 \
+                 WHERE id = ?1",
+                params![
+                    switch.to_string(),
+                    switch_state_str(state),
+                    from.map(|v| v.0),
+                    (state == SwitchState::Draining).then_some(drain_deadline_ms),
+                    now_ms(),
+                ],
+            )?;
+            let row = read_row(c)?.ok_or(StoreError::NotFound)?;
+            Ok((service, row))
+        })
+        .await
+    }
+
     async fn update_switch(&self, id: ServiceId, switch: SwitchId, patch: SwitchPatch) -> Result<Switch> {
         self.write(move |c| {
             let changed = c
@@ -2186,45 +2264,7 @@ impl MetaStore for SqliteMetaStore {
     }
 
     async fn set_live(&self, id: ServiceId, v: VersionNo, if_match: Option<Etag>) -> Result<Service> {
-        self.write(move |c| {
-            let cur = require_service(c, id)?;
-            if if_match.is_some_and(|e| e != cur.etag) {
-                return Err(StoreError::PreconditionFailed);
-            }
-            let state: Option<String> = c
-                .query_row(
-                    "SELECT build_state FROM versions WHERE service_id = ?1 AND number = ?2",
-                    params![id.to_string(), v.0],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            match state.as_deref() {
-                None => return Err(StoreError::NotFound),
-                Some("failed") => return Err(StoreError::Conflict("version_not_ready")),
-                Some(_) => {}
-            }
-            let now = now_ms();
-            // One live version per service (`versions_one_live`): clear the old flag first.
-            c.execute(
-                "UPDATE versions SET is_live = 0 WHERE service_id = ?1 AND is_live = 1",
-                [id.to_string()],
-            )?;
-            c.execute(
-                "UPDATE versions SET is_live = 1 WHERE service_id = ?1 AND number = ?2",
-                params![id.to_string(), v.0],
-            )?;
-            c.execute(
-                "UPDATE services SET etag = etag + 1, updated_at = ?2 WHERE id = ?1",
-                params![id.to_string(), now],
-            )?;
-            Ok(Service {
-                live_version: Some(v),
-                etag: Etag(cur.etag.0 + 1),
-                updated_at_ms: now,
-                ..cur
-            })
-        })
-        .await
+        self.write(move |c| set_live_tx(c, id, v, if_match)).await
     }
 
     async fn count_builds_since(&self, tenant: TenantId, since_ms: UnixMs) -> Result<u64> {

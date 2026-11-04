@@ -357,6 +357,11 @@ impl Scheduler {
         self.inner.admission.inflight_of(service, version)
     }
 
+    /// [`Scheduler::inflight_of`], or `None` when the version's tasks cannot be counted any more.
+    pub fn inflight_known(&self, service: ServiceId, version: u32) -> Option<u32> {
+        self.inner.admission.inflight_known(service, version)
+    }
+
     /// One service's autoscaler view: admission state, learned latency baseline, demand, smoothed
     /// queue wait, queue timeouts (`GET /v1/services/{s}`, `…/stats`).
     pub fn service_scaling(&self, service: ServiceId) -> Option<ServiceScaling> {

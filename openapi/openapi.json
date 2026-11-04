@@ -3836,6 +3836,16 @@
               }
             }
           },
+          "202": {
+            "description": "the flip committed, the route refresh is delayed: see `warnings`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceView"
+                }
+              }
+            }
+          },
           "401": {
             "description": "missing, invalid, revoked or expired credential",
             "content": {
@@ -10163,11 +10173,25 @@
           "status": {
             "$ref": "#/components/schemas/ServiceStatus"
           },
+          "switch_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The switch this flip wrote (`PUT /v1/services/{s}/live` only)."
+          },
           "tenant_id": {
             "type": "string"
           },
           "triggers": {
             "type": "object"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SwitchWarning"
+            },
+            "description": "What the flip could not finish; empty and absent normally."
           },
           "wasm": {
             "type": "object",
@@ -10289,6 +10313,19 @@
             "items": {
               "type": "string"
             }
+          }
+        }
+      },
+      "SwitchWarning": {
+        "type": "object",
+        "description": "A flip committed, but one of its follow-ups did not finish.",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "`routes_refresh_delayed`: the new version is committed and reaches traffic once the node\nre-reads its routes, which it keeps trying."
           }
         }
       },
@@ -10597,6 +10634,13 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SwitchWarning"
+            },
+            "description": "What activating this version could not finish; empty and absent normally."
           }
         }
       }
