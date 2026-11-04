@@ -3254,3 +3254,96 @@ fn pred_003_a_wall_kill_in_the_scheduler_feeds_the_estimator() {
     let pred = scaling_of(&sim, 1).pred[0].expect("a sample was taken");
     assert!(pred >= ms(150) && pred <= ms(300), "{pred:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Per-version inflight counter (branching services, the drain of a switch)
+// ---------------------------------------------------------------------------------------------
+
+fn versioned(limit: u32, version: u32) -> TaskSpec {
+    let mut spec = task(1, 2, knobs(limit, 0, 0));
+    spec.service.version = rt_types::VersionNo(version);
+    spec
+}
+
+fn inflight_of(adm: &Adm, version: u32) -> u32 {
+    adm.a.inflight_of(ids::service(2), version)
+}
+
+/// Two versions interleaved: each finish takes one off its own version only.
+#[test]
+fn two_versions_interleaved_count_apart() {
+    let mut adm = Adm::new(limits(100));
+    let (old, new) = (versioned(10, 1), versioned(10, 2));
+    adm.admit(&old).unwrap();
+    adm.admit(&new).unwrap();
+    adm.admit(&old).unwrap();
+    adm.admit(&new).unwrap();
+    assert_eq!((inflight_of(&adm, 1), inflight_of(&adm, 2)), (2, 2));
+    adm.finish(1);
+    assert_eq!((inflight_of(&adm, 1), inflight_of(&adm, 2)), (1, 2));
+    adm.finish(2);
+    adm.finish(4);
+    assert_eq!((inflight_of(&adm, 1), inflight_of(&adm, 2)), (1, 0));
+    adm.finish(3);
+    assert_eq!((inflight_of(&adm, 1), inflight_of(&adm, 2)), (0, 0));
+}
+
+/// A task of the old version waiting for a slot still has to finish: the drain sees it from
+/// admission on, through its grant, to its release.
+#[test]
+fn a_waiting_task_counts_for_its_version_until_it_finishes() {
+    let mut adm = Adm::new(limits(100));
+    adm.admit(&versioned(1, 1)).unwrap();
+    let waiting = adm.admit(&versioned(1, 1)).unwrap();
+    assert!(waiting.run.is_none());
+    assert_eq!(inflight_of(&adm, 1), 2);
+    assert_eq!(adm.finish(1), vec![2]);
+    assert_eq!(inflight_of(&adm, 1), 1, "granted, still in flight");
+    adm.finish(2);
+    assert_eq!(inflight_of(&adm, 1), 0);
+}
+
+/// A waiting task taken out of its queue no longer counts; a second cancel takes nothing off.
+#[test]
+fn a_cancelled_waiting_task_stops_counting() {
+    let mut adm = Adm::new(limits(100));
+    adm.admit(&versioned(1, 1)).unwrap();
+    adm.admit(&versioned(1, 1)).unwrap();
+    let t = adm.tickets[&2].clone();
+    assert!(adm.a.cancel(&t, false, |n| *n == 2));
+    assert_eq!(inflight_of(&adm, 1), 1);
+    assert!(!adm.a.cancel(&t, false, |n| *n == 2));
+    assert_eq!(inflight_of(&adm, 1), 1);
+}
+
+/// A task refused for lack of room never counted.
+#[test]
+fn a_refused_task_does_not_count() {
+    let mut adm = Adm::new(limits(100));
+    let k = knobs(1, 1, 0);
+    let mut spec = task(1, 2, k);
+    spec.service.version = rt_types::VersionNo(1);
+    adm.admit(&spec).unwrap();
+    adm.admit(&spec).unwrap();
+    assert_eq!(adm.admit(&spec).unwrap_err(), RejectReason::Overloaded);
+    assert_eq!(inflight_of(&adm, 1), 2);
+}
+
+/// Cost of the admit + release pair with the version counter (no contention, the fast path).
+#[test]
+#[ignore = "perf"]
+fn admit_release_with_version_counter_under_200ns() {
+    const N: u32 = 1_000_000;
+    let a: Admission<u32> = Admission::new(limits(1000));
+    let spec = versioned(1000, 1);
+    let r = req(&spec);
+    let start = Instant::now();
+    for _ in 0..N {
+        let t = a.admit(&r, NORMAL, |_| 0).unwrap().ticket;
+        a.release(&t, 1, None);
+    }
+    let per = start.elapsed().as_nanos() / u128::from(N);
+    println!("admit+release with version counter: {per} ns");
+    assert_eq!(a.inflight_of(spec.service.service, 1), 0);
+    assert!(per < 200, "{per} ns per admit+release");
+}

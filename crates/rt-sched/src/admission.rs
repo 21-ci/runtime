@@ -274,6 +274,8 @@ pub struct AdmissionTicket {
     /// A re-entrant call ([`AdmitRequest::reentrant`]) and its parent: registered as a borrower.
     pub reentrant: bool,
     pub parent: Option<TaskId>,
+    /// The service version this task runs (`ServiceRef::version`): the cell it counts in.
+    pub version: u32,
     pub(crate) slot: Arc<SvcSlot>,
 }
 
@@ -488,6 +490,102 @@ impl TenantSlot {
     }
 }
 
+/// A cell of [`VersionCells`]: `version << 32 | count`.
+const fn cell(version: u32, count: u32) -> u64 {
+    (version as u64) << 32 | count as u64
+}
+
+const fn cell_version(c: u64) -> u32 {
+    (c >> 32) as u32
+}
+
+const fn cell_count(c: u64) -> u32 {
+    c as u32
+}
+
+/// Guest tasks admitted and not finished, for the service's two latest versions (what the drain
+/// of a switch polls). One compare-and-swap per admit and per release; no lock, no allocation.
+///
+/// A rotation copies `cur` to `prev`, then swaps `cur` only if it did not change since it was
+/// read. Counting tries `cur` first, so during a rotation the old version still counts in `cur`
+/// (which fails the swap, and the rotation starts over) and `prev` is an unused copy until the
+/// swap makes it the real cell: no count is lost or doubled. A third version forgets the oldest;
+/// its running tasks then count nowhere and their release touches nothing. If that forgotten
+/// version comes back while old tasks still run, their releases take from its new count, which
+/// stops at zero: a drain of it can end early by those tasks.
+#[derive(Debug, Default)]
+struct VersionCells {
+    cur: AtomicU64,
+    prev: AtomicU64,
+}
+
+impl VersionCells {
+    fn inc(&self, version: u32) {
+        loop {
+            let c = self.cur.load(SeqCst);
+            if cell_version(c) == version {
+                if self.cur.compare_exchange_weak(c, c + 1, SeqCst, SeqCst).is_ok() {
+                    return;
+                }
+                continue;
+            }
+            let p = self.prev.load(SeqCst);
+            if cell_version(p) == version {
+                if self.prev.compare_exchange_weak(p, p + 1, SeqCst, SeqCst).is_ok() {
+                    return;
+                }
+                continue;
+            }
+            // Strong: a failed swap means another thread counted or rotated, so read again.
+            if self.prev.compare_exchange(p, c, SeqCst, SeqCst).is_ok()
+                && self.cur.compare_exchange(c, cell(version, 1), SeqCst, SeqCst).is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn dec(&self, version: u32) {
+        loop {
+            let c = self.cur.load(SeqCst);
+            let target = if cell_version(c) == version {
+                (&self.cur, c)
+            } else {
+                let p = self.prev.load(SeqCst);
+                if cell_version(p) != version {
+                    // Forgotten by a rotation (a version only leaves `cur` for `prev`).
+                    return;
+                }
+                (&self.prev, p)
+            };
+            if cell_count(target.1) == 0 {
+                return;
+            }
+            if target
+                .0
+                .compare_exchange_weak(target.1, target.1 - 1, SeqCst, SeqCst)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// `cur` first, then `prev`: a rotation moves a version in that order.
+    fn count_of(&self, version: u32) -> u32 {
+        let c = self.cur.load(SeqCst);
+        if cell_version(c) == version {
+            return cell_count(c);
+        }
+        let p = self.prev.load(SeqCst);
+        if cell_version(p) == version {
+            cell_count(p)
+        } else {
+            0
+        }
+    }
+}
+
 /// Per-service counters, policy and autoscaler state.
 #[derive(Debug)]
 pub(crate) struct SvcSlot {
@@ -508,6 +606,8 @@ pub(crate) struct SvcSlot {
     pred_ns: [AtomicU64; LANES],
     /// Running re-entrant calls by the parent they borrow a slot from.
     lent: Mutex<Lenders>,
+    /// Guest tasks in flight per version.
+    versions: VersionCells,
 }
 
 /// Parents lending a slot to their running re-entrant children (see the module doc).
@@ -579,6 +679,7 @@ impl SvcSlot {
             }),
             pred_ns: [AtomicU64::new(0), AtomicU64::new(0)],
             lent: Mutex::new(Lenders::default()),
+            versions: VersionCells::default(),
         }
     }
 
@@ -747,6 +848,7 @@ struct Waiting<T> {
     depth: u8,
     reentrant: bool,
     parent: Option<TaskId>,
+    version: u32,
     since_ns: u64,
     key: u64,
     pred_ns: u64,
@@ -1020,6 +1122,15 @@ impl<T> Admission<T> {
     // Observers
     // -----------------------------------------------------------------------------------------
 
+    /// Guest tasks of `version` admitted and not finished, waiting ones included, builds not
+    /// (0 without admission state, or for a version older than the service's latest two).
+    pub fn inflight_of(&self, service: ServiceId, version: u32) -> u32 {
+        self.services[shard_of(u128::from(service.ulid()))]
+            .read()
+            .get(&service)
+            .map_or(0, |s| s.versions.count_of(version))
+    }
+
     /// Tasks admitted and not finished (running + waiting).
     pub fn inflight(&self) -> u32 {
         self.running.load(SeqCst).saturating_add(self.queued.load(SeqCst))
@@ -1222,6 +1333,7 @@ impl<T> Admission<T> {
             lane: req.lane,
             reentrant: req.reentrant,
             parent: req.parent,
+            version: req.service.version.0,
             slot: slot.clone(),
         }
     }
@@ -1244,6 +1356,7 @@ impl<T> Admission<T> {
         if !line_up && self.try_take(slot, req.class, req.call_depth, req.reentrant.then_some(req.parent)) == Take::Ok {
             if counted {
                 slot.win.arrivals.fetch_add(1, Ordering::Relaxed);
+                slot.versions.inc(req.service.version.0);
             }
             let ticket = Self::ticket(slot, req, None);
             let item = make(&ticket);
@@ -1286,6 +1399,8 @@ impl<T> Admission<T> {
         }
         if counted {
             slot.win.arrivals.fetch_add(1, Ordering::Relaxed);
+            // Counted while it waits too: it still has to run on this version.
+            slot.versions.inc(req.service.version.0);
         }
         let lane = usize::from(req.lane).min(LANES - 1);
         let pred = predicted_ns(slot.pred_ns[lane].load(SeqCst), req.wall);
@@ -1317,6 +1432,7 @@ impl<T> Admission<T> {
             depth: req.call_depth,
             reentrant: req.reentrant,
             parent: req.parent,
+            version: req.service.version.0,
             since_ns: req.now_ns,
             key,
             pred_ns: pred,
@@ -1529,6 +1645,7 @@ impl<T> Admission<T> {
         }
         let slot = &ticket.slot;
         if ticket.class != SlotClass::Build {
+            slot.versions.dec(ticket.version);
             Self::untake_svc(slot, ticket.reentrant.then_some(ticket.parent));
             dec(&slot.tenant.running);
             if ticket.class == SlotClass::Call {
@@ -1610,6 +1727,9 @@ impl<T> Admission<T> {
         let Some(x) = x else { return false };
         let slot = sq.slot.clone();
         self.unqueue(&slot, x.bytes);
+        if x.class != SlotClass::Build {
+            slot.versions.dec(x.version);
+        }
         if timed_out {
             slot.win.timeouts.fetch_add(1, SeqCst);
         }
@@ -1776,6 +1896,143 @@ impl<T> Admission<T> {
 #[cfg(test)]
 mod edge_tests {
     use super::*;
+    use rt_types::{Digest, RuntimeKind, VersionNo};
+
+    fn version_req(version: u32, class: SlotClass) -> AdmitRequest {
+        AdmitRequest {
+            service: ServiceRef {
+                tenant: TenantId::from_u128(1),
+                service: ServiceId::from_u128(2),
+                version: VersionNo(version),
+                digest: Digest([0; 32]),
+            },
+            kind: match class {
+                SlotClass::Build => TaskKind::Build,
+                _ => TaskKind::Exec(RuntimeKind::Deno),
+            },
+            class,
+            call_depth: 0,
+            knobs: ServiceKnobs {
+                max_instances: 1000,
+                ..ServiceKnobs::default()
+            },
+            key: None,
+            bytes: 0,
+            instance_bytes: 0,
+            now_ns: 0,
+            wall: Duration::from_secs(1),
+            lane: 0,
+            reentrant: false,
+            parent: None,
+        }
+    }
+
+    fn admit_version(a: &Admission<u32>, version: u32, class: SlotClass) -> AdmissionTicket {
+        let cx = AdmitContext {
+            mode: DegradationMode::Normal,
+            t1_ready: true,
+        };
+        a.admit(&version_req(version, class), cx, |_| 0).unwrap().ticket
+    }
+
+    fn adm() -> Admission<u32> {
+        Admission::new(AdmissionLimits::resolve(1000, 0, 0, 1 << 30))
+    }
+
+    fn svc() -> ServiceId {
+        ServiceId::from_u128(2)
+    }
+
+    #[test]
+    fn version_cells_rotate_on_a_third_version_and_forget_the_oldest() {
+        let c = VersionCells::default();
+        c.inc(1);
+        c.inc(1);
+        c.inc(2);
+        assert_eq!((c.count_of(1), c.count_of(2)), (2, 1));
+        c.inc(3);
+        assert_eq!((c.count_of(1), c.count_of(2), c.count_of(3)), (0, 1, 1));
+        // A ticket of the forgotten version touches nothing.
+        c.dec(1);
+        assert_eq!((c.count_of(2), c.count_of(3)), (1, 1));
+    }
+
+    #[test]
+    fn version_cells_dec_only_the_matching_cell_and_stop_at_zero() {
+        let c = VersionCells::default();
+        c.inc(7);
+        c.inc(8);
+        c.inc(7);
+        c.dec(7);
+        assert_eq!((c.count_of(7), c.count_of(8)), (1, 1));
+        c.dec(8);
+        c.dec(8);
+        assert_eq!(
+            (c.count_of(7), c.count_of(8)),
+            (1, 0),
+            "no borrow into the version bits"
+        );
+    }
+
+    /// The largest version keeps its own cell: the count never reaches the version bits.
+    #[test]
+    fn version_cells_keep_a_large_version_apart_from_its_count() {
+        let c = VersionCells::default();
+        c.inc(u32::MAX);
+        c.inc(u32::MAX);
+        assert_eq!(c.count_of(u32::MAX), 2);
+        assert_eq!(c.count_of(0), 0);
+    }
+
+    /// Rotations racing with counting lose nothing of the two versions that stay in the cells.
+    #[test]
+    fn version_cells_balance_under_concurrent_rotation() {
+        let c = Arc::new(VersionCells::default());
+        let threads: Vec<_> = (1..=4u32)
+            .map(|t| {
+                let c = c.clone();
+                std::thread::spawn(move || {
+                    for i in 0..20_000u32 {
+                        let v = (t + i) % 2 + 1;
+                        c.inc(v);
+                        c.dec(v);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!((c.count_of(1), c.count_of(2)), (0, 0));
+    }
+
+    #[test]
+    fn inflight_of_follows_the_ticket_version_and_is_zero_without_state() {
+        let a = adm();
+        assert_eq!(a.inflight_of(svc(), 1), 0);
+        let t1 = admit_version(&a, 1, SlotClass::Throttled);
+        let t2 = admit_version(&a, 2, SlotClass::Call);
+        assert_eq!((t1.version, t2.version), (1, 2));
+        assert_eq!((a.inflight_of(svc(), 1), a.inflight_of(svc(), 2)), (1, 1));
+        a.release(&t1, 1, None);
+        assert_eq!((a.inflight_of(svc(), 1), a.inflight_of(svc(), 2)), (0, 1));
+        a.release(&t2, 1, None);
+        assert_eq!(a.inflight_of(svc(), 2), 0);
+    }
+
+    /// A build is not guest work: it neither counts nor rotates a cell, on admit or on release.
+    #[test]
+    fn inflight_of_excludes_builds() {
+        let a = adm();
+        let t1 = admit_version(&a, 1, SlotClass::Throttled);
+        let b = admit_version(&a, 9, SlotClass::Build);
+        let b1 = admit_version(&a, 1, SlotClass::Build);
+        assert_eq!((a.inflight_of(svc(), 9), a.inflight_of(svc(), 1)), (0, 1));
+        a.release(&b, 1, None);
+        a.release(&b1, 1, None);
+        assert_eq!(a.inflight_of(svc(), 1), 1, "a build's release takes nothing off");
+        a.release(&t1, 1, None);
+    }
 
     /// ADM-011: releasing below zero (a bookkeeping bug) is undone, never wrapped to u32::MAX, and
     /// asserts in debug builds.

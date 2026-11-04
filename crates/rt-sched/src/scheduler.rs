@@ -352,6 +352,11 @@ impl Scheduler {
         self.inner.admission.service(service)
     }
 
+    /// Guest tasks of one service version admitted and not finished (the drain of a switch).
+    pub fn inflight_of(&self, service: ServiceId, version: u32) -> u32 {
+        self.inner.admission.inflight_of(service, version)
+    }
+
     /// One service's autoscaler view: admission state, learned latency baseline, demand, smoothed
     /// queue wait, queue timeouts (`GET /v1/services/{s}`, `…/stats`).
     pub fn service_scaling(&self, service: ServiceId) -> Option<ServiceScaling> {
