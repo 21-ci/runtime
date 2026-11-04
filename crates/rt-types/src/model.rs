@@ -12,7 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::digest::Digest;
 use crate::events::{AsyncInvokeConfig, EventsConfig};
-use crate::ids::{EventId, KeyId, ProjectId, ScheduleId, ServiceId, TenantId, VersionNo};
+use crate::ids::{EventId, KeyId, ProjectId, ScheduleId, ServiceId, SwitchId, TenantId, VersionNo};
 use crate::kinds::{Profile, RuntimeKind};
 use crate::limits::CompileMode;
 use crate::outcome::BuildFailure;
@@ -706,12 +706,86 @@ pub struct Version {
     /// build reports it and for WASM.
     #[serde(default)]
     pub bundle_digest: Option<Digest>,
+    /// The version this one was adopted from by digest (`MetaStore::adopt_version`); `None` for an
+    /// upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<VersionOrigin>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewVersion {
     pub source_digest: Digest,
     pub compile: CompileMode,
+}
+
+/// Where an adopted version came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionOrigin {
+    pub service: ServiceId,
+    pub version: VersionNo,
+}
+
+/// What started a tracked flip of the live version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchKind {
+    Promote,
+    Switch,
+    Rollback,
+}
+
+/// Progress of a tracked flip. `Preparing` and `Migrating` are before the flip and exclusive per
+/// service; `Draining` is after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchState {
+    Preparing,
+    Migrating,
+    Draining,
+    Completed,
+    DrainTimedOut,
+    Failed,
+}
+
+/// One row of `version_switches`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Switch {
+    pub id: SwitchId,
+    pub service_id: ServiceId,
+    pub kind: SwitchKind,
+    pub state: SwitchState,
+    /// The source version (`SwitchKind::Switch` only).
+    pub source: Option<VersionOrigin>,
+    pub from_version: Option<VersionNo>,
+    pub to_version: VersionNo,
+    /// A stable code, never driver text.
+    pub error: Option<String>,
+    /// The node restarted while this switch was unfinished.
+    pub interrupted: bool,
+    pub drain_deadline_ms: Option<UnixMs>,
+    pub created_by: Option<String>,
+    pub created_at_ms: UnixMs,
+    pub updated_at_ms: UnixMs,
+}
+
+/// A new switch; it starts in [`SwitchState::Preparing`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewSwitch {
+    pub kind: SwitchKind,
+    pub source: Option<VersionOrigin>,
+    pub from_version: Option<VersionNo>,
+    pub to_version: VersionNo,
+    pub created_by: Option<String>,
+}
+
+/// Fields of a switch to change; `None` keeps the stored value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SwitchPatch {
+    pub state: Option<SwitchState>,
+    pub from_version: Option<VersionNo>,
+    pub drain_deadline_ms: Option<UnixMs>,
+    /// `&'static` so that only a stable code fits, not formatted driver text.
+    pub error: Option<&'static str>,
 }
 
 /// Schedule definition.

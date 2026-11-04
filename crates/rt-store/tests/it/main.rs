@@ -36,6 +36,7 @@ mod reader_pool;
 mod sql_stmt_cache;
 mod sql_store;
 mod stream_store;
+mod switches;
 mod sync_sql;
 mod sync_sql_edges;
 mod version_gc;

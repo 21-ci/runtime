@@ -14,9 +14,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rt_types::{
     ApiKey, BuildFailure, BuildState, CompileMode, Digest, Etag, EventId, HostMapping, HostStatus, KeyId, NewKey,
-    NewProject, NewSchedule, NewService, NewTenant, NewVersion, NodeEvent, Profile, Project, ProjectId, ProjectPatch,
-    RouteEntry, RouteSnapshot, Schedule, ScheduleId, ScheduleKind, SecretsVersion, Service, ServiceConfig, ServiceId,
-    ServicePatch, Tenant, TenantId, UnixMs, UsageBatch, Version, VersionNo,
+    NewProject, NewSchedule, NewService, NewSwitch, NewTenant, NewVersion, NodeEvent, Profile, Project, ProjectId,
+    ProjectPatch, RouteEntry, RouteSnapshot, Schedule, ScheduleId, ScheduleKind, SecretsVersion, Service,
+    ServiceConfig, ServiceId, ServicePatch, Switch, SwitchId, SwitchKind, SwitchPatch, SwitchState, Tenant, TenantId,
+    UnixMs, UsageBatch, Version, VersionNo, VersionOrigin,
 };
 use rt_types::{
     GrantEffect, GrantScope, NewSdkRelease, Sdk, SdkChannel, SdkGrant, SdkRelease, SdkSnapshot, SdkState, SdkTarget,
@@ -30,7 +31,10 @@ use crate::sqlutil::{
 };
 
 /// Forward-only migrations: `(version, sql)`. The newest version is the schema version.
-pub const MIGRATIONS: &[(u32, &str)] = &[(1, include_str!("../migrations/meta_0001_init.sql"))];
+pub const MIGRATIONS: &[(u32, &str)] = &[
+    (1, include_str!("../migrations/meta_0001_init.sql")),
+    (2, include_str!("../migrations/meta_0002_switches.sql")),
+];
 
 /// Whose view a call has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -327,7 +331,45 @@ pub trait MetaStore: Send + Sync {
     /// Delete old versions beyond `keep` (never `live`); returns the artifact digests nothing
     /// references any more: sources, their `rt.lock`s, and the vendored modules of those locks
     /// that no remaining lock lists ([`MetaStore::record_lock_modules`]).
+    /// The `from_version` of the service's last 3 switches is kept too (rollback targets).
     async fn gc_versions(&self, id: ServiceId, keep: u32) -> Result<Vec<Digest>>;
+    /// Add to `parent` a version with the digests of `source`'s version, read here and never
+    /// taken from a caller. Reuses the row when that origin was already adopted. `NotFound` when
+    /// `source` is missing or in another tenant or project, `Conflict("version_not_ready")` unless
+    /// the source is `ready`, `Conflict("runtime_mismatch")` across runtimes.
+    // LCOV_EXCL_START: defaults for test wrappers of the trait; SqliteMetaStore overrides them all
+    async fn adopt_version(
+        &self,
+        _parent: ServiceId,
+        _source: ServiceId,
+        _source_version: VersionNo,
+    ) -> Result<Version> {
+        Err(StoreError::Invalid("adopt_version is not supported".into()))
+    }
+    /// Start a tracked flip in `preparing`. `NotFound` without the service or `to_version`,
+    /// `Conflict("switch_in_progress")` while another is `preparing` or `migrating`.
+    async fn create_switch(&self, _id: ServiceId, _s: NewSwitch) -> Result<Switch> {
+        Err(StoreError::Invalid("create_switch is not supported".into()))
+    }
+    /// `NotFound` unless the switch belongs to `id`.
+    async fn update_switch(&self, _id: ServiceId, _switch: SwitchId, _patch: SwitchPatch) -> Result<Switch> {
+        Err(StoreError::Invalid("update_switch is not supported".into()))
+    }
+    /// `None` unless the switch belongs to `id`.
+    async fn get_switch(&self, _id: ServiceId, _switch: SwitchId) -> Result<Option<Switch>> {
+        Err(StoreError::Invalid("get_switch is not supported".into()))
+    }
+    /// Newest first; the cursor is the last id returned.
+    async fn list_switches(&self, _id: ServiceId, _page: PageReq) -> Result<Page<Switch>> {
+        Err(StoreError::Invalid("list_switches is not supported".into()))
+    }
+    /// At startup, close what a crash left open: `preparing|migrating` become `failed` with
+    /// `error = interrupted`, `draining` becomes `completed`, both flagged `interrupted`. The live
+    /// version is not touched. Returns how many rows changed.
+    async fn recover_switches(&self) -> Result<u64> {
+        Err(StoreError::Invalid("recover_switches is not supported".into()))
+    }
+    // LCOV_EXCL_STOP
     /// True while any version (source or lock) or any recorded lock (module) still references
     /// `digest` (artifact refcount is computed live).
     async fn digest_referenced(&self, digest: &Digest) -> Result<bool>;
@@ -629,7 +671,81 @@ fn project_row(r: &Row<'_>) -> rusqlite::Result<Project> {
 }
 
 const VERSION_COLS: &str =
-    "service_id, number, source_digest, lock_digest, build_state, pending_reason, failure, created_at, bundle_digest";
+    "service_id, number, source_digest, lock_digest, build_state, pending_reason, failure, created_at, bundle_digest, origin";
+
+const SWITCH_COLS: &str = "id, service_id, kind, state, source_service, source_version, from_version, to_version, \
+     error, interrupted, drain_deadline, created_by, created_at, updated_at";
+
+fn switch_kind_str(k: SwitchKind) -> &'static str {
+    match k {
+        SwitchKind::Promote => "promote",
+        SwitchKind::Switch => "switch",
+        SwitchKind::Rollback => "rollback",
+    }
+}
+
+fn switch_state_str(s: SwitchState) -> &'static str {
+    match s {
+        SwitchState::Preparing => "preparing",
+        SwitchState::Migrating => "migrating",
+        SwitchState::Draining => "draining",
+        SwitchState::Completed => "completed",
+        SwitchState::DrainTimedOut => "drain_timed_out",
+        SwitchState::Failed => "failed",
+    }
+}
+
+fn switch_row(r: &Row<'_>) -> rusqlite::Result<Switch> {
+    let kind = match r.get::<_, String>(2)?.as_str() {
+        "promote" => SwitchKind::Promote,
+        "switch" => SwitchKind::Switch,
+        "rollback" => SwitchKind::Rollback,
+        // LCOV_EXCL_START: the column's CHECK admits only the names above
+        other => return Err(bad_col(2, format!("unknown switch kind `{other}`"))),
+        // LCOV_EXCL_STOP
+    };
+    let state = match r.get::<_, String>(3)?.as_str() {
+        "preparing" => SwitchState::Preparing,
+        "migrating" => SwitchState::Migrating,
+        "draining" => SwitchState::Draining,
+        "completed" => SwitchState::Completed,
+        "drain_timed_out" => SwitchState::DrainTimedOut,
+        "failed" => SwitchState::Failed,
+        // LCOV_EXCL_START: the column's CHECK admits only the names above
+        other => return Err(bad_col(3, format!("unknown switch state `{other}`"))),
+        // LCOV_EXCL_STOP
+    };
+    let source = match (r.get::<_, Option<String>>(4)?, r.get::<_, Option<i64>>(5)?) {
+        (Some(service), Some(version)) => Some(VersionOrigin {
+            service: parse_col(&service, 4)?,
+            version: VersionNo(version as u32),
+        }),
+        _ => None,
+    };
+    Ok(Switch {
+        id: parse_col(&r.get::<_, String>(0)?, 0)?,
+        service_id: parse_col(&r.get::<_, String>(1)?, 1)?,
+        kind,
+        state,
+        source,
+        from_version: r.get::<_, Option<i64>>(6)?.map(|v| VersionNo(v as u32)),
+        to_version: VersionNo(r.get::<_, i64>(7)? as u32),
+        error: r.get(8)?,
+        interrupted: r.get::<_, i64>(9)? != 0,
+        drain_deadline_ms: r.get(10)?,
+        created_by: r.get(11)?,
+        created_at_ms: r.get(12)?,
+        updated_at_ms: r.get(13)?,
+    })
+}
+
+fn active_switch_conflict(e: rusqlite::Error) -> StoreError {
+    if is_unique_violation(&e) {
+        StoreError::Conflict("switch_in_progress")
+    } else {
+        e.into() // LCOV_EXCL_LINE: a constraint other than the active index cannot fail on these rows
+    }
+}
 
 fn state_str(s: BuildState) -> &'static str {
     match s {
@@ -669,6 +785,10 @@ fn version_row(r: &Row<'_>) -> rusqlite::Result<Version> {
         bundle_digest: r
             .get::<_, Option<String>>(8)?
             .map(|d| parse_col::<Digest>(&d, 8))
+            .transpose()?,
+        origin: r
+            .get::<_, Option<String>>(9)?
+            .map(|o| json_col::<VersionOrigin>(&o, 9))
             .transpose()?,
     })
 }
@@ -1786,7 +1906,225 @@ impl MetaStore for SqliteMetaStore {
                 failure: None,
                 created_at_ms: now,
                 bundle_digest: None,
+                origin: None,
             })
+        })
+        .await
+    }
+
+    async fn adopt_version(&self, parent: ServiceId, source: ServiceId, source_version: VersionNo) -> Result<Version> {
+        self.write(move |c| {
+            if parent == source {
+                return Err(StoreError::Invalid("a service cannot adopt its own version".into()));
+            }
+            let to = require_service(c, parent)?;
+            let from = require_service(c, source)?;
+            // Callers load both through their key's scope; this holds even if one forgets.
+            if to.tenant_id != from.tenant_id || to.project_id != from.project_id {
+                return Err(StoreError::NotFound);
+            }
+            if to.runtime != from.runtime {
+                return Err(StoreError::Conflict("runtime_mismatch"));
+            }
+            let src = c
+                .prepare_cached(&format!(
+                    "SELECT {VERSION_COLS} FROM versions WHERE service_id = ?1 AND number = ?2"
+                ))?
+                .query_row(params![source.to_string(), source_version.0], version_row)
+                .optional()?
+                .ok_or(StoreError::NotFound)?;
+            if src.build_state != BuildState::Ready {
+                return Err(StoreError::Conflict("version_not_ready"));
+            }
+            let key = parent.to_string();
+            let existing = c
+                .prepare_cached(&format!(
+                    "SELECT {VERSION_COLS} FROM versions WHERE service_id = ?1 \
+                     AND json_extract(origin, '$.service') = ?2 AND json_extract(origin, '$.version') = ?3 \
+                     ORDER BY number DESC LIMIT 1"
+                ))?
+                .query_row(params![key, source.to_string(), source_version.0], version_row)
+                .optional()?;
+            if let Some(v) = existing {
+                return Ok(v);
+            }
+            let number: i64 = c.query_row(
+                "SELECT COALESCE(MAX(number), 0) + 1 FROM versions WHERE service_id = ?1",
+                [&key],
+                |r| r.get(0),
+            )?;
+            let now = now_ms();
+            let origin = VersionOrigin {
+                service: source,
+                version: source_version,
+            };
+            c.execute(
+                "INSERT INTO versions (service_id, number, source_digest, lock_digest, bundle_digest, build_state, created_at, origin) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'ready', ?6, ?7)",
+                params![
+                    key,
+                    number,
+                    src.source_digest.to_string(),
+                    src.lock_digest.map(|d| d.to_string()),
+                    src.bundle_digest.map(|d| d.to_string()),
+                    now,
+                    to_json(&origin)?,
+                ],
+            )?;
+            Ok(Version {
+                service_id: parent,
+                number: VersionNo(number as u32),
+                pending_reason: None,
+                failure: None,
+                created_at_ms: now,
+                origin: Some(origin),
+                ..src
+            })
+        })
+        .await
+    }
+
+    async fn create_switch(&self, id: ServiceId, s: NewSwitch) -> Result<Switch> {
+        self.write(move |c| {
+            require_service(c, id)?;
+            let key = id.to_string();
+            let target: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM versions WHERE service_id = ?1 AND number = ?2)",
+                params![key, s.to_version.0],
+                |r| r.get(0),
+            )?;
+            if !target {
+                return Err(StoreError::NotFound);
+            }
+            // Strictly increasing per service: "the last 3" and paging order by id, and two ULIDs
+            // of one millisecond are in random order.
+            let last: Option<String> = c.query_row(
+                "SELECT MAX(id) FROM version_switches WHERE service_id = ?1",
+                [&key],
+                |r| r.get(0),
+            )?;
+            let mut switch = SwitchId::new();
+            if let Some(last) = last {
+                let last: SwitchId = parse_col(&last, 0)?;
+                if last >= switch {
+                    // LCOV_EXCL_START: overflow needs the largest possible ULID
+                    let next = last
+                        .ulid()
+                        .increment()
+                        .ok_or(StoreError::Conflict("switch_in_progress"))?;
+                    // LCOV_EXCL_STOP
+                    switch = SwitchId::from_ulid(next);
+                }
+            }
+            let now = now_ms();
+            c.execute(
+                "INSERT INTO version_switches (id, service_id, kind, state, source_service, source_version, \
+                 from_version, to_version, created_by, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, 'preparing', ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                params![
+                    switch.to_string(),
+                    key,
+                    switch_kind_str(s.kind),
+                    s.source.map(|o| o.service.to_string()),
+                    s.source.map(|o| o.version.0),
+                    s.from_version.map(|v| v.0),
+                    s.to_version.0,
+                    s.created_by,
+                    now,
+                ],
+            )
+            .map_err(active_switch_conflict)?;
+            Ok(Switch {
+                id: switch,
+                service_id: id,
+                kind: s.kind,
+                state: SwitchState::Preparing,
+                source: s.source,
+                from_version: s.from_version,
+                to_version: s.to_version,
+                error: None,
+                interrupted: false,
+                drain_deadline_ms: None,
+                created_by: s.created_by,
+                created_at_ms: now,
+                updated_at_ms: now,
+            })
+        })
+        .await
+    }
+
+    async fn update_switch(&self, id: ServiceId, switch: SwitchId, patch: SwitchPatch) -> Result<Switch> {
+        self.write(move |c| {
+            let changed = c
+                .execute(
+                    "UPDATE version_switches SET state = COALESCE(?3, state), from_version = COALESCE(?4, from_version), \
+                     drain_deadline = COALESCE(?5, drain_deadline), error = COALESCE(?6, error), updated_at = ?7 \
+                     WHERE id = ?1 AND service_id = ?2",
+                    params![
+                        switch.to_string(),
+                        id.to_string(),
+                        patch.state.map(switch_state_str),
+                        patch.from_version.map(|v| v.0),
+                        patch.drain_deadline_ms,
+                        patch.error,
+                        now_ms(),
+                    ],
+                )
+                .map_err(active_switch_conflict)?;
+            if changed == 0 {
+                return Err(StoreError::NotFound);
+            }
+            Ok(c.query_row(
+                &format!("SELECT {SWITCH_COLS} FROM version_switches WHERE id = ?1"),
+                [switch.to_string()],
+                switch_row,
+            )?)
+        })
+        .await
+    }
+
+    async fn get_switch(&self, id: ServiceId, switch: SwitchId) -> Result<Option<Switch>> {
+        self.db
+            .read(move |c| {
+                Ok(c.prepare_cached(&format!(
+                    "SELECT {SWITCH_COLS} FROM version_switches WHERE id = ?1 AND service_id = ?2"
+                ))?
+                .query_row(params![switch.to_string(), id.to_string()], switch_row)
+                .optional()?)
+            })
+            .await
+    }
+
+    async fn list_switches(&self, id: ServiceId, page: PageReq) -> Result<Page<Switch>> {
+        self.db
+            .read(move |c| {
+                let limit = page_limit(page.limit);
+                let rows = c
+                    .prepare_cached(&format!(
+                        "SELECT {SWITCH_COLS} FROM version_switches WHERE service_id = ?1 \
+                         AND (?2 IS NULL OR id < ?2) ORDER BY id DESC LIMIT ?3"
+                    ))?
+                    .query_map(params![id.to_string(), page.cursor, limit as i64 + 1], switch_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(paginate(rows, limit, |s| s.id.to_string()))
+            })
+            .await
+    }
+
+    async fn recover_switches(&self) -> Result<u64> {
+        self.write(move |c| {
+            let now = now_ms();
+            let failed = c.execute(
+                "UPDATE version_switches SET state = 'failed', error = 'interrupted', interrupted = 1, updated_at = ?1 \
+                 WHERE state IN ('preparing', 'migrating')",
+                [now],
+            )?;
+            let drained = c.execute(
+                "UPDATE version_switches SET state = 'completed', interrupted = 1, updated_at = ?1 \
+                 WHERE state = 'draining'",
+                [now],
+            )?;
+            Ok((failed + drained) as u64)
         })
         .await
     }
@@ -1909,11 +2247,14 @@ impl MetaStore for SqliteMetaStore {
             let live: Option<i64> = c
                 .query_row("SELECT number FROM versions WHERE service_id = ?1 AND is_live = 1", [&key], |r| r.get(0))
                 .optional()?;
-            // Everything except the live version and the newest `keep` versions goes.
+            // Everything except the live version, the newest `keep` versions and the rollback
+            // targets of the last 3 switches goes.
             let doomed: Vec<(i64, String, Option<String>)> = c
                 .prepare(
                     "SELECT number, source_digest, lock_digest FROM versions WHERE service_id = ?1 \
                      AND number NOT IN (SELECT number FROM versions WHERE service_id = ?1 ORDER BY number DESC LIMIT ?2) \
+                     AND number NOT IN (SELECT from_version FROM version_switches \
+                                        WHERE service_id = ?1 AND from_version IS NOT NULL ORDER BY id DESC LIMIT 3) \
                      AND (?3 IS NULL OR number != ?3)",
                 )?
                 .query_map(params![key, i64::from(keep), live], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?

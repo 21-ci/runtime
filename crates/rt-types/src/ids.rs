@@ -147,6 +147,10 @@ prefixed_ulid!(
     /// Async invocation (`inv_…`).
     InvocationId, "inv"
 );
+prefixed_ulid!(
+    /// Tracked flip of a service's live version (`swt_…`).
+    SwitchId, "swt"
+);
 
 /// Node-local monotonic task identifier. Rendered as `task_<16 hex>`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
