@@ -32,8 +32,8 @@ use rt_types::{
     Access, BuildState, CallAccess, CompileMode, DegradationMode, DenoServiceConfig, Digest, EgressRules, Etag,
     HostMapping, HostStatus, IngressRules, LimitsConfig, NewSchedule, NewService, NewTenant, NewVersion, Plan, Profile,
     ProjectId, RuntimeKind, ScalingConfig, Schedule, ScheduleId, ScheduleKind, Scope, Scopes, Service, ServiceConfig,
-    ServiceId, ServicePatch, TaskId, TaskKind, TenantId, TriggerKind, TriggerSwitches, ValidationError, Version,
-    VersionNo, WasmServiceConfig, WsServiceConfig,
+    ServiceId, ServicePatch, Switch, SwitchId, SwitchKind, SwitchState, TaskId, TaskKind, TenantId, TriggerKind,
+    TriggerSwitches, ValidationError, Version, VersionNo, VersionOrigin, WasmServiceConfig, WsServiceConfig,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -2251,6 +2251,398 @@ async fn services_set_live(
     Ok(json_resp(status, &view))
 }
 
+// ---- switch --------------------------------------------------------------------------------
+
+/// The serialized name of a switch's kind or state.
+fn wire_name<T: serde::Serialize>(v: T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn is_system_service(svc: &Service) -> bool {
+    rt_types::is_system_tenant(svc.tenant_id) || svc.slug.starts_with(rt_types::SYSTEM_SLUG_PREFIX)
+}
+
+/// The parent of a switch: `403 reserved` for system services.
+fn not_system_parent(svc: &Service) -> Result<(), ApiError> {
+    if is_system_service(svc) {
+        return Err(ApiError::new("reserved", "system services are not switched"));
+    }
+    Ok(())
+}
+
+fn valid_branch_name(n: &str) -> bool {
+    let b = n.as_bytes();
+    (1..=24).contains(&b.len())
+        && b[0].is_ascii_lowercase()
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+/// `<parent-slug>-br-<name>`, if the caller may see it. `404` otherwise, like any source.
+async fn load_branch(s: &ApiState, a: &Auth, parent: &Service, name: &str) -> Result<Service, ApiError> {
+    if !valid_branch_name(name) {
+        return Err(ApiError::new(
+            "branch_name_invalid",
+            "a branch name matches ^[a-z][a-z0-9-]{0,23}$",
+        ));
+    }
+    let filter = ServiceFilter {
+        slug: Some(format!("{}-br-{name}", parent.slug)),
+        ..ServiceFilter::default()
+    };
+    let page = s
+        .meta
+        .list_services(TenantScope::Tenant(parent.tenant_id), filter, page_req(Some(1), None))
+        .await?;
+    let found = page.items.first().ok_or_else(ApiError::not_found)?;
+    load_service(s, a, &found.id.to_string()).await
+}
+
+/// Which service and version a switch takes. Refusals follow §5 step 1; another service is held to
+/// the key's scope by `load_service`, and to the parent's tenant and project here.
+async fn switch_source(
+    s: &ApiState,
+    a: &Auth,
+    svc: &Service,
+    from: &SwitchFrom,
+) -> Result<(Service, Version), ApiError> {
+    let (source, number) = match from {
+        SwitchFrom::Version { version } => (svc.clone(), Some(VersionNo(*version))),
+        SwitchFrom::Service { service, version } => {
+            a.require_scope(Scope::ServicesRead)?;
+            (load_service(s, a, service).await?, version.map(VersionNo))
+        }
+        SwitchFrom::Branch { branch } => {
+            a.require_scope(Scope::ServicesRead)?;
+            (load_branch(s, a, svc, branch).await?, None)
+        }
+    };
+    if source.id != svc.id {
+        if source.tenant_id != svc.tenant_id || source.project_id != svc.project_id {
+            return Err(ApiError::not_found());
+        }
+        if is_system_service(&source) {
+            return Err(ApiError::new(
+                "scratch_source_reserved",
+                "a system service cannot be the source of a switch",
+            ));
+        }
+        if source.runtime != svc.runtime {
+            return Err(ApiError::new("runtime_mismatch", "the source has another runtime"));
+        }
+    }
+    let number = number
+        .or(source.live_version)
+        .ok_or_else(|| ApiError::new("version_not_ready", "the source has no live version"))?;
+    let version = s
+        .meta
+        .get_version(source.id, number)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    if version.build_state != BuildState::Ready {
+        return Err(ApiError::new("version_not_ready", "the version is not built"));
+    }
+    Ok((source, version))
+}
+
+/// What a switch from `source` will not bring along. Names only.
+async fn switch_warnings(s: &ApiState, svc: &Service, source: &Service) -> Result<Vec<SwitchWarning>, ApiError> {
+    if source.id == svc.id {
+        return Ok(Vec::new());
+    }
+    let mut warnings = Vec::new();
+    let names = |env: Vec<(String, String)>, secrets: Vec<rt_store::SecretMeta>| {
+        env.into_iter()
+            .map(|(k, _)| k)
+            .chain(secrets.into_iter().map(|m| m.name))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let have = names(s.meta.get_env(svc.id).await?, s.meta.list_secrets(svc.id).await?);
+    let want = names(s.meta.get_env(source.id).await?, s.meta.list_secrets(source.id).await?);
+    let missing: Vec<String> = want.difference(&have).cloned().collect();
+    if !missing.is_empty() {
+        warnings.push(SwitchWarning {
+            code: "env_missing_on_parent".to_string(),
+            names: missing,
+        });
+    }
+    let fields = |t: &TriggerSwitches| serde_json::to_value(t).unwrap_or(Value::Null);
+    let (ours, theirs) = (fields(&svc.config.triggers), fields(&source.config.triggers));
+    let differ: Vec<String> = ours
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, v)| theirs.get(k.as_str()) != Some(v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    if !differ.is_empty() {
+        warnings.push(SwitchWarning {
+            code: "triggers_differ".to_string(),
+            names: differ,
+        });
+    }
+    Ok(warnings)
+}
+
+/// `versions` are the service's own: an adopted version has the digest of its source.
+fn switch_view(s: &ApiState, sw: &Switch, versions: &[Version]) -> SwitchView {
+    let inflight_old = match (sw.state, sw.from_version) {
+        (SwitchState::Draining, Some(from)) => s.scheduler.inflight_known(sw.service_id, from.0).unwrap_or(0),
+        _ => 0,
+    };
+    let digest = versions
+        .iter()
+        .find(|v| v.number == sw.to_version)
+        .map(|v| v.source_digest.to_string());
+    SwitchView {
+        id: Some(sw.id.to_string()),
+        service: sw.service_id.to_string(),
+        kind: wire_name(sw.kind),
+        state: wire_name(sw.state),
+        from_version: sw.from_version.map(|v| v.0),
+        to_version: Some(sw.to_version.0),
+        source: sw.source.map(|o| SwitchSourceView {
+            service: o.service.to_string(),
+            version: o.version.0,
+            digest,
+        }),
+        inflight_old,
+        drain_deadline: sw.drain_deadline_ms,
+        interrupted: sw.interrupted,
+        error: sw.error.clone(),
+        warnings: Vec::new(),
+        dry_run: false,
+        created_at: sw.created_at_ms,
+        updated_at: sw.updated_at_ms,
+    }
+}
+
+/// What `svc` is expected to look like; refused before anything is written.
+fn check_if_match(svc: &Service, h: &HeaderMap) -> Result<Option<Etag>, ApiError> {
+    let want = if_match(h)?;
+    if want.is_some_and(|e| e != svc.etag) {
+        return Err(StoreError::PreconditionFailed.into());
+    }
+    Ok(want)
+}
+
+/// Move a version of another service (or of this one) to live: by digest, tracked, drained. The
+/// digest comes from the source's row; the body has no field for one.
+#[utoipa::path(post, path = "/v1/services/{s}/switch", tag = "services", request_body = SwitchBody,
+    params(("s" = String, Path, description = "service id")),
+    responses((status = 200, description = "`dry_run`: nothing was written", body = SwitchView),
+        (status = 202, body = SwitchView),
+        (status = 403, body = ErrorEnvelope), (status = 404, body = ErrorEnvelope), (status = 409, body = ErrorEnvelope),
+        (status = 412, body = ErrorEnvelope), (status = 422, body = ErrorEnvelope)))]
+async fn services_switch(
+    State(s): State<ApiState>,
+    a: Auth,
+    Path(id): Path<String>,
+    h: HeaderMap,
+    ApiJson(b): ApiJson<SwitchBody>,
+) -> Result<Response, ApiError> {
+    a.require_scope(Scope::Deploy)?;
+    let etag = h.get(header::IF_MATCH).map(HeaderValue::as_bytes).unwrap_or_default();
+    let fp = fingerprint(&[b"switch", id.as_bytes(), etag, format!("{b:?}").as_bytes()]);
+    let (replay, _idem_turn) = idem_replay(&s, &a, &h, fp).await?;
+    if let Some(resp) = replay {
+        return Ok(resp);
+    }
+    a.tenant()?;
+    let svc = load_service(&s, &a, &id).await?;
+    not_system_parent(&svc)?;
+    let want = check_if_match(&svc, &h)?;
+    if b.drain_timeout.is_some_and(|d| d.is_zero()) {
+        return Err(ApiError::invalid("`drain_timeout` must be more than zero"));
+    }
+    let (source, version) = switch_source(&s, &a, &svc, &b.from).await?;
+    if svc.config.durable && svc.runtime == RuntimeKind::Wasm {
+        check_version_socket_handler(&s, &source, version.number).await?;
+    }
+    let mut warnings = switch_warnings(&s, &svc, &source).await?;
+    let origin = (source.id != svc.id).then_some(VersionOrigin {
+        service: source.id,
+        version: version.number,
+    });
+    let digest = version.source_digest.to_string();
+
+    if b.dry_run {
+        let versions = s.meta.list_versions(svc.id).await?;
+        let to = match origin {
+            Some(o) => versions.iter().rev().find(|v| v.origin == Some(o)).map(|v| v.number.0),
+            None => Some(version.number.0),
+        };
+        let now = s.clock.unix_ms();
+        let view = SwitchView {
+            id: None,
+            service: svc.id.to_string(),
+            kind: wire_name(SwitchKind::Switch),
+            state: wire_name(SwitchState::Preparing),
+            from_version: svc.live_version.map(|v| v.0),
+            to_version: to,
+            source: origin.map(|o| SwitchSourceView {
+                service: o.service.to_string(),
+                version: o.version.0,
+                digest: Some(digest),
+            }),
+            inflight_old: svc
+                .live_version
+                .and_then(|v| s.scheduler.inflight_known(svc.id, v.0))
+                .unwrap_or(0),
+            drain_deadline: None,
+            interrupted: false,
+            error: None,
+            warnings,
+            dry_run: true,
+            created_at: now,
+            updated_at: now,
+        };
+        return Ok(json_resp(StatusCode::OK, &view));
+    }
+
+    let req = match origin {
+        Some(o) => PromoteReq::adopt(o),
+        None => PromoteReq::new(version.number).kind(SwitchKind::Switch),
+    };
+    let req = req
+        .if_match(want)
+        .by(switch_actor(&a))
+        .no_wait()
+        .drain_timeout(b.drain_timeout);
+    let done = s.promoter.promote(&svc, req).await?;
+    let closed = if b.close_sockets {
+        s.sockets.close_service(svc.id, None, None, 1012, "service restart")
+    } else {
+        0
+    };
+    audit(
+        &s,
+        &a,
+        "switch",
+        Some(svc.tenant_id),
+        Some(svc.id),
+        json!({
+            "switch": done.switch.id.to_string(),
+            "from": done.switch.from_version.map(|v| v.0),
+            "to": done.switch.to_version.0,
+            "source_service": origin.map(|o| o.service.to_string()),
+            "source_version": version.number.0,
+            "digest": digest,
+            // No version records its commit yet; the key is here for when one does.
+            "git_sha": Value::Null,
+            "sockets_closed": closed,
+        }),
+    );
+    warnings.extend(done.warnings);
+    // From its commit on the flip must not fail: a failed read costs the digest, not the answer.
+    let versions = s.meta.list_versions(svc.id).await.unwrap_or_default();
+    let mut view = switch_view(&s, &done.switch, &versions);
+    if let Some(source) = view.source.as_mut() {
+        source.digest = Some(digest);
+    }
+    view.warnings = warnings;
+    let value = serde_json::to_value(&view).unwrap_or(Value::Null);
+    idem_store(&s, &a, &h, fp, StatusCode::ACCEPTED, &value);
+    Ok(value_resp(StatusCode::ACCEPTED, &value))
+}
+
+/// Newest first.
+#[utoipa::path(get, path = "/v1/services/{s}/switches", tag = "services",
+    params(("s" = String, Path, description = "service id"), PageQuery),
+    responses((status = 200, body = SwitchPage), (status = 404, body = ErrorEnvelope)))]
+async fn switches_list(
+    State(s): State<ApiState>,
+    a: Auth,
+    Path(id): Path<String>,
+    ApiQuery(q): ApiQuery<PageQuery>,
+) -> R<SwitchPage> {
+    a.require_scope(Scope::ServicesRead)?;
+    let svc = load_service(&s, &a, &id).await?;
+    let page = s.meta.list_switches(svc.id, page_req(q.limit, q.cursor)).await?;
+    let versions = s.meta.list_versions(svc.id).await?;
+    Ok(Json(SwitchPage {
+        items: page.items.iter().map(|sw| switch_view(&s, sw, &versions)).collect(),
+        next_cursor: page.next_cursor,
+    }))
+}
+
+async fn load_switch(s: &ApiState, svc: &Service, id: &str) -> Result<Switch, ApiError> {
+    let id: SwitchId = id.parse().map_err(|_| ApiError::not_found())?;
+    s.meta.get_switch(svc.id, id).await?.ok_or_else(ApiError::not_found)
+}
+
+#[utoipa::path(get, path = "/v1/services/{s}/switches/{id}", tag = "services",
+    params(("s" = String, Path, description = "service id"), ("id" = String, Path, description = "switch id")),
+    responses((status = 200, body = SwitchView), (status = 404, body = ErrorEnvelope)))]
+async fn switches_get(State(s): State<ApiState>, a: Auth, Path((id, sw)): Path<(String, String)>) -> R<SwitchView> {
+    a.require_scope(Scope::ServicesRead)?;
+    let svc = load_service(&s, &a, &id).await?;
+    let row = load_switch(&s, &svc, &sw).await?;
+    let versions = s.meta.list_versions(svc.id).await?;
+    Ok(Json(switch_view(&s, &row, &versions)))
+}
+
+/// Go back to what this switch replaced, as a new switch of kind `rollback`. Data written by the
+/// new version stays.
+#[utoipa::path(post, path = "/v1/services/{s}/switches/{id}/rollback", tag = "services",
+    params(("s" = String, Path, description = "service id"), ("id" = String, Path, description = "switch id")),
+    responses((status = 202, body = SwitchView), (status = 403, body = ErrorEnvelope), (status = 404, body = ErrorEnvelope),
+        (status = 409, body = ErrorEnvelope), (status = 412, body = ErrorEnvelope)))]
+async fn switches_rollback(
+    State(s): State<ApiState>,
+    a: Auth,
+    Path((id, sw)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Result<Response, ApiError> {
+    a.require_scope(Scope::Deploy)?;
+    let etag = h.get(header::IF_MATCH).map(HeaderValue::as_bytes).unwrap_or_default();
+    let fp = fingerprint(&[b"switch-rollback", id.as_bytes(), sw.as_bytes(), etag]);
+    let (replay, _idem_turn) = idem_replay(&s, &a, &h, fp).await?;
+    if let Some(resp) = replay {
+        return Ok(resp);
+    }
+    a.tenant()?;
+    let svc = load_service(&s, &a, &id).await?;
+    not_system_parent(&svc)?;
+    let want = check_if_match(&svc, &h)?;
+    let row = load_switch(&s, &svc, &sw).await?;
+    let gone = || ApiError::new("rollback_target_gone", "the version before this switch is gone");
+    let target = row.from_version.ok_or_else(gone)?;
+    let version = s.meta.get_version(svc.id, target).await?.ok_or_else(gone)?;
+    if svc.config.durable && svc.runtime == RuntimeKind::Wasm {
+        check_version_socket_handler(&s, &svc, target).await?;
+    }
+    let req = PromoteReq::new(target)
+        .kind(SwitchKind::Rollback)
+        .if_match(want)
+        .by(switch_actor(&a))
+        .no_wait();
+    let done = s.promoter.promote(&svc, req).await?;
+    audit(
+        &s,
+        &a,
+        "rollback",
+        Some(svc.tenant_id),
+        Some(svc.id),
+        json!({
+            "switch": row.id.to_string(),
+            "rollback": done.switch.id.to_string(),
+            "from": done.switch.from_version.map(|v| v.0),
+            "to": target.0,
+            "digest": version.source_digest.to_string(),
+            "git_sha": Value::Null,
+        }),
+    );
+    let mut view = switch_view(&s, &done.switch, &[]);
+    view.warnings = done.warnings;
+    let value = serde_json::to_value(&view).unwrap_or(Value::Null);
+    idem_store(&s, &a, &h, fp, StatusCode::ACCEPTED, &value);
+    Ok(value_resp(StatusCode::ACCEPTED, &value))
+}
+
 // ---- env, secrets, hosts ---------------------------------------------------------------------
 
 #[utoipa::path(get, path = "/v1/services/{s}/env", tag = "env", params(("s" = String, Path, description = "service id")),
@@ -3114,7 +3506,7 @@ async fn data_export(State(s): State<ApiState>, a: Auth, Path(id): Path<String>)
         crate::projects::projects_patch, crate::projects::projects_delete, crate::projects::environments_get,
         services_create, services_list, services_get, services_patch, services_delete,
         versions_upload, versions_list, versions_get, versions_source, versions_rebuild, versions_build_logs, services_types,
-        services_set_live,
+        services_set_live, services_switch, switches_list, switches_get, switches_rollback,
         env_get, env_put, secrets_list, secrets_put, secrets_delete,
         hosts_list, hosts_get, hosts_put, hosts_delete,
         schedules_list, schedules_once_list, schedules_create, schedules_patch, schedules_delete,
@@ -3136,7 +3528,7 @@ async fn data_export(State(s): State<ApiState>, a: Auth, Path(id): Path<String>)
         CreateKeyBody, CreateTokenBody, KeyView, KeyCreated,
         CreateProjectBody, PatchProjectBody, ProjectView, ProjectPage, EnvironmentsView, LimitsView, QuotaView,
         CreateServiceBody, PatchServiceBody, ServiceStatus, AdmissionView, ServiceView, ServicePage,
-        VersionView, SetLiveBody, EnvMap, PutSecretBody, SecretNameView, HostView,
+        VersionView, SetLiveBody, SwitchBody, SwitchFrom, SwitchView, SwitchSourceView, SwitchWarning, SwitchPage, EnvMap, PutSecretBody, SecretNameView, HostView,
         ScheduleBody, ScheduleView, OnceScheduleView, OncePage, EnqueueBody, Enqueued, QueueStatsView, Redriven,
         LogView, LogsPage, EventView, EventsPage,
     )),
@@ -3281,6 +3673,10 @@ pub fn control_router(state: ApiState) -> Router {
         .route("/v1/services/{s}/types", get(services_types))
         .route("/v1/services/{s}/versions/{v}/build/logs", get(versions_build_logs))
         .route("/v1/services/{s}/live", put(services_set_live))
+        .route("/v1/services/{s}/switch", post(services_switch))
+        .route("/v1/services/{s}/switches", get(switches_list))
+        .route("/v1/services/{s}/switches/{id}", get(switches_get))
+        .route("/v1/services/{s}/switches/{id}/rollback", post(switches_rollback))
         .route("/v1/services/{s}/env", get(env_get).put(env_put))
         .route("/v1/services/{s}/secrets", get(secrets_list))
         .route(

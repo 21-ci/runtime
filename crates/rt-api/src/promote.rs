@@ -58,22 +58,59 @@ pub trait RouteRefresh: Send + Sync {
 /// One flip to ask for.
 #[derive(Clone, Debug)]
 pub struct PromoteReq {
-    pub to: VersionNo,
+    pub target: PromoteTarget,
     pub kind: SwitchKind,
-    pub source: Option<VersionOrigin>,
     pub if_match: Option<Etag>,
     pub created_by: Option<String>,
+    /// Answer `switch_in_progress` instead of waiting for a flip of this service that is running.
+    pub no_wait: bool,
+    /// Wait this long for the previous version instead of the longest a task can take.
+    pub drain_timeout: Option<Duration>,
+}
+
+/// The version to make live.
+#[derive(Clone, Copy, Debug)]
+pub enum PromoteTarget {
+    /// One of the service's own.
+    Version(VersionNo),
+    /// A version of another service, adopted by digest first, inside the lock.
+    Adopt(VersionOrigin),
 }
 
 impl PromoteReq {
     pub fn new(to: VersionNo) -> Self {
         Self {
-            to,
+            target: PromoteTarget::Version(to),
             kind: SwitchKind::Promote,
-            source: None,
             if_match: None,
             created_by: None,
+            no_wait: false,
+            drain_timeout: None,
         }
+    }
+
+    /// Adopt `origin` and flip to it, tracked as a switch.
+    pub fn adopt(origin: VersionOrigin) -> Self {
+        Self {
+            target: PromoteTarget::Adopt(origin),
+            kind: SwitchKind::Switch,
+            ..Self::new(VersionNo(0))
+        }
+    }
+
+    pub fn kind(mut self, kind: SwitchKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub fn no_wait(mut self) -> Self {
+        self.no_wait = true;
+        self
+    }
+
+    pub fn drain_timeout(mut self, wait: Option<Duration>) -> Self {
+        self.drain_timeout = wait;
+        self
     }
 
     pub fn if_match(mut self, etag: Option<Etag>) -> Self {
@@ -112,8 +149,18 @@ struct ActiveDrain {
     task: AbortHandle,
 }
 
-/// Behind the per-service lock: at most a few, one per flip while old tasks run.
-type Slot = Arc<tokio::sync::Mutex<Vec<ActiveDrain>>>;
+/// The locks of one service.
+///
+/// `flip` is held by a flip from before adoption until it returns. `drains` is at most a few
+/// entries, one per flip while old tasks run; the drain tasks take only this one, so a drain ending
+/// never looks like a flip in progress.
+#[derive(Default)]
+struct ServiceLocks {
+    flip: tokio::sync::Mutex<()>,
+    drains: tokio::sync::Mutex<Vec<ActiveDrain>>,
+}
+
+type Slot = Arc<ServiceLocks>;
 
 /// Flips live versions; one per node.
 pub struct Promoter {
@@ -163,7 +210,7 @@ impl Promoter {
     }
 
     /// The longest the previous version's tasks can take, from now.
-    fn drain_deadline(&self, svc: &Service) -> UnixMs {
+    fn drain_deadline(&self, svc: &Service, asked: Option<Duration>) -> UnixMs {
         let plan = self.deps.plans.plan_for(svc.tenant_id);
         let eff = self
             .deps
@@ -171,7 +218,9 @@ impl Promoter {
             .load()
             .service_effective(svc.profile, &svc.config, &plan);
         let longest = eff.wall_ms.value.max(eff.queue_timeout.value.as_millis() as u64);
-        let wait = longest.saturating_add(DRAIN_MARGIN_MS).min(DRAIN_MAX_MS);
+        let wait = asked
+            .map_or(longest.saturating_add(DRAIN_MARGIN_MS), |d| d.as_millis() as u64)
+            .min(DRAIN_MAX_MS);
         self.deps.clock.unix_ms().saturating_add(wait as i64)
     }
 
@@ -179,12 +228,32 @@ impl Promoter {
     /// failing comes back as a warning, because the flip already happened.
     pub async fn promote(&self, svc: &Service, req: PromoteReq) -> Result<Promoted, ApiError> {
         let slot = self.slot(svc.id);
-        let mut drains = slot.lock().await;
+        let _flip = if req.no_wait {
+            slot.flip
+                .try_lock()
+                .map_err(|_| ApiError::new("switch_in_progress", "another switch of this service is running"))?
+        } else {
+            slot.flip.lock().await
+        };
+        // Adoption first: the row names the adopted number. Reused per origin, so a flip refused
+        // below leaves a version the next attempt takes.
+        let (to, source) = match req.target {
+            PromoteTarget::Version(v) => (v, None),
+            PromoteTarget::Adopt(origin) => {
+                let adopted = self
+                    .deps
+                    .meta
+                    .adopt_version(svc.id, origin.service, origin.version)
+                    .await?;
+                (adopted.number, Some(origin))
+            }
+        };
+        let mut drains = slot.drains.lock().await;
         let new = NewSwitch {
             kind: req.kind,
-            source: req.source,
+            source,
             from_version: None, // written by the flip, with what was really live
-            to_version: req.to,
+            to_version: to,
             created_by: req.created_by,
         };
         let row = match self.deps.meta.create_switch(svc.id, new.clone()).await {
@@ -196,7 +265,7 @@ impl Promoter {
         };
         self.emit("service.switch.started", svc.tenant_id, svc.id, &row);
 
-        let deadline = self.drain_deadline(svc);
+        let deadline = self.drain_deadline(svc, req.drain_timeout);
         let (service, mut switch) = match self.deps.meta.flip_switch(svc.id, row.id, req.if_match, deadline).await {
             Ok(done) => done,
             Err(e) => return Err(self.flip_failed(svc, row, e).await),
@@ -204,7 +273,7 @@ impl Promoter {
         self.emit("service.switch.flipped", svc.tenant_id, svc.id, &switch);
 
         // The target is live again: a drain waiting for it can never end, and is moot.
-        for d in drains.iter().filter(|d| d.from == req.to) {
+        for d in drains.iter().filter(|d| d.from == to) {
             d.task.abort();
             if let Some(closed) = self
                 .close(svc.id, d.switch, SwitchState::DrainTimedOut, Some(DRAIN_UNKNOWN))
@@ -213,7 +282,7 @@ impl Promoter {
                 self.emit("service.switch.drain_timed_out", svc.tenant_id, svc.id, &closed);
             }
         }
-        drains.retain(|d| d.from != req.to);
+        drains.retain(|d| d.from != to);
 
         if switch.state == SwitchState::Draining {
             if let Some(from) = switch.from_version {
@@ -246,6 +315,7 @@ impl Promoter {
         if !self.refresh_with_retries().await {
             warnings.push(SwitchWarning {
                 code: ROUTES_REFRESH_DELAYED.to_string(),
+                names: Vec::new(),
             });
             self.spawn_repair();
         }
@@ -256,7 +326,7 @@ impl Promoter {
         })
     }
 
-    /// This node's flips run under the lock we hold, so an open row is one whose closing failed
+    /// This node's flips run under the flip lock we hold, so an open row is one whose closing failed
     /// after a store error. Left alone it would block every flip until the next start.
     async fn close_stale(&self, service: ServiceId) -> Result<(), ApiError> {
         let page = PageReq { limit: 1, cursor: None };
@@ -374,7 +444,7 @@ async fn watch_drain(
         }
         // `promote` aborts this task under the same lock, so a closed row is not written again.
         let slot = p.slot(service);
-        let mut drains = slot.lock().await;
+        let mut drains = slot.drains.lock().await;
         let Some((state, error, event)) = ended(&p) else {
             continue;
         };

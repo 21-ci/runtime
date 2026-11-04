@@ -57,6 +57,11 @@ Returned by the control listener (`/v1/*`, default port 8081) in `error.code`.
 | `host_taken` | 409 | Another service already holds this host. | Use another host, or remove it from the other service first. |
 | `host_cooldown` | 409 | Your earlier pending claim for this host expired; the same tenant must wait one more TTL. | Wait for the cooldown, or have the operator attach the host. |
 | `version_not_ready` | 409 | The version failed to build and cannot go live. | Read its build logs, fix the source, upload again or `rebuild`. |
+| `switch_in_progress` | 409 | Another switch or rollback of this service is running right now. A running drain does not count. | Wait a moment and try again; `GET /v1/services/{s}/switches` shows it. |
+| `rollback_target_gone` | 409 | The switch had no previous version, or that version was collected. | Pick a version from `GET /v1/services/{s}/versions` and `PUT .../live`. |
+| `runtime_mismatch` | 422 | The source of a switch has another runtime. | Switch from a service with the same runtime. |
+| `branch_name_invalid` | 422 | The branch name does not match `^[a-z][a-z0-9-]{0,23}$`. | Fix the name. |
+| `scratch_source_reserved` | 403 | A system service cannot be the source of a switch. | Use a service of your own. |
 | `tenant_not_empty` | 409 | The tenant still owns services. | Delete them first or pass `?purge=1`. |
 | `project_slug_taken` | 409 | The tenant already has a project with this slug. | Pick another slug, or use the existing project. |
 | `project_not_empty` | 409 | The project still holds services or topics. | Delete the services and topics first. |

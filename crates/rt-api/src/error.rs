@@ -16,11 +16,22 @@ pub fn status_for_code(code: &str) -> StatusCode {
         | "binding_not_allowed"
         | "host_not_allowed"
         | "reserved"
+        | "scratch_source_reserved"
         | "async_not_allowed" => StatusCode::FORBIDDEN,
         "not_found" => StatusCode::NOT_FOUND,
-        "slug_taken" | "host_taken" | "host_cooldown" | "version_not_ready" | "tenant_not_empty"
-        | "project_slug_taken" | "project_not_empty" | "environment_in_use" | "sdk_release_exists" | "topic_exists"
-        | "switch_in_progress" | "switch_not_open" => StatusCode::CONFLICT,
+        "slug_taken"
+        | "host_taken"
+        | "host_cooldown"
+        | "version_not_ready"
+        | "tenant_not_empty"
+        | "project_slug_taken"
+        | "project_not_empty"
+        | "environment_in_use"
+        | "sdk_release_exists"
+        | "topic_exists"
+        | "switch_in_progress"
+        | "switch_not_open"
+        | "rollback_target_gone" => StatusCode::CONFLICT,
         "precondition_failed" => StatusCode::PRECONDITION_FAILED,
         "too_large" | "storage_quota" | "egress_quota" => StatusCode::PAYLOAD_TOO_LARGE,
         // Guest-data errors a control route can meet (data export, KV/SQL inspection): the
@@ -35,6 +46,8 @@ pub fn status_for_code(code: &str) -> StatusCode {
         | "limit_exceeds_plan"
         | "schedule_too_frequent"
         | "idempotency_mismatch"
+        | "runtime_mismatch"
+        | "branch_name_invalid"
         | "no_rpc_surface"
         | "sdk_contract_missing"
         | "sdk_unchecked_caller" => StatusCode::UNPROCESSABLE_ENTITY,

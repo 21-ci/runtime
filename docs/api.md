@@ -120,6 +120,10 @@ A project groups a tenant's services and lists their environments. Every tenant 
 | PATCH | `/v1/services/{s}` | `services:write` | any of `name, profile, environment, limits, scaling, access, triggers, ingress, egress, call, deno, wasm`; `If-Match` | service. Each provided block **replaces** that block |
 | DELETE | `/v1/services/{s}` | `services:write` | `?keep_data=1` | `204` |
 | PUT | `/v1/services/{s}/live` | `deploy` | `{version, close_sockets?}`; `If-Match` | service; `409 version_not_ready` for a `failed` version (`pending` is accepted); rollback = point it at an older version. Open WebSockets stay and their next events run the new version; `close_sockets: true` closes them with 1012. The response has `switch_id`. `202` with `warnings: [{"code": "routes_refresh_delayed"}]`: the flip committed, the node keeps re-reading its routes, do not retry. An upload with `activate` reports the same way. Events `service.switch.started\|flipped\|drained\|drain_timed_out\|failed` follow the drain of the previous version; a drain ending in `drain_timed_out` with `error: drain_unknown` could not be counted (three versions busy at once, or a flip back to the version), so its tasks may still have been running |
+| POST | `/v1/services/{s}/switch` | `deploy`; `services:read` when the source is another service | `{from: {branch} \| {service, version?} \| {version}, close_sockets?, drain_timeout?, dry_run?}`; `If-Match`, `Idempotency-Key` | `202` switch. Adopts the source version into `{s}` **by digest** (read from the source's row; the body has no field for one; a second switch of the same source version reuses the adopted version), flips, and tracks the drain of the previous version. Both services must be visible to the key, in one tenant and project: anything else is `404`. The source version must be `ready`. Env, secrets, config and data do not move. `dry_run: true` answers `200` and writes nothing: no `id`, and `to_version` only if already adopted. `warnings`: `env_missing_on_parent` and `triggers_differ` with `names` (never values), `routes_refresh_delayed`. `drain_timeout` (`10m`) replaces the computed wait, capped at 15 minutes. `409 switch_in_progress`: another switch or rollback of this service is running right now; a running drain does not count. A `PUT /live` or an upload with `activate` waits its turn instead |
+| GET | `/v1/services/{s}/switches` | `services:read` | `?limit&cursor` | `{items: [switch], next_cursor}`, newest first; every flip has one, whatever started it |
+| GET | `/v1/services/{s}/switches/{id}` | `services:read` | | `{id, service, kind: promote\|switch\|rollback, state: preparing\|migrating\|draining\|completed\|drain_timed_out\|failed, from_version?, to_version, source?: {service, version, digest?}, inflight_old, drain_deadline?, interrupted, error?, warnings?, created_at, updated_at}` |
+| POST | `/v1/services/{s}/switches/{id}/rollback` | `deploy` | `If-Match`, `Idempotency-Key` | `202` switch of kind `rollback` to that switch's `from_version`; `409 rollback_target_gone` when there is none or it was collected; `409 switch_in_progress` as above. Does not wait for a drain. Data written by the newer version stays |
 | GET | `/v1/services/{s}/data/export` | `data:admin` | | SQLite snapshot (`application/vnd.sqlite3`) |
 
 ### WebSockets and objects
@@ -268,14 +272,14 @@ Each code is explained in [Error reasons](reference/errors.md#control-api-codes)
 | `code` | HTTP |
 |---|---|
 | `unauthorized` | 401 |
-| `insufficient_scope`, `quota_exceeded`, `trigger_not_allowed`, `binding_not_allowed`, `host_not_allowed`, `reserved` (the system tenant) | 403 |
+| `insufficient_scope`, `quota_exceeded`, `trigger_not_allowed`, `binding_not_allowed`, `host_not_allowed`, `reserved` (the system tenant), `scratch_source_reserved` (a system service as the source of a switch) | 403 |
 | `not_found` | 404 |
-| `slug_taken`, `host_taken`, `host_cooldown`, `topic_exists`, `version_not_ready`, `tenant_not_empty`, `project_slug_taken`, `project_not_empty` (also with topics), `environment_in_use` (also with topics), `sdk_release_exists`, `switch_in_progress` | 409 |
+| `slug_taken`, `host_taken`, `host_cooldown`, `topic_exists`, `version_not_ready`, `tenant_not_empty`, `project_slug_taken`, `project_not_empty` (also with topics), `environment_in_use` (also with topics), `sdk_release_exists`, `switch_in_progress`, `rollback_target_gone` | 409 |
 | `precondition_failed` | 412 |
 | `too_large`, `storage_quota`, `egress_quota` | 413 |
 | `sql_error`, `sql_not_authorized`, `sql_result_too_large`, `kv_not_integer`, `kv_overflow` (guest data, e.g. on export) | 422 |
 | `sql_busy`, `sql_timeout` | 503 |
-| `validation_failed`, `invalid_artifact`, `missing_export` (a durable WASM service without `socket-handler`), `limit_exceeds_plan`, `schedule_too_frequent`, `idempotency_mismatch`, `no_rpc_surface`, `sdk_contract_missing`, `sdk_unchecked_caller` | 422 |
+| `runtime_mismatch`, `branch_name_invalid`, `validation_failed`, `invalid_artifact`, `missing_export` (a durable WASM service without `socket-handler`), `limit_exceeds_plan`, `schedule_too_frequent`, `idempotency_mismatch`, `no_rpc_surface`, `sdk_contract_missing`, `sdk_unchecked_caller` | 422 |
 | `rate_limited`, `build_quota`, `queue_full`, `stream_full` | 429 (`Retry-After` when known) |
 | `not_implemented` | 501 |
 | `control_disabled` | 503 |

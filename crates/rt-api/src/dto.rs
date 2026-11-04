@@ -393,8 +393,94 @@ pub struct LimitChangeView {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub struct SwitchWarning {
     /// `routes_refresh_delayed`: the new version is committed and reaches traffic once the node
-    /// re-reads its routes, which it keeps trying.
+    /// re-reads its routes, which it keeps trying. `env_missing_on_parent`: env or secret names the
+    /// source has and the parent lacks. `triggers_differ`: trigger switches that differ; config
+    /// does not move with a switch.
     pub code: String,
+    /// What the code is about; names only, never a value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+}
+
+/// What to switch to. Never a digest: that is read from the source's row.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum SwitchFrom {
+    /// The branch `<name>`, the service `<parent-slug>-br-<name>`; its live version.
+    Branch { branch: String },
+    /// Another service of the project; its live version unless one is named.
+    Service { service: String, version: Option<u32> },
+    /// One of this service's own versions.
+    Version { version: u32 },
+}
+
+/// `POST /v1/services/{s}/switch`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchBody {
+    pub from: SwitchFrom,
+    /// Close the service's WebSockets with 1012 once the version is live (default false).
+    #[serde(default)]
+    pub close_sockets: bool,
+    /// How long to wait for the previous version's tasks, e.g. `10m`; capped by the node.
+    #[serde(default, with = "rt_config::serde_duration::opt")]
+    #[schema(value_type = Option<String>)]
+    pub drain_timeout: Option<std::time::Duration>,
+    /// Check and report; write nothing (`200`, no `id`).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// The version a switch came from.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SwitchSourceView {
+    pub service: String,
+    pub version: u32,
+    /// `sha256:…` of the code; absent once the adopted version was collected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+/// One tracked flip of a live version.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SwitchView {
+    /// Absent on a dry run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub service: String,
+    /// `promote` | `switch` | `rollback`.
+    pub kind: String,
+    /// `preparing` | `migrating` | `draining` | `completed` | `drain_timed_out` | `failed`.
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_version: Option<u32>,
+    /// Absent on a dry run whose source was not adopted yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SwitchSourceView>,
+    /// Tasks of the previous version still running (0 when not draining or not known).
+    pub inflight_old: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drain_deadline: Option<i64>,
+    /// The node restarted while this switch was unfinished.
+    pub interrupted: bool,
+    /// A stable code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SwitchWarning>,
+    /// This answer changed nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SwitchPage {
+    pub items: Vec<SwitchView>,
+    pub next_cursor: Option<String>,
 }
 
 /// `GET /v1/services/{s}`.

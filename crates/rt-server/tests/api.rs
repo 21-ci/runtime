@@ -34,6 +34,8 @@ mod projects;
 mod promote;
 #[path = "api/sdk.rs"]
 mod sdk;
+#[path = "api/switch.rs"]
+mod switch;
 #[path = "api/tenancy.rs"]
 mod tenancy;
 #[path = "api/tokens.rs"]

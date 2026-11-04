@@ -5418,6 +5418,401 @@
         }
       }
     },
+    "/v1/services/{s}/switch": {
+      "post": {
+        "tags": [
+          "services"
+        ],
+        "summary": "Move a version of another service (or of this one) to live: by digest, tracked, drained. The\ndigest comes from the source's row; the body has no field for one.",
+        "operationId": "services_switch",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "service id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SwitchBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`dry_run`: nothing was written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SwitchView"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SwitchView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/services/{s}/switches": {
+      "get": {
+        "tags": [
+          "services"
+        ],
+        "summary": "Newest first.",
+        "operationId": "switches_list",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "service id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size (default 50, max 200).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from a previous `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SwitchPage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/services/{s}/switches/{id}": {
+      "get": {
+        "tags": [
+          "services"
+        ],
+        "operationId": "switches_get",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "service id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "switch id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SwitchView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient_scope, quota_exceeded or another refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/services/{s}/switches/{id}/rollback": {
+      "post": {
+        "tags": [
+          "services"
+        ],
+        "summary": "Go back to what this switch replaced, as a new switch of kind `rollback`. Data written by the\nnew version stays.",
+        "operationId": "switches_rollback",
+        "parameters": [
+          {
+            "name": "s",
+            "in": "path",
+            "description": "service id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "switch id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SwitchView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing, invalid, revoked or expired credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited (with Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/services/{s}/types": {
       "get": {
         "tags": [
@@ -10316,6 +10711,232 @@
           }
         }
       },
+      "SwitchBody": {
+        "type": "object",
+        "description": "`POST /v1/services/{s}/switch`.",
+        "required": [
+          "from"
+        ],
+        "properties": {
+          "close_sockets": {
+            "type": "boolean",
+            "description": "Close the service's WebSockets with 1012 once the version is live (default false)."
+          },
+          "drain_timeout": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How long to wait for the previous version's tasks, e.g. `10m`; capped by the node."
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "Check and report; write nothing (`200`, no `id`)."
+          },
+          "from": {
+            "$ref": "#/components/schemas/SwitchFrom"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SwitchFrom": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The branch `<name>`, the service `<parent-slug>-br-<name>`; its live version.",
+            "required": [
+              "branch"
+            ],
+            "properties": {
+              "branch": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Another service of the project; its live version unless one is named.",
+            "required": [
+              "service"
+            ],
+            "properties": {
+              "service": {
+                "type": "string"
+              },
+              "version": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "One of this service's own versions.",
+            "required": [
+              "version"
+            ],
+            "properties": {
+              "version": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              }
+            }
+          }
+        ],
+        "description": "What to switch to. Never a digest: that is read from the source's row."
+      },
+      "SwitchPage": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SwitchView"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "SwitchSourceView": {
+        "type": "object",
+        "description": "The version a switch came from.",
+        "required": [
+          "service",
+          "version"
+        ],
+        "properties": {
+          "digest": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`sha256:…` of the code; absent once the adopted version was collected."
+          },
+          "service": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "SwitchView": {
+        "type": "object",
+        "description": "One tracked flip of a live version.",
+        "required": [
+          "service",
+          "kind",
+          "state",
+          "inflight_old",
+          "interrupted",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "drain_deadline": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "This answer changed nothing."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A stable code."
+          },
+          "from_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Absent on a dry run."
+          },
+          "inflight_old": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Tasks of the previous version still running (0 when not draining or not known).",
+            "minimum": 0
+          },
+          "interrupted": {
+            "type": "boolean",
+            "description": "The node restarted while this switch was unfinished."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`promote` | `switch` | `rollback`."
+          },
+          "service": {
+            "type": "string"
+          },
+          "source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SwitchSourceView"
+              }
+            ]
+          },
+          "state": {
+            "type": "string",
+            "description": "`preparing` | `migrating` | `draining` | `completed` | `drain_timed_out` | `failed`."
+          },
+          "to_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Absent on a dry run whose source was not adopted yet.",
+            "minimum": 0
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SwitchWarning"
+            }
+          }
+        }
+      },
       "SwitchWarning": {
         "type": "object",
         "description": "A flip committed, but one of its follow-ups did not finish.",
@@ -10325,7 +10946,14 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "`routes_refresh_delayed`: the new version is committed and reaches traffic once the node\nre-reads its routes, which it keeps trying."
+            "description": "`routes_refresh_delayed`: the new version is committed and reaches traffic once the node\nre-reads its routes, which it keeps trying. `env_missing_on_parent`: env or secret names the\nsource has and the parent lacks. `triggers_differ`: trigger switches that differ; config\ndoes not move with a switch."
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What the code is about; names only, never a value."
           }
         }
       },
