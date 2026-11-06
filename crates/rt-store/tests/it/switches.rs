@@ -642,7 +642,7 @@ async fn a_populated_v1_database_upgrades_in_place() {
     };
     // Back to the exact schema-1 shape, with the rows in place.
     let c = rusqlite::Connection::open(&path).expect("open");
-    c.execute_batch("DROP TABLE version_switches; ALTER TABLE versions DROP COLUMN origin; PRAGMA user_version = 1;")
+    c.execute_batch("DROP TABLE secret_refs; DROP TABLE pending_imports; DROP TABLE version_switches; DROP TABLE IF EXISTS backups; ALTER TABLE versions DROP COLUMN origin; ALTER TABLE versions DROP COLUMN migrations; ALTER TABLE versions DROP COLUMN migrations_sql; ALTER TABLE versions DROP COLUMN meta; ALTER TABLE versions DROP COLUMN activate_after_build; PRAGMA user_version = 1;")
         .expect("downgrade");
     drop(c);
 
@@ -796,4 +796,37 @@ async fn only_an_open_row_of_the_service_can_flip() {
         m.flip_switch(ServiceId::from_u128(77), row.id, None, 5_000).await,
         Err(StoreError::NotFound)
     ));
+}
+
+/// A deploy's `meta` is on the version and survives adoption; the `after_build` activation is
+/// handed out once and is not adopted.
+#[tokio::test]
+async fn version_deploy_info_is_kept_and_an_activation_is_taken_once() {
+    let (m, _tenant, parent, source) = family().await;
+    let (a, b) = (source.id, parent.id);
+    let v = ready_version(&m, a, 1).await;
+    let meta = serde_json::json!({"git": {"sha": "abc1234"}});
+    m.set_version_deploy(a, v.number, Some(meta.clone()), Some("key:1".into()))
+        .await
+        .unwrap();
+    let read = m.get_version(a, v.number).await.unwrap().unwrap();
+    assert_eq!(read.meta.as_ref(), Some(&meta));
+    assert_eq!(read.git_sha(), Some("abc1234"));
+    assert_eq!(m.list_versions(a).await.unwrap()[0].git_sha(), Some("abc1234"));
+
+    let adopted = m.adopt_version(b, a, v.number).await.unwrap();
+    assert_eq!(adopted.git_sha(), Some("abc1234"));
+    let stored = m.get_version(b, adopted.number).await.unwrap().unwrap();
+    assert_eq!(stored.git_sha(), Some("abc1234"));
+    assert_eq!(m.take_version_activation(b, adopted.number).await.unwrap(), None);
+
+    assert_eq!(
+        m.take_version_activation(a, v.number).await.unwrap().as_deref(),
+        Some("key:1")
+    );
+    assert_eq!(m.take_version_activation(a, v.number).await.unwrap(), None);
+    assert!(m
+        .set_version_deploy(a, rt_types::VersionNo(99), None, None)
+        .await
+        .is_err());
 }

@@ -8,15 +8,19 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 #![warn(clippy::await_holding_lock, clippy::mem_forget, clippy::undocumented_unsafe_blocks)]
 
+pub mod archive_fetch;
+pub mod backup;
 pub mod build_exec;
 pub mod cli;
 pub mod control_plane;
 pub mod policy;
 pub mod reseal;
 pub mod specs;
+pub mod telemetry;
+mod vault_sync;
 pub mod wiring;
 
-pub use cli::{Cli, Command, Role, SecretsCommand};
+pub use cli::{BackupCommand, Cli, Command, Role, SecretsCommand};
 pub use control_plane::InProcControlPlane;
 pub use wiring::{
     start, start_with, MetaLayer, NodeSignal, NodeSignals, RouteRefreshLayer, RunningServer, ServerAddrs, ServerError,

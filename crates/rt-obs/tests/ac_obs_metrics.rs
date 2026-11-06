@@ -173,11 +173,8 @@ fn the_node_metric_list_equals_the_metrics_documented_in_the_deploy_guide() {
         NODE_METRIC_NAMES.len(),
         "NODE_METRIC_NAMES has duplicates"
     );
-    assert_eq!(
-        documented.len(),
-        60,
-        "docs/deploy.md lists 60 always-on metrics (parser sanity)"
-    );
+    // Parser sanity only: the two sets are compared below, so a new metric needs no edit here.
+    assert!(documented.len() >= 60, "the parser found the table in docs/deploy.md");
     let missing_in_code: Vec<_> = documented.difference(&listed).collect();
     let undocumented: Vec<_> = listed.difference(&documented).collect();
     assert!(

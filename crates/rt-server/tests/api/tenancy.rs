@@ -588,3 +588,71 @@ async fn free_plan_tenants_cannot_attach_custom_hosts() {
     node.shutdown().await;
 }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Plan caps and GET /v1/usage
+// ---------------------------------------------------------------------------------------------
+
+node_test! {
+async fn usage_reports_the_quota_shape_and_secrets_hosts_and_branches_stop_at_their_caps() {
+    let node = start_node_with(|c| {
+        c.plans.insert(
+            "capped".to_string(),
+            Plan {
+                max_secrets_per_service: 1,
+                max_custom_hosts: 1,
+                max_branches: 1,
+                ..pro_plan()
+            },
+        );
+    })
+    .await;
+    let t = new_tenant(&node, "capped").await;
+    let svc = create_service(&node, &t.key, &uniq("cap"), "deno").await;
+
+    let u = get(&node, &t.key, "/v1/usage").await;
+    assert_eq!(u.s(), 200, "{}", u.text);
+    assert_eq!(u.json["plan"], "capped");
+    assert!(u.json["resets_at"].is_i64() && u.json["day"].is_string() && u.json["limits"].is_object());
+    for name in [
+        "invocations", "cpu_ms", "egress_bytes", "storage_bytes", "services", "projects", "branches", "previews",
+        "custom_hosts", "schedules", "secrets",
+    ] {
+        let q = &u.json["quotas"][name];
+        assert!(q["used"].is_u64() && q["period"].is_string() && q.get("limit").is_some(), "{name}: {q}");
+    }
+    assert_eq!(u.json["quotas"]["cpu_ms"]["limit"], Value::Null, "0 is unlimited");
+    assert_eq!(u.json["quotas"]["secrets"]["limit"], 1);
+    assert_eq!(u.json["quotas"]["secrets"]["period"], "per_service");
+    assert_eq!(u.json["quotas"]["services"]["used"], 1);
+    assert_eq!(u.json["quotas"]["services"]["remaining"], u.json["quotas"]["services"]["limit"].as_u64().unwrap() - 1);
+
+    let secret = |n: &str| format!("/v1/services/{svc}/secrets/{n}");
+    assert_eq!(put(&node, &t.key, &secret("A"), json!({"value": "1"})).await.s(), 204);
+    assert_eq!(put(&node, &t.key, &secret("A"), json!({"value": "2"})).await.s(), 204, "overwriting never counts");
+    let over = put(&node, &t.key, &secret("B"), json!({"value": "1"})).await;
+    assert_eq!(over.s(), 403, "{}", over.text);
+    assert!(over.text.contains("max_secrets_per_service"), "{}", over.text);
+
+    let host = |n: &str| format!("/v1/services/{svc}/hosts/{n}.bots.example.com");
+    let first = send(api(&node, &t.key, Method::PUT, &host(&uniq("a")))).await;
+    assert_eq!(first.s(), 200, "{}", first.text);
+    let over = send(api(&node, &t.key, Method::PUT, &host(&uniq("b")))).await;
+    assert_eq!(over.s(), 403, "{}", over.text);
+    assert!(over.text.contains("max_custom_hosts"), "{}", over.text);
+
+    let branches = format!("/v1/services/{svc}/branches");
+    let first = post(&node, &t.key, &branches, json!({"name": "one"})).await;
+    assert_eq!(first.s(), 201, "{}", first.text);
+    let over = post(&node, &t.key, &branches, json!({"name": "two"})).await;
+    assert_eq!(over.s(), 403, "{}", over.text);
+    assert!(over.text.contains("max_branches"), "{}", over.text);
+
+    let after = get(&node, &t.key, "/v1/usage").await;
+    for name in ["secrets", "custom_hosts", "branches"] {
+        assert_eq!(after.json["quotas"][name]["used"], 1, "{name}");
+        assert_eq!(after.json["quotas"][name]["remaining"], 0, "{name}");
+    }
+    node.shutdown().await;
+}
+}

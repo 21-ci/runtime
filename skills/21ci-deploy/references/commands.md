@@ -29,9 +29,16 @@ before or after the command.
 | `service list [--project P] [--env ENV] [--limit N] [--cursor C] [--all]` | |
 | `service get <svc>`, `service stats <svc> [--window 5m\|1h\|24h]` | |
 | `service delete <svc> [--keep-data]` | destructive: drops KV, SQL and blobs unless `--keep-data` |
-| `push <path> [--service SLUG] [--create [--project P] [--env ENV]] [--runtime deno\|wasm] [--no-activate] [--close-sockets] [--compile lazy\|eager] [--wait] [--wait-timeout 120s]` | new version per push (identical sources are deduplicated by digest but still numbered) |
+| `push <path> [--service SLUG] [--branch NAME \| --create [--project P] [--env ENV]] [--runtime deno\|wasm] [--no-activate] [--close-sockets] [--compile lazy\|eager] [--wait] [--wait-timeout 120s]` | new version per push (identical sources are deduplicated by digest but still numbered) |
 | `versions <svc> [N]` | list, or one version with `failure` (`reason`: `syntax`, `resolve`, `fetch`, `lock_mismatch`, `timeout`, `oom`, `too_large`, `internal`) |
 | `rollback <svc> [--to N] [--close-sockets]` | default: newest older version that did not fail; `--to` can roll forward |
+| `rollback <svc> --switch ID` | make the version that switch replaced live, as a tracked rollback (`409 rollback_target_gone`) |
+| `branch create <svc> --name NAME [--copy-data] [--schedules] [--environment ENV] [--ttl 7d] [--env-names] [--no-egress]` | service `<slug>-br-<NAME>`; empty data, no secret values. `--copy-data` needs `data:admin` |
+| `branch list <svc> [--limit N] [--cursor C] [--all]`, `branch delete <svc> <NAME>` | delete drops the branch's data; nothing is merged |
+| `switch <svc> --from BRANCH [--dry-run] [--wait] [--wait-timeout 20m] [--drain-timeout 10m] [--close-sockets]` | the branch's live version goes live with `<svc>`'s secrets and data. `--wait`: exit 0 on `completed` and `drain_timed_out`, 1 on `failed` or timeout |
+| `switch status <svc> [ID]` | every flip, newest first, or one |
+| `app move <svc> --to <context> [--slug S]` | Export here, import on another context's node; the source stays |
+| `from-url <svc> <URL> [--header N:V] [--sha256 H] [--strip-components N] [--subdir D] [--entry F] [--meta JSON] [--compile M] [--after-build]` | The node fetches a zip or tar and deploys it |
 | `rebuild <svc> <N>`, `build-logs <svc> <N>`, `source <svc> <N> [--out FILE]` | |
 | `types <svc> [VERSION] [-d DIR]` | Deno RPC surface as `<slug>.d.ts` (`422 no_rpc_surface` for WASM or no `rpc` export) |
 
@@ -56,7 +63,7 @@ Over the plan maximum: `422 limit_exceeds_plan`. `service get` shows it as `Keep
 | `scaling` | `min_instances`, `max_instances`, `max_queued` (over it `503 overloaded`), `keep_resident`, `min_run_time_ms` |
 | `triggers` | `http`, `interval`, `cron`, `queue`, `call`, `websocket` (booleans, all on by default) |
 | `ws` | `allowed_origins[]` (empty = any), `warm` (default true), `max_sockets` |
-| `ingress` | `allowed_methods[]`, `allow_paths[]` (prefix `*`), `ip_allow[]` (CIDRs), `rate_limit.rps`, `rate_limit.burst` |
+| `ingress` | `allowed_methods[]`, `allow_paths[]` (prefix `*`), `ip_allow[]` (CIDRs), `rate_rules[]`, `rate_limit.rps`, `rate_limit.burst` |
 | `egress` | `allowed_hosts[]` (JSON array required), `denied_hosts[]` |
 | `deno` | `reuse_isolates` |
 | `wasm` | `reuse_instances` |
@@ -77,6 +84,20 @@ Top-level service fields (create): `slug`, `runtime`, `name`, `profile`, `projec
 | `data export <svc> [--out FILE]` | SQLite snapshot (scope `data:admin`) |
 
 Env/secret names: `[A-Z_][A-Z0-9_]*`, no `RT_` prefix, at most 100 entries, values at most 32 KB.
+
+## Backups (operator)
+
+| Command | Notes |
+|---|---|
+| `app export <svc> --out FILE` | saves a bundle (data, blobs, sources, env values, secret names), mode `0600` |
+| `app import FILE --slug S [--project P] [--env E] [--activate]`, `app fork <svc> --slug S` | creates a service, rebuilt from source; secrets must be entered again |
+| `backup create [--wait]` | starts a node backup and returns; `--wait` follows it and exits 1 if it failed |
+| `backup list [--limit N]`, `backup status`, `backup get <id>` | |
+| `backup download <id> --out FILE` | streams to `FILE.part`, renames it when whole, mode `0600` |
+| `backup delete <id>` | |
+
+Verifying and restoring are offline commands of the `rt` binary, not of `21ci`: `rt backup verify <archive>`,
+`rt backup restore <archive> --data-dir <empty>`. Node configuration and retention: `docs/deploy.md`.
 
 ## Triggers
 
@@ -110,9 +131,9 @@ Env/secret names: `[A-Z_][A-Z0-9_]*`, no `RT_` prefix, at most 100 entries, valu
 | Command | Notes |
 |---|---|
 | `logs <svc> [-f] [--since TIME] [--until TIME] [--level debug\|info\|warn\|error] [--task task_…] [--kind runtime\|build\|system] [--limit N] [--cursor C]` | TIME: RFC 3339 or a duration back (`15m`, `2h`, `1d`); `--limit` up to 1000 |
-| `stats <svc> [--window 5m\|1h\|24h]` | requests, errors, outcomes, admission (with `predicted run` time), latency percentiles |
+| `stats <svc> [--window 5m\|1h\|24h] [--series 1m\|5m\|1h]` | requests, errors, outcomes, admission (with `predicted run` time), latency percentiles |
 | `events <svc> [--limit N] [--cursor C]` | deploys, rollbacks, env/secret writes, ... |
-| `sockets ls <svc> [--object NAME] [--tag TAG]`, `sockets close <svc> (<ws_id> \| --tag TAG) [--object NAME] [--code N] [--reason TEXT]` | object default `default`; code 1000 or 3000-4999 |
+| `sockets ls <svc> [--object NAME] [--tag TAG]`, `sockets close <svc> (<ws_id> \| --tag TAG \| --all) [--object NAME] [--code N] [--reason TEXT]` | object default `default`; `--all` closes every socket of the service; code 1000 or 3000-4999 |
 | `objects ls <svc> [--prefix P]`, `objects rm <svc> <name>` | `rm` drops a durable object's storage and alarm |
 
 ## Projects, tokens, SDKs
@@ -132,14 +153,27 @@ Operator-only (root token): `tenant *`, `key *`, `plan *`, `node *`, `sdk publis
 |---|---|
 | `service list/get`, `versions`, `source`, `env get`, `secret list`, `host list/get`, `schedule list`, `queue stats`, `queue dlq` (list), `events`, `topic list/get/read`, `consumer list`, `consumer dlq list`, `invocation list/get`, `sockets ls`, `objects ls`, `project list/get`, `sdk ls/types`; every slug lookup | `services:read` |
 | `service create/update/delete`, `host attach/detach`, `schedule add/update/rm`, `project create/update/delete`, `topic create/update/delete` | `services:write` |
-| `push`, `rollback`, `rebuild` | `deploy` (+ `services:read`; `services:write` for `--create`) |
+| `push`, `from-url`, `rollback`, `rebuild`, `switch` | `deploy` (+ `services:read`; `services:write` for `--create`) |
+| `branch list`, `switch status` | `services:read` |
+| `branch create/delete` | `services:write` (+ `services:read`; `--copy-data` also `data:admin`) |
 | `env set/unset` | `env:write` |
 | `secret set/delete` | `secrets:write` |
 | `queue send`, `queue dlq --redrive/--purge`, `topic append`, `pubsub publish`, `consumer reset`, `consumer dlq purge`, `invocation redrive/purge` | `queue:write` |
 | `logs`, `build-logs`, `stats` | `logs:read` |
 | `data export`, `objects rm` | `data:admin` |
 | `sockets close` | `sockets:write` |
+| `data tables`, `data query`, `data kv`, `data blobs` | `data:read` |
 | `token *` | `keys:write` |
 | `invoke` | none for `access=public`; a key with `invoke` for `access=key` |
 
 Default scopes of a key made by `21ci key create`: `services:read,services:write,deploy,invoke,logs:read,env:write,secrets:write,queue:write`.
+
+## Migrations
+
+| Command | Does |
+|---|---|
+| `21ci migrations status <svc>` | applied, and pending for the newest version |
+| `21ci promote <svc> <n> [--dry-run] [--no-migrate] [--close-sockets]` | run pending migrations, then make `n` live; `--dry-run` tries them on a copy |
+| `21ci push DIR --after-build` | Deno source with `migrations/`: live once the build is ready, migrations first |
+| `21ci push DIR --meta-git` | Record the checked-out commit on the version |
+| `21ci push app.wasm --migrations DIR` | WASM: store `NNNN_name.sql` files with the version |

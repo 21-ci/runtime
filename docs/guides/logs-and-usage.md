@@ -152,6 +152,9 @@ The stream is SSE in the same record format and ends when the version is `ready`
 
 ## Stats
 
+![21ci stats and usage output](../assets/screenshots/cli-monitoring-light.png#only-light)
+![21ci stats and usage output](../assets/screenshots/cli-monitoring-dark.png#only-dark)
+
 `21ci stats` answers "how is the service doing?" without any monitoring setup. It is always on, kept in memory per
 service in one-minute buckets for the last 24 hours, and lags real time by about a second.
 

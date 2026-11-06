@@ -18,6 +18,9 @@ References:
 - Limits and invoke outcomes are shared with Deno: [21cloud-deno-service limits](../21cloud-deno-service/references/limits.md)
   (if that skill is not installed: https://github.com/21-ci/runtime/blob/main/skills/21cloud-deno-service/references/limits.md).
 
+
+Schema changes: `21ci push app.wasm --migrations DIR` stores `NNNN_name.sql` files with the version; they run once, in order, before it goes live. See `21ci-deploy`.
+
 ## Contract
 
 1. **Export `wasi:http/incoming-handler`.** A core module, a component without that export, or one using threads /

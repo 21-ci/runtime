@@ -54,6 +54,8 @@ Key flags: `--service SLUG` (default: cleaned-up file/dir name), `--create` (onl
 with `--project P --env ENV`), `--runtime deno|wasm`, `--wait` (poll until `ready`; exit 1 on `failed` or after
 `--wait-timeout`, default 120s; implies `--compile eager`), `--no-activate`, `--close-sockets`.
 
+SQL migrations: `migrations/NNNN_name.sql` in the source (WASM: `--migrations DIR`) run at promote, before the flip, in one transaction. Push with `--no-activate`, try `21ci promote <svc> <n> --dry-run`, then `21ci promote <svc> <n>`. Errors give `{file, statement_index, line, sqlite_code, message}`. No `BEGIN`/`COMMIT` in files, no down-migrations, never edit an applied file; keep schema changes backward-compatible.
+
 Always deploy with `--wait` when you can: without it a lazy build runs on the first request, and build failures (an
 unresolvable `npm:` import) only show up there as `502 build_failed`. Syntax errors are `422 validation_failed` at upload
 either way, with `file:line:col` diagnostics printed under the error.
@@ -104,7 +106,11 @@ The code must handle the trigger: `scheduled(event, ctx)` / `queue(batch, ctx)` 
 | Recent errors as JSON | `21ci logs api --since 15m --level error --json` |
 | Latency, outcomes, queueing | `21ci stats api --window 1h` |
 | Control-plane history | `21ci events api` |
-| Roll back | `21ci rollback api` (previous good version) or `--to N`; `--close-sockets` to drop WebSockets |
+| Roll back | `21ci rollback api` (previous good version) or `--to N`; `--close-sockets` to drop WebSockets; `--switch sw_…` to undo a switch. Data written by the newer version stays |
+| Try a change on a branch | `21ci branch create api --name fix --env-names`, set the branch's secrets, `21ci push ./src --service api --branch fix --wait`, test `api-br-fix` |
+| Try code in isolation, with an expiry | `21ci service scratch --of api --ttl 2h`, then `21ci push --service <slug> <path>` |
+| Ship a branch | `21ci switch api --from fix --dry-run`, read the warnings, ask the user, then `21ci switch api --from fix --wait`. The code gets the parent's secrets and data, and old and new versions overlap during the drain, so stored data and messages must work with both ([docs/deploy.md](../../docs/deploy.md#branches-and-switches)). Exit 0 with a `drain_timed_out` note: the new version is live |
+| Follow switches | `21ci switch status api`, `21ci switch status api sw_…` |
 | Rebuild a failed version | `21ci rebuild api 3` |
 | Get uploaded source back | `21ci source api 3 --out src.json` |
 | Plan limits left today | `21ci limits` |

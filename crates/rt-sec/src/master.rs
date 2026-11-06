@@ -21,6 +21,8 @@ pub mod purpose {
     pub const SECRETS: &str = "rt/secrets-aes-gcm/v1";
     /// Source of the non-secret key id stored with sealed secrets (SEC-53).
     pub const SECRETS_KEY_ID: &str = "rt/secrets-key-id/v1";
+    /// HMAC key of a backup's `manifest.mac`: proves the node (or its master key) wrote it.
+    pub const BACKUP_MAC: &str = "rt/backup-mac/v1";
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

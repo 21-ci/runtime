@@ -151,6 +151,9 @@ pub trait QueueStore: Send + Sync {
     }
     // LCOV_EXCL_STOP
     async fn stats(&self, s: ServiceId) -> Result<QueueStats>;
+    /// [`QueueStore::stats`] of every service holding messages or dead letters, in one grouped
+    /// read (bulk stats: no per-service query). A service without any is not listed.
+    async fn stats_all(&self) -> Result<HashMap<ServiceId, QueueStats>>;
     async fn dlq_list(&self, s: ServiceId, limit: usize) -> Result<Vec<DlqEntry>>;
     /// Move DLQ messages back with `attempt = 1`; returns how many.
     async fn dlq_redrive(&self, s: ServiceId) -> Result<u64>;
@@ -619,6 +622,48 @@ impl QueueStore for SqliteQueueStore {
                     oldest_age_ms: oldest.map(|t| (now - t).max(0) as u64).unwrap_or(0),
                     dlq: dlq.max(0) as u64,
                 })
+            })
+            .await
+    }
+
+    async fn stats_all(&self) -> Result<HashMap<ServiceId, QueueStats>> {
+        self.db
+            .read(move |c| {
+                let now = now_ms();
+                let mut all: HashMap<ServiceId, QueueStats> = HashMap::new();
+                let mut msgs = c.prepare_cached(
+                    "SELECT service_id, \
+                     sum(leased = 0 OR visible_at <= ?1), \
+                     sum(leased = 1 AND visible_at > ?1), \
+                     min(CASE WHEN leased = 0 OR visible_at <= ?1 THEN enqueued_at END) \
+                     FROM messages GROUP BY service_id",
+                )?;
+                let rows = msgs.query_map([now], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, depth, in_flight, oldest) = row?;
+                    if let Ok(id) = id.parse::<ServiceId>() {
+                        let e = all.entry(id).or_default();
+                        e.depth = depth.max(0) as u64;
+                        e.in_flight = in_flight.max(0) as u64;
+                        e.oldest_age_ms = oldest.map(|t| (now - t).max(0) as u64).unwrap_or(0);
+                    }
+                }
+                let mut dlq = c.prepare_cached("SELECT service_id, count(*) FROM dlq GROUP BY service_id")?;
+                let rows = dlq.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+                for row in rows {
+                    let (id, n) = row?;
+                    if let Ok(id) = id.parse::<ServiceId>() {
+                        all.entry(id).or_default().dlq = n.max(0) as u64;
+                    }
+                }
+                Ok(all)
             })
             .await
     }

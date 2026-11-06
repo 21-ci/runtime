@@ -70,10 +70,22 @@ pub fn pro_plan() -> Plan {
         max_topic_partitions: 16,
         max_stream_mb: 10_240,
         max_stream_retention_hours: 720,
+        max_scratch: 1_000,
+        scratch_ttl_max: 604_800,
+        cpu_ms_per_day: 0,
+        max_projects: 0,
+        max_environments_per_project: 0,
+        max_branches: 0,
+        max_secrets_per_service: 0,
+        max_custom_hosts: 0,
+        max_versions_retained: 0,
+        log_retention_days: 0,
+        max_fetches_per_call: 0,
+        max_log_lines_per_call: 0,
     }
 }
 
-pub const ALL_SCOPES: [&str; 10] = [
+pub const ALL_SCOPES: [&str; 11] = [
     "services:read",
     "services:write",
     "deploy",
@@ -84,6 +96,7 @@ pub const ALL_SCOPES: [&str; 10] = [
     "queue:write",
     "data:admin",
     "sockets:write",
+    "data:read",
 ];
 
 // ---------------------------------------------------------------------------------------------

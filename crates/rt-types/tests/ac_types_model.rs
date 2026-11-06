@@ -381,6 +381,7 @@ fn scopes_use_the_documented_names_on_the_wire() {
         "data:admin",
         "keys:write",
         "sockets:write",
+        "data:read",
     ];
     assert_eq!(Scope::ALL.len(), documented.len());
     for name in documented {
@@ -406,7 +407,7 @@ fn scope_sets_serialize_as_sorted_arrays_and_check_membership() {
         json.starts_with('[') && json.contains("\"deploy\"") && json.contains("\"invoke\""),
         "{json}"
     );
-    assert_eq!(Scopes::all().iter().count(), 11);
+    assert_eq!(Scopes::all().iter().count(), 12);
     assert!(!Scopes::default().contains(Scope::Invoke));
     assert!(serde_json::from_str::<Scopes>("[\"invoke\",\"bogus\"]").is_err());
 }

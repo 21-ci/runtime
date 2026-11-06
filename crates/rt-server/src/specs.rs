@@ -231,6 +231,8 @@ pub struct Specs {
     /// plan's `max_warm_floor_total` (a plan downgrade). Set by `NodeImpl::sync_floors`; their
     /// tasks carry no floor, so a request does not bring it back.
     pub unfloored: ArcSwap<HashSet<ServiceId>>,
+    /// `cpu_ms_per_day` of the background triggers (in-memory counters, never `meta.db`).
+    pub quotas: Arc<dyn rt_sec::QuotaEnforcer>,
 }
 
 impl Specs {
@@ -262,8 +264,10 @@ impl Specs {
         if knobs.min_instances > 0 && self.unfloored.load().contains(&entry.service) {
             knobs.min_instances = 0;
         }
+        let mut limits = eff.limits_for(&trigger);
+        plan.cap_call_budgets(&mut limits);
         let mut spec = TaskSpec::new(TaskKind::Exec(entry.runtime), sref, trigger.clone())
-            .with_limits(eff.limits_for(&trigger))
+            .with_limits(limits)
             .with_knobs(knobs)
             .with_payload(payload)
             .with_slug(svc.slug.as_str());
@@ -323,7 +327,7 @@ impl ScheduleTaskFactory for Specs {
             ScheduleKind::Interval { .. } => (Trigger::Interval { id: schedule.id }, entry.triggers.interval),
             ScheduleKind::Cron { .. } => (Trigger::Cron { id: schedule.id }, entry.triggers.cron),
         };
-        if !enabled {
+        if !enabled || self.quotas.cpu_exhausted(entry.tenant) {
             return None;
         }
         let payload = Payload::Schedule(ScheduledEvent {
@@ -339,7 +343,7 @@ impl DelayedTaskFactory for Specs {
     /// One-off schedules ride the service's interval switch (`triggers.interval`, timed triggers).
     fn task_for(&self, service: ServiceId, item: &DelayedItem) -> Option<TaskSpec> {
         let (entry, svc) = self.lookup(service)?;
-        if !entry.triggers.interval {
+        if !entry.triggers.interval || self.quotas.cpu_exhausted(entry.tenant) {
             return None;
         }
         let payload = serde_json::from_slice(&item.payload).unwrap_or(serde_json::Value::Null);
@@ -479,6 +483,7 @@ impl Specs {
     /// otherwise nothing is leased, so no delivery attempt is burned while it cannot run.
     fn consumes_queue(&self, entry: &RouteEntry) -> bool {
         entry.triggers.queue
+            && !self.quotas.cpu_exhausted(entry.tenant)
             && self
                 .plans
                 .plan_arc(entry.tenant)
@@ -554,7 +559,7 @@ impl CallTaskFactory for Specs {
 
 impl Specs {
     /// Changes with the route table and with every swap of the service table.
-    fn events_generation(&self) -> u64 {
+    pub(crate) fn events_generation(&self) -> u64 {
         self.routes.generation() ^ (Arc::as_ptr(&*self.services.load()) as usize as u64)
     }
 
@@ -573,6 +578,29 @@ impl Specs {
             project: entry.project,
             environment: entry.environment.clone(),
         }
+    }
+}
+
+impl Specs {
+    /// Services with `events.data_events` whose plan allows the `stream` trigger.
+    pub(crate) fn data_event_subs(&self) -> Vec<rt_triggers::data_events::DataEventsSub> {
+        self.event_services(TriggerKind::Stream)
+            .into_iter()
+            .filter_map(|(entry, svc)| {
+                let cfg = svc.config.events.data_events.clone()?;
+                Some(rt_triggers::data_events::DataEventsSub {
+                    service: entry.service,
+                    tenant: entry.tenant,
+                    ns: Self::namespace_of(&entry),
+                    cfg,
+                    max_stream_bytes: self
+                        .plans
+                        .plan_arc(entry.tenant)
+                        .max_stream_mb
+                        .saturating_mul(1024 * 1024),
+                })
+            })
+            .collect()
     }
 }
 
@@ -842,6 +870,7 @@ mod tests {
                 project: rt_types::ProjectId::from_u128(1),
                 environment: rt_types::default_environment(),
                 call: rt_types::CallAccess::default(),
+                isolated: false,
             }],
             ..RouteSnapshot::default()
         });
@@ -861,12 +890,14 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         };
+        let plans: Arc<dyn PlanSource> = Arc::new(TenantPlans::new(config.clone(), tenants.clone()));
         let specs = Specs {
             config: config.clone(),
-            plans: Arc::new(TenantPlans::new(config.clone(), tenants.clone())),
+            plans: plans.clone(),
             routes,
             services: Arc::new(ArcSwap::from_pointee(HashMap::from([(sid, Arc::new(svc))]))),
             unfloored: ArcSwap::default(),
+            quotas: Arc::new(rt_sec::LocalQuotaEnforcer::new(plans)),
         };
         let leased = [Leased {
             id: rt_types::MsgId::new(),
@@ -880,6 +911,49 @@ mod tests {
         tenants.insert(tid, tenant(tid, "free", serde_json::Value::Null));
         assert!(specs.routable(sid), "the free plan allows `queue`");
         assert!(QueueTaskFactory::task_for(&specs, sid, &leased).is_some());
+    }
+
+    /// `cpu_ms_per_day` spent: schedules, one-off schedules and queues stop without a `meta.db` read
+    /// or an invocation taken; a counted day's end brings them back (the enforcer's own roll).
+    #[test]
+    fn a_spent_cpu_budget_stops_schedules_and_queue_delivery() {
+        struct Spent(std::sync::atomic::AtomicBool);
+        impl rt_sec::QuotaEnforcer for Spent {
+            fn check(&self, _: TenantId, _: rt_sec::QuotaOp) -> Result<(), rt_sec::QuotaError> {
+                panic!("the gate must not take an invocation");
+            }
+            fn record(&self, _: TenantId, _: ServiceId, _: rt_types::UsageDelta) {}
+            fn cpu_exhausted(&self, _: TenantId) -> bool {
+                self.0.load(std::sync::atomic::Ordering::Relaxed)
+            }
+        }
+        let on = rt_types::TriggerSwitches {
+            http: true,
+            cron: true,
+            interval: true,
+            queue: true,
+            call: true,
+            websocket: true,
+        };
+        let (mut specs, sid) = specs_with(on);
+        let spent = Arc::new(Spent(std::sync::atomic::AtomicBool::new(true)));
+        specs.quotas = spent.clone();
+        let interval = schedule(sid, ScheduleKind::Interval { every_seconds: 60 });
+        let item = DelayedItem {
+            id: "d".into(),
+            gen: 1,
+            run_at_ms: 5,
+            attempt: 1,
+            payload: bytes::Bytes::new(),
+        };
+        assert!(!specs.routable(sid), "nothing is leased");
+        assert!(ScheduleTaskFactory::task_for(&specs, &interval, 5).is_none());
+        assert!(DelayedTaskFactory::task_for(&specs, sid, &item).is_none());
+
+        spent.0.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(specs.routable(sid));
+        assert!(ScheduleTaskFactory::task_for(&specs, &interval, 5).is_some());
+        assert!(DelayedTaskFactory::task_for(&specs, sid, &item).is_some());
     }
 
     // ---- plans ---------------------------------------------------------------------------------
@@ -998,6 +1072,7 @@ mod tests {
                 project: rt_types::ProjectId::from_u128(1),
                 environment: rt_types::default_environment(),
                 call: rt_types::CallAccess::default(),
+                isolated: false,
             }],
             ..RouteSnapshot::default()
         });
@@ -1017,12 +1092,14 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         };
+        let plans: Arc<dyn PlanSource> = Arc::new(TenantPlans::new(config.clone(), tenants));
         let specs = Specs {
-            config: config.clone(),
-            plans: Arc::new(TenantPlans::new(config, tenants)),
+            config,
+            plans: plans.clone(),
             routes,
             services: Arc::new(ArcSwap::from_pointee(HashMap::from([(sid, Arc::new(svc))]))),
             unfloored: ArcSwap::default(),
+            quotas: Arc::new(rt_sec::LocalQuotaEnforcer::new(plans)),
         };
         (specs, sid)
     }

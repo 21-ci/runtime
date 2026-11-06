@@ -52,6 +52,8 @@ Returned by the control listener (`/v1/*`, default port 8081) in `error.code`.
 | `host_not_allowed` | 403 | The custom host does not match the plan's `custom_host_suffixes`. | Use an allowed suffix, or ask the operator to attach the host. |
 | `reserved` | 403 | The system tenant is reserved: operator SDKs live there and are managed only through `/v1/sdks`. | Use the SDK routes (`21ci sdk`) instead of the tenant routes. |
 | `not_found` | 404 | The resource does not exist, belongs to another tenant, or is a service whose project or environment the key does not admit (a restricted key cannot tell these apart). | Check the id or slug, the tenant of your key and its `project_ids` and `environments` (`21ci whoami`). |
+| `archive_gone` | 410 | The backup's row exists but this node has no archive for it: it failed, retention removed it, or the data directory was restored. | Use another backup. |
+| `backup_running` | 409 | A backup is already running, or the one you tried to delete still is. | Wait for it: `GET /v1/node/backups/status`. |
 | `slug_taken` | 409 | Another service on the node already uses this slug (slugs are node-wide). | Pick another slug. |
 | `topic_exists` | 409 | The tenant already has a topic with this name (a topic name is unique within the tenant). | Pick another name, or use the existing topic. |
 | `host_taken` | 409 | Another service already holds this host. | Use another host, or remove it from the other service first. |
@@ -70,6 +72,8 @@ Returned by the control listener (`/v1/*`, default port 8081) in `error.code`.
 | `precondition_failed` | 412 | `If-Match` did not match the current `ETag`: somebody changed the service meanwhile. | Re-read the service and retry with the new `ETag`. |
 | `too_large` | 413 | The request body is over the limit. | Shrink the body; upload limits are in the limits reference. |
 | `storage_quota` | 413 | The write would push the tenant over the plan's `storage_mb`. | Delete data or blobs, or ask for a bigger plan. |
+| `egress_denied` | 403 | `from-url`: the egress rules refuse the URL or a redirect hop (private address, plain `http`, the service's rules). | Use a public `https` URL the service's `egress` block allows. |
+| `fetch_failed` | 502 | `from-url`: unreachable, too many redirects, timed out or a non-2xx answer (`details.status`). | Check the URL and its credentials. |
 | `egress_quota` | 413 | The tenant used up the plan's `egress_mb_per_day`. | Wait for the day window to reset, or ask for a bigger plan. |
 | `sql_error` | 422 | A SQL statement of the service failed (syntax, constraint, ...). | Read the message in the response and fix the statement. |
 | `sql_not_authorized` | 422 | The statement uses something the SQL authorizer denies (for example `ATTACH`, extension loading or a restricted `PRAGMA`). | Rewrite the statement without it. |
@@ -92,7 +96,24 @@ Returned by the control listener (`/v1/*`, default port 8081) in `error.code`.
 | `queue_full` | 429 | The service queue is at the plan's `max_queue_depth`. Carries `Retry-After`. | Let consumers catch up, or check the DLQ. |
 | `stream_full` | 429 | The tenant's topics hold more records and dead letters than the plan's storage cap allows. | Let consumers catch up and trim retention, or ask for a bigger plan. |
 | `not_implemented` | 501 | The route exists in the API but is not implemented in this release. | None. |
+| `backup_disabled` | 503 | `backup.enabled` is off on this node. | Turn it on in `rt.toml` and restart. |
 | `control_disabled` | 503 | A release build started without `RT_ROOT_TOKEN`: the control API is off. | Set `RT_ROOT_TOKEN` (or `RT_ROOT_TOKEN_FILE`) and restart. |
+
+## Backup codes
+
+These are not HTTP responses. A background backup reports them in `last_failure` of `GET /v1/node/backups/status`; startup and `rt backup` print them.
+
+| Code | Where | Meaning | What to do |
+|---|---|---|---|
+| `plaintext_remote` | startup | `backup.s3` is set without a recipient. | Set `backup.encrypt_to`, or `backup.allow_plaintext_remote = true`. |
+| `bad_config` | startup | `backup.s3.bucket` is not a bucket name, or `backup.s3.prefix` has unsafe characters. | Fix the key. |
+| `endpoint_refused` | startup, upload | `backup.s3.endpoint` is not allowed. | Read the message and fix the endpoint. |
+| `upload_failed` | backup | The upload failed. The message carries the underlying code (`s3_error`, `size_mismatch`, `digest_mismatch`), and the archive stays on the local disk. | Fix the cause; the local archive is still usable. |
+| `s3_error` | upload | The endpoint could not be reached, answered with an error status, or gave an incomplete answer. | Check the endpoint, credentials and bucket. |
+| `size_mismatch` | upload | The uploaded object does not have the archive's size. | Run the backup again. |
+| `digest_mismatch` | backup, restore | The bytes are not the ones written: the local archive, the uploaded sidecar, or an entry at restore. | Run the backup again, or restore another archive. |
+| `age_identity_required` | `rt backup verify`, `restore` | The archive is encrypted. | Pass `--age-identity FILE`. |
+| `not_encrypted` | `rt backup verify`, `restore` | `--age-identity` was given for an archive that is not encrypted. | Leave the flag out. |
 
 ## Invoke reasons (`x-rt-reason`)
 

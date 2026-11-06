@@ -233,7 +233,13 @@ pub trait LogStore: LogSink {
 
     /// Delete segments older than `retention_days` or beyond `max_mb_per_service`, oldest first
     /// (OBS-04). Called periodically by sysmon / an I/O timer.
-    fn sweep_retention(&self, now_ms: UnixMs) -> SweepReport;
+    fn sweep_retention(&self, now_ms: UnixMs) -> SweepReport {
+        self.sweep_retention_for(now_ms, &|_| None)
+    }
+
+    /// [`Self::sweep_retention`] with a per-service cap in days (a plan's `log_retention_days`):
+    /// the lower of it and `retention_days` applies.
+    fn sweep_retention_for(&self, now_ms: UnixMs, cap_days: &dyn Fn(ServiceId) -> Option<u32>) -> SweepReport;
 
     /// Records dropped by the per-service rate limit (`rt_logs_dropped_total`).
     fn dropped_total(&self) -> u64;
@@ -891,11 +897,12 @@ impl LogStore for FileLogStore {
         LogPage { records, next_cursor }
     }
 
-    fn sweep_retention(&self, now_ms: UnixMs) -> SweepReport {
+    fn sweep_retention_for(&self, now_ms: UnixMs, cap_days: &dyn Fn(ServiceId) -> Option<u32>) -> SweepReport {
         let cfg = &self.inner.cfg;
-        let cutoff = now_ms.saturating_sub(i64::from(cfg.retention_days) * DAY_MS);
         let mut report = SweepReport::default();
         for id in self.inner.all_services() {
+            let days = cap_days(id).map_or(cfg.retention_days, |d| d.min(cfg.retention_days));
+            let cutoff = now_ms.saturating_sub(i64::from(days) * DAY_MS);
             let svc = self.inner.svc(id);
             let mut s = svc.lock();
             let mut doomed: Vec<usize> = s

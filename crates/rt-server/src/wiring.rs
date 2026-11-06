@@ -183,6 +183,9 @@ pub struct StartOptions {
     pub meta_layer: Option<MetaLayer>,
     /// Failure plans attached to the opened stores (tests make store operations fail on demand).
     pub faults: StartFaults,
+    /// Fetches `POST …/versions/from-url` archives; the guard-backed fetcher by default (tests use
+    /// one whose guard resolves to a local mock origin).
+    pub archive_fetcher: Option<Arc<dyn rt_api::ArchiveFetcher>>,
     /// The clock of drain deadlines (tests step it); the node's clock by default.
     pub promote_clock: Option<Arc<dyn Clock>>,
     /// Wraps the route refresh of `promote()` (tests make it fail on demand).
@@ -225,6 +228,10 @@ struct LateCalls {
 
 #[async_trait]
 impl Calls for LateCalls {
+    fn is_isolated(&self, service: ServiceId) -> bool {
+        self.inner.get().is_some_and(|d| d.is_isolated(service))
+    }
+
     async fn call(&self, from: &TaskCtx, slug: &str, req: Request) -> Result<Response, CallError> {
         match self.inner.get() {
             Some(d) => d.call(from, slug, req).await,
@@ -407,6 +414,86 @@ impl rt_host::SocketHost for LateSockets {
     }
 }
 
+/// What the data-change pump asks of the node.
+struct PumpHost {
+    specs: Arc<Specs>,
+    events: mpsc::UnboundedSender<NodeEvent>,
+    stream_engine: Arc<StreamEngine>,
+    /// By generation: the pump asks every second, and walking every service for it is not free.
+    subs: parking_lot::Mutex<Option<(u64, Vec<rt_triggers::data_events::DataEventsSub>)>>,
+}
+
+impl rt_triggers::data_events::DataEventsHost for PumpHost {
+    fn subscriptions(&self) -> Vec<rt_triggers::data_events::DataEventsSub> {
+        let generation = self.specs.events_generation();
+        let mut cached = self.subs.lock();
+        match &*cached {
+            Some((g, subs)) if *g == generation => subs.clone(),
+            _ => {
+                let subs = self.specs.data_event_subs();
+                *cached = Some((generation, subs.clone()));
+                subs
+            }
+        }
+    }
+
+    fn service_event(&self, tenant: TenantId, service: ServiceId, action: &str, message: &str) {
+        let mut ev = NodeEvent::new(action.to_string(), chrono::Utc::now().timestamp_millis());
+        ev.tenant = Some(tenant);
+        ev.service = Some(service);
+        ev.data = serde_json::json!({ "message": message });
+        let _ = self.events.send(ev);
+    }
+
+    fn appended(&self, topic: rt_types::TopicId) {
+        self.stream_engine.notify(topic);
+    }
+}
+
+/// The Vault sync, when `[secrets.vault]` is set: its own trusted guard, never a guest's.
+fn vault_sync_of(
+    cfg: &Config,
+    guard: &EgressGuardConfig,
+    denylist: Arc<dyn rt_sec::EgressDenylist>,
+    meta: &Arc<dyn MetaStore>,
+    secrets: &Arc<dyn SecretsBackend>,
+    events: mpsc::UnboundedSender<NodeEvent>,
+) -> Result<Option<Arc<crate::vault_sync::VaultSync>>, String> {
+    use rt_host::vault::{VaultAuth, VaultClient, VaultSettings};
+    let v = &cfg.secrets.vault;
+    if v.address.is_empty() {
+        return Ok(None);
+    }
+    let mut g = guard.clone();
+    if !v.ca_file.is_empty() {
+        g.extra_root_pem = Some(std::fs::read(&v.ca_file).map_err(|_| "cannot read ca_file".to_string())?);
+    }
+    let auth = if v.token_file.is_empty() {
+        VaultAuth::AppRole {
+            role_id_file: v.role_id_file.clone().into(),
+            secret_id_file: v.secret_id_file.clone().into(),
+        }
+    } else {
+        VaultAuth::TokenFile(v.token_file.clone().into())
+    };
+    let client = VaultClient::new(
+        VaultSettings {
+            address: v.address.clone(),
+            mount: v.mount.clone(),
+            auth,
+        },
+        Arc::new(GuardedEgress::for_trusted_endpoints(g, denylist)),
+    );
+    Ok(Some(crate::vault_sync::VaultSync::new(
+        meta.clone(),
+        secrets.clone(),
+        Arc::new(client),
+        v.path_template.clone(),
+        v.poll,
+        events,
+    )))
+}
+
 struct ServerAudit {
     events: mpsc::UnboundedSender<NodeEvent>,
     base: Arc<dyn AuditSink>,
@@ -471,6 +558,9 @@ struct BuildJob {
 // ---------------------------------------------------------------------------------------------
 
 struct NodeImpl {
+    /// `status.host` and the node series.
+    host: Arc<rt_obs::HostSampler>,
+    policy: Arc<PlanPolicy>,
     config: Arc<ArcSwap<Config>>,
     draining: AtomicBool,
     stalled: AtomicBool,
@@ -508,6 +598,8 @@ struct NodeImpl {
     pubsub: Arc<PubsubRouter>,
     /// Woken by appends, invalidated by consumer resets, drained with the node.
     stream_engine: Arc<StreamEngine>,
+    data_events: Arc<rt_triggers::data_events::DataEventsPump>,
+    vault_sync: Option<Arc<crate::vault_sync::VaultSync>>,
     /// Woken by accepted async requests, drained with the node.
     async_engine: Arc<AsyncEngine>,
 }
@@ -526,6 +618,9 @@ fn apply_live_knobs(cfg: &Config, scheduler: &Scheduler, governor: &Governor) {
     let k = cfg.node_knobs();
     governor.set_watermarks(k.memory_high.value, k.memory_critical.value);
 }
+
+/// One host sample per minute (the maintenance pass ticks every 100 ms).
+const HOST_SAMPLE_EVERY_TICKS: u64 = 600;
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -633,6 +728,18 @@ impl NodeImpl {
 }
 
 impl NodeInfo for NodeImpl {
+    fn host(&self) -> Option<Arc<rt_obs::HostSampler>> {
+        Some(self.host.clone())
+    }
+
+    fn storage_bytes(&self) -> u64 {
+        self.policy.storage_total()
+    }
+
+    fn tenant_storage_bytes(&self, tenant: TenantId) -> u64 {
+        self.policy.storage_used(tenant)
+    }
+
     fn cache(&self) -> serde_json::Value {
         let top = |keys: Vec<PreparedKey>| keys.iter().map(|k| k.digest.to_string()).collect::<Vec<_>>();
         serde_json::json!({
@@ -692,6 +799,24 @@ impl NodeInfo for NodeImpl {
             PubsubError::Validation(m) => ("validation_failed", m),
             other => (other.code(), other.to_string()),
         })
+    }
+
+    fn secret_sync(&self) -> Option<Arc<dyn rt_api::secret_refs::SecretSync>> {
+        self.vault_sync
+            .clone()
+            .map(|v| v as Arc<dyn rt_api::secret_refs::SecretSync>)
+    }
+
+    fn data_events_status(&self, service: ServiceId) -> Option<rt_api::state::DataEventsStatus> {
+        self.data_events
+            .status(service)
+            .map(|p| rt_api::state::DataEventsStatus {
+                state: p.state,
+                backlog: p.backlog,
+                lag_ms: p.lag_ms,
+                last_error: p.last_error,
+                warnings: p.warnings,
+            })
     }
 
     fn schedule_running(&self, service: ServiceId) -> bool {
@@ -792,6 +917,7 @@ impl NodeInfo for NodeImpl {
             ControlEvent::StreamAppended(topic) => self.stream_engine.notify(topic),
             ControlEvent::AsyncAccepted(svc) => self.async_engine.notify(svc),
             ControlEvent::ConsumersReset(svc) => self.stream_engine.invalidate(svc),
+            ControlEvent::DataEventsChanged(svc) => self.data_events.rearm(svc),
         }
     }
 
@@ -820,6 +946,11 @@ impl NodeInfo for NodeImpl {
 // ---------------------------------------------------------------------------------------------
 // Running server
 // ---------------------------------------------------------------------------------------------
+
+/// Free disk a backup leaves, beyond what it is estimated to need.
+const BACKUP_FREE_FLOOR: u64 = 256 * MIB;
+/// How often the backup schedule is looked at.
+const BACKUP_TICK: Duration = Duration::from_secs(30);
 
 /// One pass of a periodic job; the argument is its 1-based tick count.
 type PeriodicPass = Arc<dyn Fn(u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
@@ -963,6 +1094,7 @@ impl RunningServer {
     pub async fn shutdown(self) {
         let inner = self.inner;
         inner.node.start_drain();
+        inner.api.backups.cancel();
         // WebSockets were told the node goes away (1001): give their close handshakes and the
         // event tasks they started `ws.drain_grace`.
         let grace = Instant::now() + inner.api.config.load().ws.drain_grace;
@@ -1197,6 +1329,10 @@ async fn seed_daily_usage(meta: &Arc<dyn MetaStore>, tenants: &DashMap<TenantId,
                 if invocations > 0 || egress > 0 {
                     quotas.seed_daily(tenant, now.timestamp_millis(), invocations, egress);
                 }
+                let cpu = rows.iter().fold(0u64, |a, r| a.saturating_add(r.cpu_ms));
+                if cpu > 0 {
+                    quotas.seed_daily_cpu(tenant, now.timestamp_millis(), cpu);
+                }
             }
             Err(e) => {
                 tracing::warn!(%tenant, error = %e, "usage seed failed: the tenant's daily counters start at zero")
@@ -1340,6 +1476,7 @@ pub async fn start_with(
     if let Some(f) = &opts.faults.meta {
         meta_db.inject_faults(f.clone());
     }
+    let backup_meta = meta_db.clone();
     let meta: Arc<dyn MetaStore> = meta_db;
     // queue.db also holds the one-off schedules of std:schedule (its `delayed` table).
     let queue_db = SqliteQueueStore::open(
@@ -1360,6 +1497,14 @@ pub async fn start_with(
         None => meta,
     };
 
+    // Fetches too: their versions end as failed, never stuck in `fetching`.
+    let failed = meta
+        .fail_interrupted_fetches()
+        .await
+        .map_err(startup("recover fetches"))?;
+    if failed > 0 {
+        tracing::info!(failed, "failed the fetches interrupted by the last stop");
+    }
     // A crash leaves switches open; their tasks died with the process.
     let closed = meta.recover_switches().await.map_err(startup("recover switches"))?;
     if closed > 0 {
@@ -1448,6 +1593,35 @@ pub async fn start_with(
     }
     let data: Arc<dyn ServiceDataStore> = local_data.clone();
 
+    // Node backups: the manager's own thread, not the blocking pool; see `rt-backup`.
+    let backups = rt_backup::manager::BackupManager::new(
+        rt_backup::manager::BackupConfig {
+            enabled: cfg.backup.enabled,
+            schedule: cfg.backup.schedule.clone(),
+            dir: if cfg.backup.dir.is_empty() {
+                data_dir.join("backups")
+            } else {
+                PathBuf::from(&cfg.backup.dir)
+            },
+            keep_last: cfg.backup.keep_last,
+            free_floor_bytes: BACKUP_FREE_FLOOR,
+            encrypt_to: cfg.backup.encrypt_to.clone(),
+            allow_plaintext_remote: cfg.backup.allow_plaintext_remote,
+            remote: crate::backup::remote_config(&cfg).map_err(startup("backup.s3"))?,
+        },
+        rt_backup::create::Sources {
+            data_dir: data_dir.clone(),
+            data: local_data.clone(),
+            secrets: secrets_backend.clone(),
+            master: master.clone(),
+        },
+        backup_meta,
+        Some(metrics.clone()),
+        tokio::runtime::Handle::current(),
+    )
+    .map_err(startup("backup.schedule"))?;
+    backups.startup_sweep().await.map_err(startup("backup sweep"))?;
+
     let audit: Arc<dyn AuditSink> = Arc::new(ServerAudit {
         events: control.event_sender(),
         base: audit_base,
@@ -1470,8 +1644,23 @@ pub async fn start_with(
         allow_https_downgrade: cfg.egress.allow_https_downgrade,
         ..EgressGuardConfig::default()
     };
+    let guest_guard_cfg = guard_cfg.clone();
+    #[cfg(debug_assertions)]
+    let guest_guard_cfg = rt_host::local_test_origin::apply_to_guests(guest_guard_cfg);
     let egress: Arc<dyn EgressGuard> =
-        Arc::new(GuardedEgress::new(guard_cfg.clone(), denylist.clone()).with_metrics(metrics.clone()));
+        Arc::new(GuardedEgress::new(guest_guard_cfg, denylist.clone()).with_metrics(metrics.clone()));
+    let archives: Arc<dyn rt_api::ArchiveFetcher> = opts.archive_fetcher.clone().unwrap_or_else(|| {
+        let guard = GuardedEgress::new(crate::archive_fetch::archive_guard_config(&guard_cfg), denylist.clone())
+            .with_metrics(metrics.clone());
+        Arc::new(crate::archive_fetch::GuardedArchiveFetcher::new(
+            Arc::new(guard),
+            data_dir.clone(),
+        ))
+    });
+    let telemetry_egress: Arc<dyn EgressGuard> = Arc::new(
+        GuardedEgress::new(crate::telemetry::guard_config(&guard_cfg), denylist.clone()).with_metrics(metrics.clone()),
+    );
+    let guard_cfg_for_vault = guard_cfg.clone();
     let trusted_egress: Arc<dyn EgressGuard> =
         Arc::new(GuardedEgress::for_trusted_endpoints(guard_cfg, denylist.clone()).with_metrics(metrics.clone()));
     let plan_of = {
@@ -1688,6 +1877,7 @@ pub async fn start_with(
         routes: routes.clone(),
         services: service_table.clone(),
         unfloored: ArcSwap::default(),
+        quotas: quotas.clone(),
     });
     let persist_next_due: rt_triggers::PersistNextDue = {
         let meta = meta.clone();
@@ -1811,6 +2001,25 @@ pub async fn start_with(
         .with_metrics(metrics.clone())
         .with_quota(async_quota(quotas.clone())),
     );
+    let vault_sync = vault_sync_of(
+        &cfg,
+        &guard_cfg_for_vault,
+        denylist.clone(),
+        &meta,
+        &secrets_backend,
+        control.event_sender(),
+    )
+    .map_err(startup("secrets.vault"))?;
+    let data_events_pump = Arc::new(rt_triggers::data_events::DataEventsPump::new(
+        local_data.clone(),
+        streams.clone(),
+        Arc::new(PumpHost {
+            specs: specs.clone(),
+            events: control.event_sender(),
+            stream_engine: stream_engine.clone(),
+            subs: parking_lot::Mutex::new(None),
+        }),
+    ));
     let notify_stream: rt_triggers::events::StreamNotify = {
         let se = stream_engine.clone();
         Arc::new(move |t| se.notify(t))
@@ -1845,6 +2054,8 @@ pub async fn start_with(
 
     let (build_tx, mut build_rx) = mpsc::unbounded_channel::<BuildJob>();
     let node = Arc::new(NodeImpl {
+        host: Arc::new(rt_obs::HostSampler::new(rt_obs::HostSources::system(data_dir.clone()))),
+        policy: policy.clone(),
         config: config.clone(),
         draining: AtomicBool::new(false),
         stalled: AtomicBool::new(false),
@@ -1870,8 +2081,13 @@ pub async fn start_with(
         sockets: sockets.clone(),
         pubsub,
         stream_engine: stream_engine.clone(),
+        data_events: data_events_pump.clone(),
+        vault_sync: vault_sync.clone(),
         async_engine: async_engine.clone(),
     });
+
+    // The first sample at startup: the node series and the status deltas have a base right away.
+    node.host.sample(now_ms(), governor.stats().committed_bytes);
 
     // 10. API state and routers
     let buckets = Arc::new(IngressBuckets::default());
@@ -1889,6 +2105,7 @@ pub async fn start_with(
         None => refresher,
     };
     let promoter = Promoter::new(PromoterDeps {
+        data: data.clone(),
         meta: meta.clone(),
         scheduler: scheduler.clone(),
         config: config.clone(),
@@ -1899,6 +2116,9 @@ pub async fn start_with(
     });
     control.set_promoter(&promoter);
     let state = ApiState {
+        backups: Arc::new(crate::backup::BackupCtl(backups.clone())),
+        // On the data directory's filesystem: an import is renamed into place.
+        app_bundles: rt_api::app_bundle::AppBundles::new(data_dir.join("app-bundles")),
         promoter,
         config: config.clone(),
         meta: meta.clone(),
@@ -1930,11 +2150,20 @@ pub async fn start_with(
         tenant_table: tenant_table.clone(),
         ingress,
         sockets: sockets.clone(),
+        data_browse: Arc::default(),
+        fetches: Arc::default(),
         uploads: Arc::new(tokio::sync::Semaphore::new(rt_api::MAX_CONCURRENT_UPLOADS)),
+        archives,
     };
     rt_api::refresh_routes(&state)
         .await
         .map_err(|e| ServerError::Startup(e.message))?;
+    let swept = rt_api::app_bundle::sweep_interrupted_imports(&state)
+        .await
+        .map_err(|e| ServerError::Startup(e.message))?;
+    if swept > 0 {
+        tracing::info!(swept, "removed the services of imports interrupted by the last stop");
+    }
 
     // Schedules persisted in meta.db come back (missed ticks are not backfilled, TRG-08).
     for sch in meta.all_schedules().await.map_err(startup("schedules"))? {
@@ -2069,6 +2298,13 @@ pub async fn start_with(
     // 12. background tasks
     let mut background: Vec<JoinHandle<()>> = Vec::new();
     let mut periodic: Vec<PeriodicPass> = Vec::new();
+    background.extend(crate::telemetry::start(
+        &cfg,
+        meta.clone(),
+        stats.clone(),
+        telemetry_egress,
+        Some(metrics.clone()),
+    ));
     {
         let e = schedule_engine.clone();
         background.push(tokio::spawn(async move { e.run().await }));
@@ -2216,7 +2452,16 @@ pub async fn start_with(
         let mem_check = cfg.memory.check_interval.max(Duration::from_millis(100));
         let mem_every = (mem_check.as_millis() / 100).max(1) as u64;
         node.heartbeat();
+        let vault = vault_sync.clone();
+        let vault_node: Arc<dyn NodeInfo> = node.clone();
+        let (sweep_services, sweep_plans) = (service_table.clone(), plans.clone());
         let (task, pass) = spawn_periodic(Duration::from_millis(100), false, move |n| {
+            // Once a second; the pass itself runs on its own task, so Vault cannot hold this tick.
+            if n % 10 == 0 {
+                if let Some(v) = &vault {
+                    v.tick(vault_node.clone());
+                }
+            }
             let (node, sched, metrics, stats, logs) = (
                 node.clone(),
                 sched.clone(),
@@ -2226,6 +2471,7 @@ pub async fn start_with(
             );
             let (dc, wc, governor, cache_dir) = (dc.clone(), wc.clone(), governor.clone(), cache_dir.clone());
             let (meta_m, queue_m, specs_m) = (meta_m.clone(), queue_m.clone(), specs_m.clone());
+            let (sweep_services, sweep_plans) = (sweep_services.clone(), sweep_plans.clone());
             async move {
                 node.heartbeat();
                 if n.is_multiple_of(mem_every) {
@@ -2238,6 +2484,10 @@ pub async fn start_with(
                 if n.is_multiple_of(10) {
                     stats.merge_shards();
                     metrics.observe_sched(&sched.snapshot());
+                }
+                if n.is_multiple_of(HOST_SAMPLE_EVERY_TICKS) {
+                    let (host, committed) = (node.host.clone(), governor.stats().committed_bytes);
+                    let _ = tokio::task::spawn_blocking(move || host.sample(now_ms(), committed)).await;
                 }
                 if n.is_multiple_of(100) {
                     dc.sweep_idle(Instant::now());
@@ -2259,7 +2509,11 @@ pub async fn start_with(
                     .await;
                 }
                 if n.is_multiple_of(36_000) {
-                    logs.sweep_retention(now_ms());
+                    let services = sweep_services.load();
+                    logs.sweep_retention_for(now_ms(), &|id| {
+                        let svc = services.get(&id)?;
+                        Some(sweep_plans.plan_arc(svc.tenant_id).log_retention_days).filter(|d| *d > 0)
+                    });
                 }
                 if n.is_multiple_of(600) {
                     // Decrypted secrets of services nobody ran for 10 minutes leave memory.
@@ -2300,6 +2554,16 @@ pub async fn start_with(
         periodic.push(pass);
     }
     {
+        // Data-change outboxes into their topics (R14). Idle services cost an atomic load.
+        let pump = data_events_pump.clone();
+        let (task, pass) = spawn_periodic(Duration::from_secs(1), true, move |n| {
+            let pump = pump.clone();
+            async move { pump.pass(n).await }
+        });
+        background.push(task);
+        periodic.push(pass);
+    }
+    {
         // Expired KV rows are hidden on read but only deleted here (B3.7). Each service's sweep
         // runs on the fair blocking pool in its tenant's lane; only open databases are swept.
         let local_data = local_data.clone();
@@ -2327,6 +2591,18 @@ pub async fn start_with(
         periodic.push(pass);
     }
     {
+        // Idle client cells of `ingress.rate_rules`: walks every cell, so off the async threads.
+        let state = state.clone();
+        let (task, pass) = spawn_periodic(SCRATCH_SWEEP_INTERVAL, true, move |_| {
+            let state = state.clone();
+            async move {
+                let _ = tokio::task::spawn_blocking(move || state.ingress.rate_rules.prune(&state.clock)).await;
+            }
+        });
+        background.push(task);
+        periodic.push(pass);
+    }
+    {
         // Warm floors (`scaling.min_instances`) of services that no longer hold one are released
         // even if the event that should have released them was missed.
         let node = node.clone();
@@ -2340,15 +2616,31 @@ pub async fn start_with(
     {
         // Artifacts nothing references and nothing wrote or touched for the grace period: modules
         // and locks of failed builds, uploads whose version was never added.
-        let (meta, artifacts) = (meta.clone(), artifacts.clone());
+        let (meta, artifacts, holds) = (meta.clone(), artifacts.clone(), local_data.holds());
         let (task, pass) = spawn_periodic(ORPHAN_SWEEP_INTERVAL, true, move |_| {
-            let (meta, artifacts) = (meta.clone(), artifacts.clone());
+            let (meta, artifacts, holds) = (meta.clone(), artifacts.clone(), holds.clone());
             async move {
+                if holds.gc_paused() {
+                    return; // a running backup; the next pass catches up
+                }
                 match rt_store::artifact::sweep_orphans(&*meta, &*artifacts, rt_store::ARTIFACT_GRACE).await {
                     Ok(0) => {}
                     Ok(n) => tracing::info!(deleted = n, "orphaned artifacts swept"),
                     Err(e) => tracing::warn!(error = %e, "orphaned-artifact sweep failed"),
                 }
+            }
+        });
+        background.push(task);
+        periodic.push(pass);
+    }
+
+    if cfg.backup.enabled {
+        let (backups, mem) = (backups.clone(), mem.clone());
+        let (task, pass) = spawn_periodic(BACKUP_TICK, true, move |_| {
+            let (backups, mem) = (backups.clone(), mem.clone());
+            async move {
+                let pressure = mem.pressure() != rt_mem::Pressure::Normal;
+                backups.tick(chrono::Utc::now().timestamp_millis(), pressure).await;
             }
         });
         background.push(task);

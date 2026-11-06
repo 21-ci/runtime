@@ -98,6 +98,13 @@ pub enum Command {
     Whoami,
     /// The plan limits of your tenant and what is left of them today
     Limits,
+    /// The anonymous daily report of the node (operator)
+    Telemetry {
+        #[command(subcommand)]
+        cmd: TelemetryCmd,
+    },
+    /// Every quota of your tenant with its use, and the whole effective plan as JSON (`--json`)
+    Usage,
     /// Plans configured on the node (operator)
     Plan {
         #[command(subcommand)]
@@ -136,6 +143,22 @@ pub enum Command {
     Versions(VersionsArgs),
     /// Make an older version live again
     Rollback(RollbackArgs),
+    /// Branch services: separate services with their own data, forked from a parent
+    Branch {
+        #[command(subcommand)]
+        cmd: BranchCmd,
+    },
+    /// Make a branch's live version live on its parent, and follow switches
+    Switch(SwitchArgs),
+    /// SQL migrations of a service
+    Migrations {
+        #[command(subcommand)]
+        cmd: MigrationsCmd,
+    },
+    /// Run a version's pending SQL migrations and make it live
+    Promote(PromoteArgs),
+    /// Deploy an archive the node fetches itself (no git or build steps run on the node)
+    FromUrl(FromUrlArgs),
     /// Rebuild a version (clears a failed build)
     Rebuild(RebuildArgs),
     /// Stream the build log of a version until the build ends
@@ -221,6 +244,16 @@ pub enum Command {
     Node {
         #[command(subcommand)]
         cmd: NodeCmd,
+    },
+    /// Node backups (operator): create, list, status, download, delete
+    Backup {
+        #[command(subcommand)]
+        cmd: BackupCmd,
+    },
+    /// Move a service as a bundle: export, import, fork
+    App {
+        #[command(subcommand)]
+        cmd: AppCmd,
     },
     /// Print (or save) the OpenAPI document of the control API
     Openapi(OpenapiArgs),
@@ -506,6 +539,30 @@ pub struct McpArgs {}
 
 #[derive(Subcommand, Debug)]
 pub enum ServiceCmd {
+    /// Create a short-lived preview: isolated by the runtime, deleted with its data when it expires
+    Scratch {
+        /// Service to mirror: slug or svc_… id. Without it, name --runtime
+        #[arg(long, value_name = "SVC")]
+        of: Option<String>,
+        /// Runtime of a preview without --of
+        #[arg(long, value_enum, conflicts_with = "of")]
+        runtime: Option<RuntimeArg>,
+        /// Project of a preview without --of
+        #[arg(long, value_name = "PROJECT", conflicts_with = "of")]
+        project: Option<String>,
+        /// Part of the slug (default: preview)
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Delete it after this long, e.g. 2h (default and maximum: the plan's scratch_ttl_max)
+        #[arg(long, value_parser = parse_duration_arg, value_name = "DURATION")]
+        ttl: Option<Duration>,
+        /// Copy the parent's data and blobs (needs data:admin; forces key access on a public service)
+        #[arg(long, requires = "of")]
+        copy_data: bool,
+        /// A host its code may reach; repeat for more (default: none)
+        #[arg(long = "allow-host", value_name = "HOST")]
+        allow_hosts: Vec<String>,
+    },
     Create {
         /// ^[a-z][a-z0-9-]{1,62}$
         slug: String,
@@ -610,6 +667,10 @@ pub enum ServiceCmd {
         /// Remove a field of a config block (repeatable), back to its default: scaling.max_instances
         #[arg(long = "unset", value_name = "BLOCK.KEY")]
         unset: Vec<String>,
+        /// Replace ingress.rate_rules; repeat for several, first match wins:
+        /// '{"path":"/api/login","methods":["POST"],"rps":5,"burst":10,"by":"ip"}'
+        #[arg(long = "rate-rule", value_name = "JSON")]
+        rate_rule: Vec<String>,
     },
     List {
         #[command(flatten)]
@@ -640,6 +701,9 @@ pub struct PushArgs {
     /// Service slug (default: derived from the file or directory name)
     #[arg(long, value_name = "SLUG")]
     pub service: Option<String>,
+    /// Upload to this branch of the service (`21ci branch create`), not to the service itself
+    #[arg(long, value_name = "NAME", conflicts_with = "create")]
+    pub branch: Option<String>,
     /// Create the service when it does not exist
     #[arg(long)]
     pub create: bool,
@@ -659,6 +723,15 @@ pub struct PushArgs {
     /// open and their next event runs the new version
     #[arg(long, conflicts_with = "no_activate")]
     pub close_sockets: bool,
+    /// Make the version live once its build is ready, SQL migrations first (implies an eager build)
+    #[arg(long, conflicts_with_all = ["no_activate", "close_sockets", "migrations"])]
+    pub after_build: bool,
+    /// Record the commit of PATH (`git` on this machine) as the version's metadata
+    #[arg(long)]
+    pub meta_git: bool,
+    /// WASM: a directory of NNNN_name.sql files that run before this version goes live
+    #[arg(long, value_name = "DIR")]
+    pub migrations: Option<std::path::PathBuf>,
     /// lazy: build on the first request; eager: build now
     #[arg(long, value_enum)]
     pub compile: Option<CompileArg>,
@@ -673,6 +746,35 @@ pub struct PushArgs {
     pub wait_interval: Duration,
 }
 
+#[derive(Subcommand, Debug)]
+pub enum MigrationsCmd {
+    /// What is applied, and what the newest version would still run
+    Status {
+        /// Service slug or svc_… id
+        #[arg(value_name = "SVC")]
+        svc: String,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct PromoteArgs {
+    /// Service slug or svc_… id
+    #[arg(value_name = "SVC")]
+    pub svc: String,
+    /// Version number
+    #[arg(value_name = "VERSION")]
+    pub number: u32,
+    /// Run the pending migrations on a copy of the data and report; change nothing
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Flip without running migrations (repair; needs scope data:admin)
+    #[arg(long, conflicts_with = "dry_run")]
+    pub no_migrate: bool,
+    /// Close the service's WebSockets (code 1012) once the version is live
+    #[arg(long, conflicts_with = "dry_run")]
+    pub close_sockets: bool,
+}
+
 #[derive(Args, Debug)]
 pub struct RollbackArgs {
     /// Service slug or svc_… id
@@ -684,6 +786,149 @@ pub struct RollbackArgs {
     /// Close the service's WebSockets (code 1012) once the version is live
     #[arg(long)]
     pub close_sockets: bool,
+    /// Undo this switch: make the version it replaced live, as a tracked rollback
+    #[arg(long, value_name = "ID", conflicts_with_all = ["to", "close_sockets"])]
+    pub switch: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BranchCmd {
+    /// Create a branch of a service: its config under a forced policy, empty data, no secret values
+    Create {
+        /// Parent service: slug or svc_… id
+        #[arg(value_name = "SVC")]
+        svc: String,
+        /// Branch name; the branch's slug is <parent-slug>-br-<name>
+        #[arg(long, value_name = "NAME")]
+        name: String,
+        /// Copy the parent's data and blobs (needs data:admin; forces key access on a public service)
+        #[arg(long)]
+        copy_data: bool,
+        /// Start from the parent's live version (needs deploy)
+        #[arg(long)]
+        code_of_parent: bool,
+        /// Let interval and cron triggers run on the branch
+        #[arg(long)]
+        schedules: bool,
+        /// Keep the parent's pub/sub subscriptions and stream consumers (needs deploy)
+        #[arg(long)]
+        events_of_parent: bool,
+        /// One of the project's environments (default: a new label br-<name>)
+        #[arg(long, value_name = "ENV")]
+        environment: Option<String>,
+        /// Delete the branch and its data after this long, e.g. 7d
+        #[arg(long, value_parser = parse_duration_arg, value_name = "DURATION")]
+        ttl: Option<Duration>,
+        /// Add the parent's env and secret names with empty values; never a value
+        #[arg(long)]
+        env_names: bool,
+        /// Allow no egress instead of keeping the parent's rules
+        #[arg(long)]
+        no_egress: bool,
+    },
+    /// List the branches of a service
+    List {
+        /// Parent service: slug or svc_… id
+        #[arg(value_name = "SVC")]
+        svc: String,
+        #[command(flatten)]
+        page: ListArgs,
+    },
+    /// Delete a branch and its data; nothing is merged into the parent
+    Delete {
+        /// Parent service: slug or svc_… id
+        #[arg(value_name = "SVC")]
+        svc: String,
+        /// Branch name
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+}
+
+/// `switch <svc> --from <branch>`, or `switch status …`.
+#[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+pub struct SwitchArgs {
+    #[command(subcommand)]
+    pub cmd: Option<SwitchCmd>,
+    /// Service slug or svc_… id (a service with the slug `status`: use its id)
+    #[arg(value_name = "SVC", required = true)]
+    pub svc: Option<String>,
+    /// Branch whose live version to make live here
+    #[arg(long, value_name = "BRANCH", required = true)]
+    pub from: Option<String>,
+    /// Check and report the warnings; write nothing
+    #[arg(long, conflicts_with = "wait")]
+    pub dry_run: bool,
+    /// Wait until the previous version has drained
+    #[arg(long)]
+    pub wait: bool,
+    /// Give up waiting after this long; the switch itself stands
+    #[arg(long, value_parser = parse_duration_arg, default_value = "20m", value_name = "DURATION")]
+    pub wait_timeout: Duration,
+    /// Poll interval of --wait
+    #[arg(long, value_parser = parse_duration_arg, default_value = "1s", hide = true)]
+    pub wait_interval: Duration,
+    /// How long to track the previous version's tasks, e.g. 10m; capped by the node's deploy.drain_max
+    #[arg(long, value_parser = checked_duration, value_name = "DURATION")]
+    pub drain_timeout: Option<String>,
+    /// Close the service's WebSockets (code 1012) once the version is live
+    #[arg(long)]
+    pub close_sockets: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SwitchCmd {
+    /// The switches of a service, newest first, or one of them
+    Status {
+        /// Service slug or svc_… id
+        #[arg(value_name = "SVC")]
+        svc: String,
+        /// Switch id
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+        #[command(flatten)]
+        page: ListArgs,
+    },
+}
+
+/// A duration passed on as written.
+fn checked_duration(s: &str) -> Result<String, String> {
+    parse_duration_arg(s).map(|_| s.to_string())
+}
+
+#[derive(Args, Debug)]
+pub struct FromUrlArgs {
+    /// Service slug or svc_… id
+    #[arg(value_name = "SVC")]
+    pub svc: String,
+    /// https URL of a zip or (gzipped) tar; its query and userinfo are never kept
+    #[arg(value_name = "URL")]
+    pub url: String,
+    /// A request header, NAME:VALUE; sent to the URL's origin only (repeatable)
+    #[arg(long = "header", value_name = "NAME:VALUE")]
+    pub headers: Vec<String>,
+    /// Expected SHA-256 of the bytes fetched
+    #[arg(long, value_name = "HEX")]
+    pub sha256: Option<String>,
+    /// Leading path components to drop (1 for a GitHub tarball)
+    #[arg(long, value_name = "N")]
+    pub strip_components: Option<u32>,
+    /// After stripping: the directory that is the source root
+    #[arg(long, value_name = "DIR")]
+    pub subdir: Option<String>,
+    /// Entry module
+    #[arg(long, value_name = "FILE")]
+    pub entry: Option<String>,
+    /// Version metadata as JSON: {"git":{"sha","ref","repo","author","message"},"label"}
+    #[arg(long, value_name = "JSON")]
+    pub meta: Option<String>,
+    /// lazy: build on the first request; eager: build now
+    #[arg(long, value_enum)]
+    pub compile: Option<CompileArg>,
+    /// Make it live once the build is ready, SQL migrations first
+    #[arg(long)]
+    pub after_build: bool,
 }
 
 #[derive(Args, Debug)]
@@ -889,6 +1134,59 @@ pub enum HostCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum DataCmd {
+    /// Data-change events: show them, or `--set FILE`, or `--off` (setting needs data:read)
+    Events {
+        #[arg(value_name = "SVC")]
+        svc: String,
+        /// JSON file: {topic, tables, kv_prefixes, max_backlog}. Saving also rearms after an overflow
+        #[arg(long, value_name = "FILE", conflicts_with = "off")]
+        set: Option<PathBuf>,
+        #[arg(long)]
+        off: bool,
+    },
+    /// List tables and views with row estimates (scope data:read)
+    Tables {
+        #[arg(value_name = "SVC")]
+        svc: String,
+    },
+    /// Run one read-only SQL statement, audited (scope data:read)
+    Query {
+        #[arg(value_name = "SVC")]
+        svc: String,
+        #[arg(value_name = "SQL")]
+        sql: String,
+        /// Bound parameters as a JSON array
+        #[arg(long, value_name = "JSON")]
+        args: Option<String>,
+        /// Rows, 1..500
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// List KV entries, or show one value with --key (scope data:read)
+    Kv {
+        #[arg(value_name = "SVC")]
+        svc: String,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        /// The key to read, as base64url (`key_b64`)
+        #[arg(long, value_name = "KEY_B64")]
+        key: Option<String>,
+    },
+    /// List blob metadata (scope data:read)
+    Blobs {
+        #[arg(value_name = "SVC")]
+        svc: String,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
     /// Download a consistent SQLite snapshot of the service's database (scope data:admin)
     Export {
         /// Service slug or svc_… id
@@ -938,8 +1236,26 @@ pub enum SecretCmd {
         #[arg(long, value_name = "FILE")]
         from_file: Option<PathBuf>,
     },
-    /// List secret names (values are never shown)
+    /// List secret names, with source and last sync (values are never shown)
     List(SvcArg),
+    /// Make a secret follow Vault; PATH is relative to the node's prefix for the service
+    Ref {
+        #[arg(value_name = "SVC")]
+        svc: String,
+        name: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        field: String,
+    },
+    /// Stop following Vault; the value stays as a plain secret
+    Unref {
+        #[arg(value_name = "SVC")]
+        svc: String,
+        name: String,
+    },
+    /// Ask for a sync of the service's refs now (6 a minute)
+    Sync(SvcArg),
     #[command(alias = "rm")]
     Delete {
         /// Service slug or svc_… id
@@ -970,6 +1286,12 @@ pub enum ScheduleCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum TelemetryCmd {
+    /// Print the next report and whether it is sent. Sends nothing
+    Show,
+}
+
+#[derive(Subcommand, Debug)]
 pub enum SocketsCmd {
     /// Open sockets of one object of a service
     #[command(alias = "list")]
@@ -992,7 +1314,7 @@ pub struct SocketsLsArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(group(ArgGroup::new("which").required(true).multiple(false).args(["socket", "tag"])))]
+#[command(group(ArgGroup::new("which").required(true).multiple(false).args(["socket", "tag", "all"])))]
 pub struct SocketsCloseArgs {
     /// Service slug or svc_… id
     #[arg(value_name = "SVC")]
@@ -1006,6 +1328,9 @@ pub struct SocketsCloseArgs {
     /// Close every socket of the object with this tag instead
     #[arg(long)]
     pub tag: Option<String>,
+    /// Close every socket of the service instead, in all its objects
+    #[arg(long)]
+    pub all: bool,
     /// Close code: 1000 or 3000-4999
     #[arg(long)]
     pub code: Option<u16>,
@@ -1363,6 +1688,9 @@ pub struct StatsArgs {
     /// Time window
     #[arg(long, value_parser = ["5m", "1h", "24h"])]
     pub window: Option<String>,
+    /// Also print the window as a series with this step
+    #[arg(long, value_name = "STEP", value_parser = ["1m", "5m", "1h"])]
+    pub series: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1415,6 +1743,87 @@ pub struct InvokeArgs {
 // ---- node and misc ---------------------------------------------------------------------------
 
 #[derive(Subcommand, Debug)]
+pub enum AppCmd {
+    /// Copy a service to the node of another context: export here, import there. The source stays
+    Move {
+        service: String,
+        /// The context (`21ci config` profile) to import into
+        #[arg(long, value_name = "PROFILE")]
+        to: String,
+        /// The slug there (default: the same)
+        #[arg(long)]
+        slug: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        env: Option<String>,
+        /// Make the live version live when its build is ready
+        #[arg(long)]
+        activate: bool,
+    },
+    /// Save a service as a bundle: data, blobs, sources, env values, secret names
+    Export {
+        service: String,
+        /// The file to write, mode 0600 (it holds env values)
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Create a service from a bundle; versions are rebuilt from source
+    Import {
+        file: PathBuf,
+        /// The new service's slug
+        #[arg(long)]
+        slug: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        env: Option<String>,
+        /// Make the bundle's live version live when its build is ready
+        #[arg(long)]
+        activate: bool,
+    },
+    /// Copy a service on this node to a new service
+    Fork {
+        service: String,
+        /// The new service's slug
+        #[arg(long)]
+        slug: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        env: Option<String>,
+        /// Make the live version live when its build is ready
+        #[arg(long)]
+        activate: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BackupCmd {
+    /// Start a backup now; add --wait to wait until it ends
+    Create {
+        /// Wait until the backup ends; exit 1 if it failed
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Backups of the node, newest first
+    List(ListArgs),
+    /// Whether backups are on, the last good one, the last failure, the next run
+    Status,
+    /// One backup
+    Get { id: String },
+    /// Save a backup's archive to a file (streamed; the file appears when complete)
+    Download {
+        id: String,
+        /// The file to write
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Delete a backup and its archive
+    Delete { id: String },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum NodeCmd {
     /// Capacity, memory, profile, mode
     Status,
@@ -1422,6 +1831,38 @@ pub enum NodeCmd {
     Scheduler,
     /// Cache tiers and hit rates (JSON)
     Cache,
+    /// CPU, load, memory, disk and network over time (at most 24 h, since the last restart)
+    Series {
+        #[arg(long, value_parser = ["1h", "6h", "24h"])]
+        range: Option<String>,
+    },
+    /// Per-service counters and queue state of all tenants (--as-tenant narrows it)
+    Stats {
+        /// Start of the range, ms since the epoch (default: an hour before --to)
+        #[arg(long)]
+        from: Option<i64>,
+        /// End of the range, ms since the epoch (default: now)
+        #[arg(long)]
+        to: Option<i64>,
+        /// Counters only: no percentiles
+        #[arg(long)]
+        counts: bool,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Events of the whole node, oldest first
+    Events {
+        /// Only events after this id
+        #[arg(long)]
+        after: Option<String>,
+        /// Comma-separated kinds
+        #[arg(long)]
+        kinds: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
     /// Stop taking new work and drain
     Drain,
     /// Live node configuration

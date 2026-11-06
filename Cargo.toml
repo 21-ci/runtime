@@ -10,6 +10,7 @@ members = [
   "crates/rt-store",
   "crates/rt-cache",
   "crates/rt-host",
+  "crates/rt-backup",
   "crates/rt-build",
   "crates/rt-exec-deno",
   "crates/rt-exec-wasm",
@@ -58,6 +59,7 @@ rt-sched = { path = "crates/rt-sched" }
 rt-store = { path = "crates/rt-store" }
 rt-cache = { path = "crates/rt-cache" }
 rt-host = { path = "crates/rt-host" }
+rt-backup = { path = "crates/rt-backup" }
 rt-build = { path = "crates/rt-build" }
 rt-exec-deno = { path = "crates/rt-exec-deno" }
 rt-exec-wasm = { path = "crates/rt-exec-wasm" }
@@ -150,6 +152,7 @@ libc = "0.2.177"
 
 # --- build pipeline --------------------------------------------------------
 tar = "0.4.44"
+zstd = "0.13.3"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 flate2 = "1.1.5"
 

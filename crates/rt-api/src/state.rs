@@ -59,6 +59,8 @@ pub enum ControlEvent {
     StreamAppended(rt_types::TopicId),
     /// An async invocation was accepted: wake the async engine for the service.
     AsyncAccepted(ServiceId),
+    /// The service's data-events config was saved: resync its triggers, rearm after an overflow.
+    DataEventsChanged(ServiceId),
     /// A consumer cursor of the service was reset: drop the stream engine's cached positions.
     ConsumersReset(ServiceId),
     /// A version is about to go live: bring its prepared artifact into memory ahead of traffic.
@@ -66,6 +68,16 @@ pub enum ControlEvent {
         digest: Digest,
         runtime: RuntimeKind,
     },
+}
+
+/// The data-change pump's report of a service.
+#[derive(Clone, Debug, Default)]
+pub struct DataEventsStatus {
+    pub state: String,
+    pub backlog: u64,
+    pub lag_ms: u64,
+    pub last_error: Option<String>,
+    pub warnings: Vec<String>,
 }
 
 /// Facts and actions only the server knows (cache, V8 build, readiness, live config apply).
@@ -101,6 +113,33 @@ pub trait NodeInfo: Send + Sync {
     fn schedule_running(&self, service: ServiceId) -> bool {
         let _ = service;
         false
+    }
+
+    /// The external secret source of this node, if any (R15).
+    fn secret_sync(&self) -> Option<Arc<dyn crate::secret_refs::SecretSync>> {
+        None
+    }
+
+    /// What the data-change pump knows of the service (R14).
+    fn data_events_status(&self, service: ServiceId) -> Option<DataEventsStatus> {
+        let _ = service;
+        None
+    }
+
+    /// The host sampler behind `status.host` and `GET /v1/node/series`.
+    fn host(&self) -> Option<Arc<rt_obs::HostSampler>> {
+        None
+    }
+
+    /// Bytes of service data on disk, from the last storage scan.
+    fn storage_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Bytes of one tenant's service data on disk, from the last storage scan.
+    fn tenant_storage_bytes(&self, tenant: rt_types::TenantId) -> u64 {
+        let _ = tenant;
+        0
     }
 
     /// Cache tier (`T1`/`T2`/`T3`) of the live artifact of `entry`.
@@ -324,6 +363,8 @@ impl IngressBuckets {
 pub struct IngressCache {
     proxies: ArcSwapOption<ProxiesOf>,
     allow: DashMap<ServiceId, Arc<AllowOf>>,
+    /// `ingress.rate_rules`: compiled once per rule list; the limits outlive route refreshes.
+    pub rate_rules: rt_triggers::rate_rules::RateRuleLimiter,
 }
 
 /// `ingress.trusted_proxies` of one config generation.
@@ -342,6 +383,7 @@ impl IngressCache {
     /// Drop the `ip_allow` lists of services `keep` rejects (deleted ones, on every route refresh).
     pub fn retain_services(&self, keep: impl Fn(&ServiceId) -> bool) {
         self.allow.retain(|s, _| keep(s));
+        self.rate_rules.retain_services(&keep);
     }
 
     pub fn allow_len(&self) -> usize {
@@ -386,6 +428,67 @@ impl IngressCache {
             }),
         );
         list
+    }
+}
+
+/// One archive fetch. No `Debug`: `url` and `headers` carry credentials.
+pub struct ArchiveRequest {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub tenant: rt_types::TenantId,
+    /// The service's egress rules, as for its guests.
+    pub rules: rt_types::EgressRules,
+    /// Plan `egress_default = "deny"`.
+    pub default_deny: bool,
+    /// Bytes left in the tenant's daily egress quota (`None` = unlimited).
+    pub quota_left: Option<u64>,
+}
+
+/// A fetched archive, in an unlinked temporary file positioned at its start.
+#[derive(Debug)]
+pub struct FetchedArchive {
+    pub file: tokio::fs::File,
+    pub len: u64,
+    /// Wire bytes received, for the tenant's egress quota.
+    pub received: u64,
+}
+
+/// Why a fetch stopped. Carries no URL or upstream text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveFetchError {
+    Denied,
+    TooLarge,
+    Quota,
+    /// Unreachable, too many redirects, timed out, or a non-2xx `status`.
+    Failed {
+        status: Option<u16>,
+    },
+}
+
+/// A failed fetch and what it cost.
+#[derive(Clone, Copy, Debug)]
+pub struct ArchiveFetchFailure {
+    pub error: ArchiveFetchError,
+    pub received: u64,
+}
+
+/// Fetches a deploy archive through the egress guard. A seam because `rt-api` must not depend on
+/// `rt-host`; `rt-server` implements it.
+#[async_trait::async_trait]
+pub trait ArchiveFetcher: Send + Sync {
+    async fn fetch(&self, req: ArchiveRequest) -> Result<FetchedArchive, ArchiveFetchFailure>;
+}
+
+/// Refuses every fetch (nodes without egress wiring).
+pub struct NoArchiveFetcher;
+
+#[async_trait::async_trait]
+impl ArchiveFetcher for NoArchiveFetcher {
+    async fn fetch(&self, _req: ArchiveRequest) -> Result<FetchedArchive, ArchiveFetchFailure> {
+        Err(ArchiveFetchFailure {
+            error: ArchiveFetchError::Denied,
+            received: 0,
+        })
     }
 }
 
@@ -434,6 +537,16 @@ pub struct ApiState {
     pub sockets: Arc<SocketHub>,
     /// Artifact uploads buffered at once ([`crate::control::MAX_CONCURRENT_UPLOADS`] permits).
     pub uploads: Arc<tokio::sync::Semaphore>,
+    /// Deploys from a URL still fetching.
+    pub fetches: Arc<crate::from_url::FetchGate>,
+    /// `POST …/versions/from-url`.
+    pub archives: Arc<dyn ArchiveFetcher>,
+    /// App bundles being built or waiting to be downloaded (`app_bundle.rs`).
+    pub app_bundles: Arc<crate::app_bundle::AppBundles>,
+    /// Node backups (`backups.rs`), implemented by `rt-server`.
+    pub backups: Arc<dyn crate::backups::BackupControl>,
+    /// The data browser's concurrency and rate limits (`data_browse.rs`).
+    pub data_browse: Arc<crate::data_browse::DataBrowseGate>,
 }
 
 #[cfg(test)]

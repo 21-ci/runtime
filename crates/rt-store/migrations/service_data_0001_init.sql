@@ -20,3 +20,25 @@ CREATE TABLE IF NOT EXISTS _rt_durable_alarm (
   object TEXT PRIMARY KEY,
   at_ms  INTEGER NOT NULL                       -- unix ms
 ) WITHOUT ROWID;
+-- SQL migrations applied to this database (R6), written only by `promote()`.
+CREATE TABLE IF NOT EXISTS _rt_migrations (
+  name       TEXT PRIMARY KEY,
+  sha256     TEXT NOT NULL,
+  applied_at INTEGER NOT NULL,                     -- unix ms
+  version    INTEGER NOT NULL
+) WITHOUT ROWID;
+-- Data-change outbox (R14): written only by the generated `_rt_ev_*` triggers, drained by the pump.
+CREATE TABLE IF NOT EXISTS _rt_changes (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts  INTEGER NOT NULL,                            -- unix ms
+  src TEXT NOT NULL,                               -- `sql:<table>` or `kv`
+  op  TEXT NOT NULL,                               -- insert, update, delete
+  key TEXT NOT NULL,                               -- JSON array
+  row TEXT                                         -- JSON object when the payload is `row`
+);
+-- The one row of the pump's state for this database: what the triggers were made from.
+CREATE TABLE IF NOT EXISTS _rt_changes_state (
+  id          INTEGER PRIMARY KEY CHECK (id = 1),
+  fingerprint TEXT NOT NULL,
+  paused      INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;

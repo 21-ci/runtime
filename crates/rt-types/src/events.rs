@@ -298,16 +298,22 @@ pub fn headers_over_limits(h: &[(String, String)]) -> bool {
 pub struct EventsConfig {
     pub subscribe: Vec<Subscription>,
     pub consume: Vec<StreamConsumer>,
+    /// Data changes published to a topic of the service's namespace (R14).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_events: Option<DataEventsConfig>,
 }
 
 impl EventsConfig {
     /// No subscription and no consumer (the block is left out of the service's JSON).
     pub fn is_unset(&self) -> bool {
-        self.subscribe.is_empty() && self.consume.is_empty()
+        self.subscribe.is_empty() && self.consume.is_empty() && self.data_events.is_none()
     }
 
     /// Bounds and grammars; the message names the field.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(d) = &self.data_events {
+            d.validate()?;
+        }
         if self.subscribe.len() > SUBSCRIPTIONS_PER_SERVICE {
             return Err(format!(
                 "`events.subscribe`: at most {SUBSCRIPTIONS_PER_SERVICE} entries"
@@ -356,6 +362,115 @@ impl EventsConfig {
                     c.topic, c.group
                 ));
             }
+        }
+        Ok(())
+    }
+}
+
+/// Tables per `events.data_events`.
+pub const DATA_EVENTS_TABLES_MAX: usize = 32;
+/// KV prefixes per `events.data_events`.
+pub const DATA_EVENTS_PREFIXES_MAX: usize = 32;
+/// Default and largest `max_backlog`.
+pub const DATA_EVENTS_BACKLOG_DEFAULT: u64 = 100_000;
+pub const DATA_EVENTS_BACKLOG_MAX: u64 = 1_000_000;
+
+/// What a data-change event carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DataEventPayload {
+    #[default]
+    Keys,
+    Row,
+}
+
+/// A write that produces an event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DataEventOp {
+    Insert,
+    Update,
+    Delete,
+}
+
+fn all_ops() -> Vec<DataEventOp> {
+    vec![DataEventOp::Insert, DataEventOp::Update, DataEventOp::Delete]
+}
+
+/// One subscribed SQL table.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataEventTable {
+    pub name: String,
+    #[serde(default = "all_ops")]
+    pub ops: Vec<DataEventOp>,
+    #[serde(default)]
+    pub payload: DataEventPayload,
+}
+
+/// One subscribed KV prefix.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataEventPrefix {
+    pub prefix: String,
+    #[serde(default)]
+    pub payload: DataEventPayload,
+}
+
+fn default_backlog() -> u64 {
+    DATA_EVENTS_BACKLOG_DEFAULT
+}
+
+/// `events.data_events`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataEventsConfig {
+    pub topic: String,
+    #[serde(default)]
+    pub tables: Vec<DataEventTable>,
+    #[serde(default)]
+    pub kv_prefixes: Vec<DataEventPrefix>,
+    #[serde(default = "default_backlog")]
+    pub max_backlog: u64,
+}
+
+impl DataEventsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !valid_topic_name(&self.topic) {
+            return Err("`events.data_events.topic`: not a valid topic name".into());
+        }
+        if self.tables.is_empty() && self.kv_prefixes.is_empty() {
+            return Err("`events.data_events`: name at least one table or KV prefix".into());
+        }
+        if self.tables.len() > DATA_EVENTS_TABLES_MAX || self.kv_prefixes.len() > DATA_EVENTS_PREFIXES_MAX {
+            return Err(format!(
+                "`events.data_events`: at most {DATA_EVENTS_TABLES_MAX} tables and {DATA_EVENTS_PREFIXES_MAX} prefixes"
+            ));
+        }
+        for (i, t) in self.tables.iter().enumerate() {
+            let reserved = t.name.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("_rt_"))
+                || t.name.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("sqlite_"));
+            if t.name.is_empty() || t.name.len() > 256 || t.name.contains('\0') || reserved {
+                return Err(format!(
+                    "`events.data_events.tables[{i}].name`: not a table a guest owns"
+                ));
+            }
+            if t.ops.is_empty() {
+                return Err(format!("`events.data_events.tables[{i}].ops`: name at least one"));
+            }
+            if self.tables[..i].iter().any(|o| o.name.eq_ignore_ascii_case(&t.name)) {
+                return Err(format!("`events.data_events.tables[{i}].name`: listed twice"));
+            }
+        }
+        for (i, p) in self.kv_prefixes.iter().enumerate() {
+            if p.prefix.is_empty() || p.prefix.len() > 256 {
+                return Err(format!("`events.data_events.kv_prefixes[{i}].prefix`: 1..=256 bytes"));
+            }
+        }
+        if !(1..=DATA_EVENTS_BACKLOG_MAX).contains(&self.max_backlog) {
+            return Err(format!(
+                "`events.data_events.max_backlog`: must be 1..={DATA_EVENTS_BACKLOG_MAX}"
+            ));
         }
         Ok(())
     }

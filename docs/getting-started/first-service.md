@@ -132,6 +132,9 @@ Filters, time ranges, build logs, stats and usage are in [Logs, stats and usage]
 
 ### Ship a new version, then roll back
 
+![21ci versions and logs output](../assets/screenshots/cli-deploy-light.png#only-light)
+![21ci versions and logs output](../assets/screenshots/cli-deploy-dark.png#only-dark)
+
 Change the greeting in `main.ts` and push again. Each push creates a new immutable version and makes it live; requests
 already running finish on the old one.
 

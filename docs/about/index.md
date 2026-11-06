@@ -63,7 +63,8 @@ extension points, so the open core is a complete runtime on its own.
 | KMS or Vault secrets backend | | :material-check: |
 | Durable, exportable audit log | Events API and logs | :material-check: |
 | SSO, OIDC and RBAC for the control API | | :material-check: |
-| Web console and fleet management | | :material-check: |
+| Web console ([Runtime Web](https://github.com/21-ci/runtime-web), Apache-2.0) | :material-check: | :material-check: |
+| Fleet management | | :material-check: |
 
 The process split and the sandboxed V8 build are part of the open core by design but are not in this release; see
 [Status and roadmap](status.md#not-in-this-release).

@@ -181,6 +181,20 @@ fn edits(
     Ok(out)
 }
 
+/// `--rate-rule JSON`, repeated: the whole `ingress.rate_rules` list.
+fn rate_rules_edit(rules: &[String]) -> Result<Edit> {
+    let parsed = rules
+        .iter()
+        .map(|r| serde_json::from_str::<Value>(r))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| CliError::usage(format!("--rate-rule: not JSON: {e}")))?;
+    Ok(Edit {
+        block: "ingress".into(),
+        path: vec!["rate_rules".into()],
+        value: Some(Value::Array(parsed)),
+    })
+}
+
 /// Each touched block, merged onto `current` (the service view, or nothing on create).
 fn merged_blocks(current: Option<&Value>, edits: &[Edit], body: &mut Value) {
     for block in BLOCKS {
@@ -261,6 +275,7 @@ pub fn run(app: &App, cmd: &ServiceCmd) -> Result<()> {
             min_run_time,
             set,
             unset,
+            rate_rule,
         } => {
             check_environment(environment.as_deref())?;
             let allowed_callers = canonical_callers(allowed_callers)?;
@@ -269,7 +284,10 @@ pub fn run(app: &App, cmd: &ServiceCmd) -> Result<()> {
                 max: *max_instances,
                 min_run_time: *min_run_time,
             };
-            let edits = edits(*reuse_isolates, *reuse_instances, instances, set, unset)?;
+            let mut edits = edits(*reuse_isolates, *reuse_instances, instances, set, unset)?;
+            if !rate_rule.is_empty() {
+                edits.push(rate_rules_edit(rate_rule)?);
+            }
             let mut body = json!({});
             for (k, v) in [
                 ("name", name),
@@ -338,6 +356,55 @@ pub fn run(app: &App, cmd: &ServiceCmd) -> Result<()> {
                     ]
                 },
             );
+        }
+        ServiceCmd::Scratch {
+            of,
+            runtime,
+            project,
+            name,
+            ttl,
+            copy_data,
+            allow_hosts,
+        } => {
+            let c = app.client()?;
+            let mut body = json!({});
+            if let Some(of) = of {
+                body["of"] = json!(resolve(&c, of)?.id);
+            } else if let Some(r) = runtime {
+                body["runtime"] = json!(runtime_str(*r));
+            } else {
+                return Err(CliError::usage(
+                    "name --of SVC, or --runtime for a preview that stands alone",
+                ));
+            }
+            if let Some(p) = project {
+                body["project"] = json!(p);
+            }
+            if let Some(n) = name {
+                body["name"] = json!(n);
+            }
+            if let Some(d) = ttl {
+                body["ttl_seconds"] = json!(d.as_secs().max(1));
+            }
+            if *copy_data {
+                body["copy_data"] = json!(true);
+            }
+            if !allow_hosts.is_empty() {
+                body["allowed_hosts"] = json!(allow_hosts);
+            }
+            let view = c.post("/v1/scratch", &body)?;
+            if app.json {
+                fmt::print_json(&view);
+                return Ok(());
+            }
+            let slug = cell(&view, "slug");
+            fmt::emitln(&format!("Preview {slug} created ({}).", cell(&view, "id")));
+            fmt::emitln(&format!(
+                "Expires: {}",
+                fmt::ts_field(view.get("scratch").unwrap_or(&Value::Null), "expires_at")
+            ));
+            fmt::emitln(&format!("Invoke:  {}/s/{slug}/", app.settings.invoke));
+            fmt::emitln(&format!("Next:    21ci push --service {slug} <path>"));
         }
         ServiceCmd::Get(a) => {
             let c = app.client()?;
@@ -569,6 +636,15 @@ fn show(app: &App, s: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_rule_flags_become_one_list() {
+        let e = rate_rules_edit(&[r#"{"path":"/a","rps":1}"#.into(), r#"{"path":"/b","rps":2}"#.into()]).unwrap();
+        assert_eq!(e.block, "ingress");
+        assert_eq!(e.path, ["rate_rules"]);
+        assert_eq!(e.value.unwrap()[1]["path"], "/b");
+        assert!(rate_rules_edit(&["nope".into()]).is_err());
+    }
 
     #[test]
     fn set_values_are_json_or_strings() {

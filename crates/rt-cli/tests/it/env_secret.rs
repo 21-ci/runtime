@@ -207,12 +207,16 @@ fn secret_list_shows_names_and_update_times_only() {
             .path("/v1/services/svc_1/secrets")
             .header("authorization", auth());
         then.status(200)
-            .json_body(json!([{"name": "API_KEY", "updated_at": T0_MS}, {"name": "TOKEN", "updated_at": T0_MS}]));
+            .json_body(json!([{"name": "API_KEY", "source": "plain", "updated_at": T0_MS}, {"name": "TOKEN", "source": "vault", "updated_at": T0_MS}]));
     });
     let out = ctx.run(&["secret", "list", "hello"]).ok();
     assert_eq!(
         out.lines(),
-        vec!["NAME UPDATED", &format!("API_KEY {T0}"), &format!("TOKEN {T0}")]
+        vec![
+            "NAME SOURCE UPDATED",
+            &format!("API_KEY plain {T0}"),
+            &format!("TOKEN vault {T0}")
+        ]
     );
 }
 

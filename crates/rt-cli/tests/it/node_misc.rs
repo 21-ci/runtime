@@ -21,6 +21,64 @@ fn status_body() -> serde_json::Value {
 // ---- node ------------------------------------------------------------------------------------
 
 #[test]
+fn node_status_prints_host_facts_when_the_node_has_them() {
+    let ctx = Ctx::new();
+    let mut body = status_body();
+    body["host"] = json!({"uptime_s": 9, "container": "none", "cores": 4, "load": null, "cpu_pct": null,
+        "disk": null, "net": null, "services": 2, "storage_bytes": 5});
+    ctx.server.mock(|when, then| {
+        when.method(GET).path("/v1/node/status");
+        then.status(200).json_body(body);
+    });
+    let out = ctx.run(&["node", "status"]).ok();
+    assert!(out.lines().contains(&"Cores: 4".to_string()), "{:?}", out.lines());
+    assert!(out.lines().contains(&"Uptime: 9 s".to_string()), "{:?}", out.lines());
+}
+
+#[test]
+fn node_series_stats_and_events_send_their_queries() {
+    let ctx = Ctx::new();
+    ctx.server.mock(|when, then| {
+        when.method(GET).path("/v1/node/series").query_param("range", "24h");
+        then.status(200)
+            .json_body(json!({"range": "24h", "step_s": 300, "points": [{"ts": 1, "mem_committed": 7}]}));
+    });
+    ctx.server.mock(|when, then| {
+        when.method(GET)
+            .path("/v1/node/stats")
+            .query_param("fields", "counts")
+            .query_param("from", "5")
+            .query_param("limit", "1");
+        then.status(200).json_body(json!({
+            "items": [{"service": "svc_1", "tenant": "tnt_1", "slug": "a", "count": 3, "errors": 0, "dlq": 0, "depth": 0}],
+            "next_cursor": "svc_1"
+        }));
+    });
+    ctx.server.mock(|when, then| {
+        when.method(GET)
+            .path("/v1/node/events")
+            .query_param("after", "evt_1")
+            .query_param("kinds", "a,b");
+        then.status(200)
+            .json_body(json!({"items": [{"id": "evt_2", "ts": 1, "kind": "a"}], "next_cursor": null}));
+    });
+    assert!(ctx
+        .run(&["node", "series", "--range", "24h"])
+        .ok()
+        .stdout
+        .contains("MEM_COMMITTED"));
+    let out = ctx
+        .run(&["node", "stats", "--counts", "--from", "5", "--limit", "1"])
+        .ok();
+    assert!(out.stdout.contains("svc_1") && out.stdout.contains("next cursor: svc_1"));
+    assert!(ctx
+        .run(&["node", "events", "--after", "evt_1", "--kinds", "a,b"])
+        .ok()
+        .stdout
+        .contains("evt_2"));
+}
+
+#[test]
 fn node_status_table_and_json() {
     let ctx = Ctx::new();
     ctx.server.mock(|when, then| {
@@ -529,4 +587,34 @@ fn version_server_uses_v1_version_when_the_node_has_it() {
     v.assert();
     status.assert_calls(0);
     assert_eq!(out.lines()[1], "server 0.2.0");
+}
+
+#[test]
+fn data_events_and_secret_refs_drive_their_routes() {
+    let ctx = Ctx::new();
+    let svc = "svc_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let get = ctx.server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path(format!("/v1/services/{svc}/data-events"));
+        then.status(200).json_body(serde_json::json!({"state": "disabled"}));
+    });
+    let put = ctx.server.mock(|when, then| {
+        when.method(httpmock::Method::PUT)
+            .path(format!("/v1/services/{svc}/secrets/DB/ref"))
+            .json_body(serde_json::json!({"path": "app/db", "field": "password"}));
+        then.status(200)
+            .json_body(serde_json::json!({"name": "DB", "source": "vault"}));
+    });
+    let sync = ctx.server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path(format!("/v1/services/{svc}/secrets/sync"));
+        then.status(202);
+    });
+    ctx.run(&["data", "events", svc]).ok();
+    ctx.run(&["secret", "ref", svc, "DB", "--path", "app/db", "--field", "password"])
+        .ok();
+    ctx.run(&["secret", "sync", svc]).ok();
+    get.assert();
+    put.assert();
+    sync.assert();
 }

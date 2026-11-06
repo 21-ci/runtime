@@ -5,6 +5,9 @@
 //! rt --print-config [--config rt.toml]           print the fully resolved configuration and exit 0
 //! rt openapi                                     print the OpenAPI JSON of the control API and exit 0
 //! rt secrets reseal [--config rt.toml]           re-seal every stored secret under RT_MASTER_KEY
+//! rt telemetry show [--config rt.toml]           print the next anonymous report; sends nothing
+//! rt backup verify <archive> [--no-auth]         check an archive, offline
+//! rt backup restore <archive> --data-dir <empty> restore an archive, offline
 //! ```
 //!
 //! Environment overlay `RT__SECTION__KEY=value`, secrets `RT_ROOT_TOKEN` / `RT_MASTER_KEY` /
@@ -40,7 +43,7 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-#[derive(Debug, Clone, Copy, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum Command {
     /// Run the node (default).
     Serve,
@@ -50,6 +53,54 @@ pub enum Command {
     Secrets {
         #[command(subcommand)]
         action: SecretsCommand,
+    },
+    /// The anonymous daily report.
+    Telemetry {
+        #[command(subcommand)]
+        action: TelemetryCommand,
+    },
+    /// Offline work on backup archives. The node need not run; the archive is not trusted.
+    Backup {
+        #[command(subcommand)]
+        action: BackupCommand,
+    },
+}
+
+/// `rt telemetry …`
+#[derive(Debug, Clone, Subcommand)]
+pub enum TelemetryCommand {
+    /// Print the next report and whether it is sent. Sends nothing, creates no id.
+    Show,
+}
+
+/// `rt backup …`
+#[derive(Debug, Clone, Subcommand)]
+pub enum BackupCommand {
+    /// Check an archive: its MAC, every entry's digest and shape. Writes nothing.
+    Verify {
+        archive: PathBuf,
+        /// Skip the MAC: for an archive whose master key is lost. Says nothing about who wrote it.
+        #[arg(long)]
+        no_auth: bool,
+        /// `age` identity file, for an encrypted archive.
+        #[arg(long)]
+        age_identity: Option<PathBuf>,
+    },
+    /// Restore an archive into an empty data directory.
+    Restore {
+        archive: PathBuf,
+        /// The new data directory; must be empty or absent.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Skip the MAC: for an archive whose master key is lost. Says nothing about who wrote it.
+        #[arg(long)]
+        no_auth: bool,
+        /// Revoke API keys created before this time (RFC 3339 or Unix ms), and keys they minted.
+        #[arg(long)]
+        revoke_keys_before: Option<String>,
+        /// `age` identity file, for an encrypted archive.
+        #[arg(long)]
+        age_identity: Option<PathBuf>,
     },
 }
 
@@ -65,6 +116,6 @@ pub enum SecretsCommand {
 impl Cli {
     /// The effective command (`serve` when none is given).
     pub fn command(&self) -> Command {
-        self.command.unwrap_or(Command::Serve)
+        self.command.clone().unwrap_or(Command::Serve)
     }
 }

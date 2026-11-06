@@ -26,6 +26,7 @@ hkdf.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
 zeroize.workspace = true
+async-trait.workspace = true
 subtle.workspace = true
 ipnet.workspace = true
 http.workspace = true

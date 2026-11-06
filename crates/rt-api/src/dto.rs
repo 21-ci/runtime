@@ -53,6 +53,132 @@ pub struct NodeStatus {
     pub inflight: u32,
     /// WebSockets the node holds.
     pub sockets: NodeSockets,
+    /// Host facts; `null` on a node that does not sample them.
+    pub host: Option<NodeHost>,
+}
+
+/// `status.host`. A value the platform cannot give (macOS, no cgroup) is `null`. No host path
+/// appears here: the disk carries a label.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeHost {
+    pub uptime_s: u64,
+    /// `cgroup2` | `cgroup1` | `none`.
+    pub container: String,
+    pub cores: u32,
+    /// 1, 5 and 15 minute load averages.
+    pub load: Option<Vec<f64>>,
+    /// Percent of all cores, since the last minute's sample.
+    pub cpu_pct: Option<f64>,
+    pub disk: Option<NodeDisk>,
+    pub net: Option<NodeNet>,
+    /// Services the node routes.
+    pub services: u64,
+    /// Bytes of service data on disk, from the last storage scan.
+    pub storage_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeDisk {
+    pub path_label: String,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeNet {
+    pub rx_bytes_per_s: f64,
+    pub tx_bytes_per_s: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct NodeSeriesQuery {
+    /// `1h` (default) | `6h` | `24h`.
+    pub range: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeSeriesPoint {
+    pub ts: i64,
+    pub cpu_pct: Option<f64>,
+    pub load1: Option<f64>,
+    pub mem_committed: u64,
+    pub disk_free: Option<u64>,
+    pub rx: Option<f64>,
+    pub tx: Option<f64>,
+}
+
+/// In memory only: after a restart the points begin at the restart.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeSeries {
+    pub range: String,
+    /// Seconds per point.
+    pub step_s: u32,
+    pub points: Vec<NodeSeriesPoint>,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct NodeStatsQuery {
+    /// Start of the range, ms (default: an hour before `to`).
+    pub from: Option<i64>,
+    /// End of the range, ms (default: now).
+    pub to: Option<i64>,
+    /// `all` (default) | `counts`: no percentiles, no histogram merge.
+    pub fields: Option<String>,
+    pub cursor: Option<String>,
+    /// Default 100, max 200.
+    pub limit: Option<u32>,
+}
+
+/// One service of `GET /v1/node/stats`. Percentiles are milliseconds of the total time, `null`
+/// with `fields=counts`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeStatsItem {
+    pub service: String,
+    pub tenant: String,
+    pub slug: String,
+    pub count: u64,
+    pub errors: u64,
+    pub p50: Option<f64>,
+    pub p95: Option<f64>,
+    pub p99: Option<f64>,
+    pub dlq: u64,
+    pub depth: u64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeStatsPage {
+    pub items: Vec<NodeStatsItem>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct NodeEventsQuery {
+    /// Only events after this id (exclusive).
+    pub after: Option<String>,
+    /// Comma-separated kinds (at most 32).
+    pub kinds: Option<String>,
+    /// Default 100, max 1000.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeEventView {
+    pub id: String,
+    pub ts: i64,
+    pub tenant: Option<String>,
+    pub service: Option<String>,
+    pub kind: String,
+    #[schema(value_type = Object)]
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeEventsPage {
+    pub items: Vec<NodeEventView>,
+    pub next_cursor: Option<String>,
 }
 
 /// `status.sockets`: open sockets, objects holding them, accepted sockets not connected yet, and
@@ -475,6 +601,9 @@ pub struct SwitchView {
     /// This answer changed nothing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
+    /// On a dry run: the migrations this switch would run, in order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_migrations: Option<Vec<String>>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -488,12 +617,24 @@ pub struct SwitchPage {
 /// `GET /v1/services/{s}`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ServiceView {
+    /// `PUT …/live` with `dry_run`: nothing changed, this is the service as it is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
+    /// `PUT …/live` with `dry_run`: the migrations that ran on a copy of the data, in order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_migrations: Option<Vec<String>>,
+    /// `PUT …/live`: the migrations that ran before the flip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub migrations_applied: Vec<MigrationView>,
     /// The switch this flip wrote (`PUT /v1/services/{s}/live` only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switch_id: Option<String>,
     /// What the flip could not finish; empty and absent normally.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<SwitchWarning>,
+    /// Create and `PATCH`: the ingress rules were stored, but may not do what they look like.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ingress_warnings: Vec<String>,
     pub id: String,
     pub tenant_id: String,
     pub slug: String,
@@ -574,7 +715,8 @@ pub struct DeleteServiceQuery {
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct UploadQuery {
-    /// Activate (flip `live`) once accepted (`1|true|yes|on`).
+    /// Activate (flip `live`) once accepted (`1|true|yes|on`), or `after_build`: once the build is
+    /// ready, through `promote()` with its SQL migrations (implies `compile=eager`).
     pub activate: Option<String>,
     /// With `activate`: close the service's WebSockets with 1012 once the version is live
     /// (`1|true|yes|on`; default: sockets stay open and the next event runs the new version).
@@ -599,13 +741,67 @@ pub struct VersionView {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<SwitchWarning>,
     pub version: u32,
-    pub source_digest: String,
+    /// `null` until the source is here: while `fetching`, and after a fetch that failed.
+    pub source_digest: Option<String>,
     pub lock_digest: Option<String>,
-    /// `pending` | `building` | `ready` | `failed`.
+    /// `fetching` (`from-url`: the archive is on its way) | `pending` | `building` | `ready` | `failed`.
     pub build_state: String,
+    /// `{code, reason, message, diagnostics}` when `failed`. `code` is stable: a build's reason, or
+    /// for `from-url` `fetch_failed`, `egress_denied`, `egress_quota`, `too_large`,
+    /// `validation_failed`, `invalid_artifact`.
     #[schema(value_type = Option<Object>)]
     pub failure: Option<serde_json::Value>,
     pub created_at: i64,
+    /// What the deploy claims (`{"git":{"sha","ref","repo","author","message"},"label"}`). Not
+    /// verified: render it as text and label it as claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub meta: Option<serde_json::Value>,
+    /// The SQL migrations this version carries, in order; absent without any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub migrations: Vec<MigrationView>,
+}
+
+/// One migration of a version, or one that ran.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MigrationView {
+    /// `NNNN_name`.
+    pub name: String,
+    /// `sha256:<hex>` of the SQL text.
+    pub sha256: String,
+}
+
+/// `POST /v1/services/{s}/versions/from-url`. No `Debug`: `url` and `headers` carry credentials.
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FromUrlBody {
+    /// `https` only. Its query and userinfo are used for the fetch and never kept.
+    pub url: String,
+    /// Sent to the URL's origin only: dropped on a cross-origin redirect, never kept.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// Expected digest of the bytes fetched: 64 hex digits, `sha256:` optional.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// Leading path components to drop (`1` for a GitHub tarball). Default 0.
+    #[serde(default)]
+    pub strip_components: Option<u32>,
+    /// After stripping: the directory that is the source root.
+    #[serde(default)]
+    pub subdir: Option<String>,
+    /// Entry module (as `entry` in `rt.json`).
+    #[serde(default)]
+    pub entry: Option<String>,
+    /// `{"git":{"sha","ref","repo","author","message"},"label"}`, 4 KiB at most.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub meta: Option<serde_json::Value>,
+    /// `lazy` | `eager`.
+    #[serde(default)]
+    pub compile: Option<String>,
+    /// `after_build`: make it live once the build is ready, migrations first.
+    #[serde(default)]
+    pub activate: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -615,6 +811,32 @@ pub struct SetLiveBody {
     /// stay open and the next event runs this version).
     #[serde(default)]
     pub close_sockets: bool,
+    /// Run pending SQL migrations first (default true). `false` needs scope `data:admin`: repair.
+    #[serde(default)]
+    pub migrate: Option<bool>,
+    /// Run the pending migrations on a copy of the data and report; change nothing (`200`).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Query of `PUT /v1/services/{s}/live`.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SetLiveQuery {
+    /// `1`: answer `202` with the switch as soon as it exists; migrations and the flip go on, poll
+    /// `GET /v1/services/{s}/switches/{id}`.
+    #[serde(default, rename = "async")]
+    pub run_async: Option<String>,
+}
+
+/// `202` of `PUT /v1/services/{s}/live`: the switch with `?async=1`; otherwise the service, after a
+/// flip whose route refresh is delayed.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(untagged)]
+#[allow(clippy::large_enum_variant, reason = "only its schema is used")]
+pub enum SetLiveAccepted {
+    Switch(SwitchView),
+    Service(ServiceView),
 }
 
 // ---- env, secrets, hosts ---------------------------------------------------------------------
@@ -631,6 +853,10 @@ pub struct PutSecretBody {
 pub struct SecretNameView {
     pub name: String,
     pub updated_at: i64,
+    /// `plain` or `vault`.
+    pub source: String,
+    pub last_synced_at: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -763,6 +989,8 @@ pub struct LogsPage {
 pub struct StatsQuery {
     /// `5m` | `1h` | `24h`.
     pub window: Option<String>,
+    /// `1m` | `5m` | `1h`: add a `series` of the window. It must leave at most 300 points.
+    pub step: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -856,6 +1084,39 @@ pub struct QuotaView {
     pub remaining: Option<u64>,
     /// `day` (counted since UTC midnight), `total` (current holdings), `per_service`.
     pub period: String,
+}
+
+/// The quotas of `GET /v1/usage`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UsageQuotas {
+    pub invocations: QuotaView,
+    pub cpu_ms: QuotaView,
+    pub egress_bytes: QuotaView,
+    pub storage_bytes: QuotaView,
+    pub services: QuotaView,
+    pub projects: QuotaView,
+    pub branches: QuotaView,
+    pub previews: QuotaView,
+    pub custom_hosts: QuotaView,
+    /// `used` is the service with the most schedules.
+    pub schedules: QuotaView,
+    /// `used` is the service with the most secrets.
+    pub secrets: QuotaView,
+}
+
+/// `GET /v1/usage`: the tenant's whole effective plan and its current use, for the console.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TenantUsageView {
+    /// Plan name.
+    pub plan: String,
+    /// UTC day the daily counters belong to (`YYYY-MM-DD`).
+    pub day: String,
+    /// Unix ms when the daily counters reset.
+    pub resets_at: i64,
+    pub quotas: UsageQuotas,
+    /// Every key of the effective `[plans.<name>]`, tenant overrides applied.
+    #[schema(value_type = Object)]
+    pub limits: serde_json::Value,
 }
 
 /// `GET /v1/limits`: the tenant's plan limits and what is left of them today.

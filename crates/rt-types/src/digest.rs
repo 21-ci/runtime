@@ -19,6 +19,9 @@ pub struct Digest(pub [u8; 32]);
 
 impl Digest {
     pub const PREFIX: &'static str = "sha256:";
+    /// No bytes yet: the `source_digest` of a version whose archive is still being fetched. Not the
+    /// digest of anything, and never looked up.
+    pub const NONE: Digest = Digest([0; 32]);
 
     /// Digest of `bytes`.
     pub fn of(bytes: &[u8]) -> Self {

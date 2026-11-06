@@ -143,6 +143,10 @@ pub(crate) async fn projects_create(
     }
     let environments = b.environments.unwrap_or_else(rt_types::default_project_environments);
     check_environments(&environments)?;
+    let plan = s.plans.plan_arc(tenant);
+    crate::limits::check_environment_count(&plan, environments.len(), 0)?;
+    let counts = s.meta.tenant_counts(tenant).await?;
+    crate::limits::check_count("max_projects", counts.projects, plan.max_projects)?;
     let project = s
         .meta
         .create_project(
@@ -211,6 +215,9 @@ pub(crate) async fn projects_patch(
     }
     if let Some(e) = &b.environments {
         check_environments(e)?;
+        // A plan that shrank does not stop edits that do not grow the list.
+        let plan = s.plans.plan_arc(cur.tenant_id);
+        crate::limits::check_environment_count(&plan, e.len(), cur.environments.len())?;
         // Topics live in an environment too: dropping one that still has topics is refused.
         for gone in cur.environments.iter().filter(|x| !e.contains(x)) {
             if s.streams.count_topics_in(cur.tenant_id, cur.id, Some(gone)).await? > 0 {

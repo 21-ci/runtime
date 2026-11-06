@@ -280,6 +280,7 @@ pub async fn node() -> TestNode {
     let service_table = Arc::new(ArcSwap::from_pointee(Default::default()));
     let (events, _) = tokio::sync::mpsc::unbounded_channel();
     let promoter = crate::promote::Promoter::new(crate::promote::PromoterDeps {
+        data: data.clone(),
         meta: meta.clone(),
         scheduler: scheduler.clone(),
         config: config.clone(),
@@ -296,6 +297,10 @@ pub async fn node() -> TestNode {
         }),
     });
     let state = ApiState {
+        backups: Arc::new(crate::backups::NoBackups),
+        app_bundles: crate::app_bundle::AppBundles::new(
+            std::env::temp_dir().join(format!("rt-app-bundles-{}", ulid::Ulid::new())),
+        ),
         promoter,
         config,
         meta: meta.clone(),
@@ -327,7 +332,10 @@ pub async fn node() -> TestNode {
         tenant_table: Arc::new(DashMap::new()),
         ingress,
         sockets,
+        data_browse: Arc::default(),
+        fetches: Arc::default(),
         uploads: Arc::new(tokio::sync::Semaphore::new(crate::MAX_CONCURRENT_UPLOADS)),
+        archives: Arc::new(crate::state::NoArchiveFetcher),
     };
     TestNode {
         dir,

@@ -6,6 +6,9 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod app;
+mod backup;
+mod branch;
 mod config_cmd;
 mod env_secret;
 mod exit_codes;
@@ -13,6 +16,7 @@ mod hosts;
 mod invoke;
 mod mcp;
 mod meta;
+mod migrations;
 mod node_misc;
 mod observe;
 mod project;
@@ -23,6 +27,8 @@ mod sdk;
 mod service;
 mod sockets;
 mod streams;
+mod switch;
+mod telemetry;
 mod tenant_key;
 mod token;
 mod versions;

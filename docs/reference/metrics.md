@@ -135,8 +135,10 @@ Only `tier="t1"` is populated for entries, bytes, hits and misses; the `t2` seri
 |---|---|---|---|
 | `rt_http_requests_total` | counter | `listener`, `status_class` | Every response of every listener, including the node's own refusals and your services' responses |
 | `rt_ingress_conn_rejected_total` | counter | | Connections closed right after accept because of `ingress.max_conns_per_ip` |
+| `rt_ingress_rate_limited_total` | counter | `rule` | Requests refused by an `ingress.rate_rules` entry (its index on the service; never an IP) |
 | `rt_egress_requests_total` | counter | `result` = `ok` or an egress code (`egress_denied`, `egress_limit`, `egress_too_large`, `egress_quota`, `egress_timeout`, `egress_dns`, `egress_upstream`, `egress_insecure_redirect`) | Guest `fetch` requests through the SSRF guard. A pre-created `result="denied"` series stays 0 |
 | `rt_egress_bytes_total` | counter | | Bytes received by guest fetches |
+| `rt_telemetry_sends_total` | counter | `result` = `ok`, `refused` or `failed` | Daily telemetry reports |
 
 ## Triggers and queues
 

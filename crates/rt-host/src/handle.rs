@@ -759,6 +759,9 @@ impl HostHandle {
         if i.detached {
             return Ok(BindingError::Denied.to_response());
         }
+        if i.services.deps.calls.is_isolated(i.ctx.service) {
+            return Ok(BindingError::Denied.to_response());
+        }
         match i.services.deps.platform.fetch(&i.ctx, binding, req).await {
             Ok(resp) => Ok(resp),
             Err(e @ (BindingError::Denied | BindingError::NotAllowed | BindingError::RateLimited)) => {
@@ -847,6 +850,7 @@ impl HostHandle {
                 "std:schedule is not available outside a task",
             ));
         }
+        self.check_not_isolated()?;
         let id = match id {
             Some(id) => {
                 check_id(&id)?;
@@ -914,11 +918,24 @@ impl HostHandle {
             .map_err(|e| HostError::from_store(&e))
     }
 
+    /// A preview runs alone: `preview_isolated` for what would reach or outlive its requests (R5).
+    fn check_not_isolated(&self) -> Result<(), HostError> {
+        let i = &self.inner;
+        if i.services.deps.calls.is_isolated(i.ctx.service) {
+            return Err(HostError::new(
+                "preview_isolated",
+                "a preview has no streams, pub/sub or schedules",
+            ));
+        }
+        Ok(())
+    }
+
     fn pubsub_bus(&self) -> Result<&Arc<dyn PubsubBus>, HostError> {
         let i = &self.inner;
         if i.detached {
             return Err(HostError::new("unavailable", "pub/sub is only available inside a task"));
         }
+        self.check_not_isolated()?;
         i.services
             .pubsub
             .as_ref()
@@ -933,6 +950,7 @@ impl HostHandle {
                 "streams are only available inside a task",
             ));
         }
+        self.check_not_isolated()?;
         i.services
             .streams
             .as_ref()

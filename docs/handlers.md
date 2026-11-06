@@ -476,6 +476,10 @@ drops an object's storage.
 | `Idempotency-Key` | 1 to 255 visible ASCII characters |
 | Concurrency | async: `queue.max_concurrency` (default 4) per service, 256 invocations per node; streams: 8 batches in flight per service, 256 per node |
 
+## Previews
+
+A service made by `POST /v1/scratch` runs alone: `std:stream`, `std:pubsub` and `std:schedule` throw `preview_isolated`, `call` throws `call_not_allowed`, `std:queue` and `std:sdk` are refused, and `fetch` reaches only the preview's `allowed_hosts`. See [Previews](api.md#previews).
+
 ## Outcome to HTTP
 
 Invoke failures are `text/plain` with `x-rt-reason` ([api.md](api.md#invoke-api) has the full table).
@@ -562,3 +566,19 @@ export default async function (req: Request): Promise<Response> {
 ## See also
 
 [api.md](api.md) · [SECURITY.md](https://github.com/21-ci/runtime/blob/main/SECURITY.md) · [sample/README.md](https://github.com/21-ci/runtime/blob/main/sample/README.md)
+
+## Data-change events
+
+With `events.data_events` set (`PUT /v1/services/{s}/data-events`), committed changes of the listed tables and KV prefixes reach a topic of the service's namespace. There is no new `std:*` API: consume them with a normal `stream` handler.
+
+```json
+{"event_id":"svc_…:42","service":"svc_…","seq":42,"ts":1760000000000,"source":"sql:orders","op":"insert","key":[7],"row":{"id":7}}
+```
+
+- Delivery is at least once and in order per service: dedupe on `event_id`.
+- `key` is the primary key, or the rowid. KV events have `source` `kv` and `key` `[<hex of the key>]`; `row` is `{"value_hex":…}`.
+- `row` appears with `payload: "row"`. BLOBs are hex; a row over 64 KB has no `row`. A row stays in the stream for its retention after it is deleted.
+- `INSERT OR REPLACE` appears as `insert`, with no `delete`. KV expiry sweeps appear as `delete`. Blobs and durable storage are not covered.
+- `DROP TABLE` on a subscribed table is refused: unsubscribe first. Dropping a column used by a `row` trigger fails the same way. After `ALTER TABLE`, triggers are regenerated within about a minute.
+- Past `max_backlog` the triggers are dropped, state becomes `paused_overflow`, a `data_events.paused` event is raised and writes go on; `PUT` rearms.
+- A `key` over 64 KiB arrives as `[{"truncated": true, "prefix": "..."}]`. A change the stream refuses is dropped with a `data_events.dropped` event and `last_error: "event_dropped"`, so the ones behind it still flow.

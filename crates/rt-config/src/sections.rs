@@ -462,6 +462,9 @@ section! {
         pub drain_max: Duration,
         /// The most data a branch's `copy_data` may copy, database and blobs together, in MiB.
         pub dry_run_max_mb: u32,
+        /// How long one version's SQL migrations may take at a promote; over it they roll back.
+        #[serde(with = "serde_duration")]
+        pub migration_budget: Duration,
     }
 }
 impl Default for DeployConfig {
@@ -471,6 +474,88 @@ impl Default for DeployConfig {
             auto_rollback: true,
             drain_max: Duration::from_secs(15 * 60),
             dry_run_max_mb: 256,
+            migration_budget: Duration::from_secs(60),
+        }
+    }
+}
+
+section! {
+    /// `[import]`
+    pub struct ImportConfig {
+        /// The largest app bundle `POST /v1/services/import` takes, in MiB, counted as it arrives.
+        /// It may unpack to eight times this.
+        pub max_bundle_mb: u32,
+    }
+}
+impl Default for ImportConfig {
+    fn default() -> Self {
+        Self { max_bundle_mb: 4096 }
+    }
+}
+
+section! {
+    /// `[backup]` — node backups (docs/deploy.md "Backup and restore").
+    pub struct BackupConfig {
+        pub enabled: bool,
+        /// Cron expression, UTC.
+        pub schedule: String,
+        /// Where archives go; empty means `<data_dir>/backups`.
+        pub dir: String,
+        /// Good archives kept locally. Same disk: this does not protect against losing it.
+        pub keep_last: u32,
+        /// `age` public keys. Any set: no plaintext archive is ever on disk.
+        pub encrypt_to: Vec<String>,
+        /// Allow `[backup.s3]` without `encrypt_to`.
+        pub allow_plaintext_remote: bool,
+        pub s3: BackupS3Config,
+    }
+}
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            schedule: "0 3 * * *".into(),
+            dir: String::new(),
+            keep_last: 3,
+            encrypt_to: Vec::new(),
+            allow_plaintext_remote: false,
+            s3: BackupS3Config::default(),
+        }
+    }
+}
+
+section! {
+    /// `[backup.s3]` — where archives go off the node. An empty `endpoint` means nowhere.
+    pub struct BackupS3Config {
+        /// `https://host[:port]`; plain `http` to loopback only.
+        pub endpoint: String,
+        pub bucket: String,
+        pub prefix: String,
+        pub region: String,
+        /// Empty: `RT_BACKUP_S3_ACCESS_KEY` from the environment.
+        pub access_key_file: String,
+        /// Empty: `RT_BACKUP_S3_SECRET_KEY` from the environment.
+        pub secret_key_file: String,
+        /// Archives kept on the local disk once uploaded.
+        pub keep_local: u32,
+        pub keep_last: u32,
+        pub keep_daily: u32,
+        pub keep_weekly: u32,
+    }
+}
+impl Default for BackupS3Config {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            bucket: String::new(),
+            prefix: String::new(),
+            region: "auto".into(),
+            access_key_file: String::new(),
+            secret_key_file: String::new(),
+            keep_local: 1,
+            keep_last: 7,
+            keep_daily: 7,
+            keep_weekly: 4,
         }
     }
 }
@@ -599,6 +684,40 @@ section! {
         pub cache_ttl: Duration,
         /// Anomaly threshold for executor secret requests.
         pub max_services_per_min: u32,
+        /// `[secrets.vault]`: an external source synced into the sealed store.
+        pub vault: VaultConfig,
+    }
+}
+
+section! {
+    /// `[secrets.vault]` (HashiCorp Vault KV v2). Off while `address` is empty.
+    pub struct VaultConfig {
+        pub address: String,
+        /// File holding a token, read at each use. Or `role_id_file` plus `secret_id_file`.
+        pub token_file: String,
+        pub role_id_file: String,
+        pub secret_id_file: String,
+        pub mount: String,
+        /// Must name `{tenant}`, `{project}` and `{environment}`.
+        pub path_template: String,
+        #[serde(with = "serde_duration")]
+        pub poll: Duration,
+        /// PEM of a private CA. TLS verification itself cannot be turned off.
+        pub ca_file: String,
+    }
+}
+impl Default for VaultConfig {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            token_file: String::new(),
+            role_id_file: String::new(),
+            secret_id_file: String::new(),
+            mount: "secret".into(),
+            path_template: "rt/{tenant}/{project}/{environment}/".into(),
+            poll: Duration::from_secs(60),
+            ca_file: String::new(),
+        }
     }
 }
 impl Default for SecretsConfig {
@@ -606,6 +725,7 @@ impl Default for SecretsConfig {
         Self {
             cache_ttl: Duration::from_secs(60),
             max_services_per_min: 200,
+            vault: VaultConfig::default(),
         }
     }
 }
@@ -628,6 +748,9 @@ section! {
         /// `listen(2)` backlog of the TCP listeners (the kernel caps it at `kern.ipc.somaxconn`
         /// / `net.core.somaxconn`).
         pub backlog: u32,
+        /// Client cells of `ingress.rate_rules` by-IP limits on this node; one service holds at most
+        /// 1/8 of them. 0 = auto (as many as fit in 1/64 of the memory budget).
+        pub rate_keys_max: u64,
     }
 }
 impl Default for IngressConfig {
@@ -640,6 +763,7 @@ impl Default for IngressConfig {
             h2_max_streams: 100,
             sse_streams_per_key: 10,
             backlog: 4096,
+            rate_keys_max: 0,
         }
     }
 }
@@ -822,6 +946,65 @@ impl Default for BindingRateLimit {
     fn default() -> Self {
         Self { rps: 0, burst: 0 }
     }
+}
+
+section! {
+    /// `[telemetry]`: the anonymous daily report (SECURITY.md "Telemetry").
+    pub struct TelemetryConfig {
+        /// `false` turns the whole feature off.
+        pub enabled: bool,
+        /// [`TELEMETRY_URL_AUTO`] (the URL set at build time, if any), `""` (no sending) or an
+        /// `https` URL.
+        pub url: String,
+    }
+}
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: TELEMETRY_URL_AUTO.to_string(),
+        }
+    }
+}
+
+/// `telemetry.url` value that means "the URL this binary was built with".
+pub const TELEMETRY_URL_AUTO: &str = "auto";
+
+/// An `https` URL with a host and nothing a report must not carry: no credentials, query or fragment.
+pub fn valid_telemetry_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or_default();
+    url.len() <= 2048
+        && !host.is_empty()
+        && !host.starts_with(':')
+        && url.bytes().all(|b| b.is_ascii_graphic())
+        && !url.contains(['@', '?', '#', '\\'])
+}
+
+/// Where reports go, or `None` when nothing is sent. `DO_NOT_TRACK=1` beats everything, then
+/// `telemetry.enabled`, then `RT_TELEMETRY_URL`, then `telemetry.url`, then the build-time URL.
+/// A URL that is not valid means no sending.
+pub fn telemetry_url_with(
+    cfg: &TelemetryConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+    built_in: Option<&str>,
+) -> Option<String> {
+    if env("DO_NOT_TRACK").as_deref() == Some("1") || !cfg.enabled {
+        return None;
+    }
+    let chosen = match env("RT_TELEMETRY_URL") {
+        Some(url) => url,
+        None if cfg.url == TELEMETRY_URL_AUTO => built_in.unwrap_or_default().to_string(),
+        None => cfg.url.clone(),
+    };
+    valid_telemetry_url(&chosen).then_some(chosen)
+}
+
+/// [`telemetry_url_with`] over the process environment and this binary's build-time URL.
+pub fn telemetry_url(cfg: &TelemetryConfig) -> Option<String> {
+    telemetry_url_with(cfg, &|k| std::env::var(k).ok(), option_env!("RT_TELEMETRY_URL"))
 }
 
 /// Plans by name (`[plans.<name>]`). A `free` plan always exists.

@@ -110,11 +110,39 @@ allowed_hosts = ["esm.sh"]      # Minimal hosts
 max_deps_mb = 25                # Reduced from 50
 compile = "lazy"
 
+[backup]
+enabled = false
+schedule = "0 3 * * *"
+dir = ""
+keep_last = 3
+encrypt_to = []
+allow_plaintext_remote = false
+
+[backup.s3]
+endpoint = ""
+bucket = ""
+prefix = ""
+region = "auto"
+access_key_file = ""
+secret_key_file = ""
+keep_local = 1
+keep_last = 7
+keep_daily = 7
+keep_weekly = 4
+
+[telemetry]
+enabled = true
+url = "auto"
+
 [deploy]
 retain_versions = 3             # Keep fewer versions
 auto_rollback = true
 drain_max = "15m"
 dry_run_max_mb = 256
+migration_budget = "60s"
+
+[import]
+max_bundle_mb = 4096
 
 [storage]
 blob_backend = "local"
@@ -145,6 +173,16 @@ executor_restart_backoff = ["500ms", "2s", "10s"]
 cache_ttl = "300s"              # Longer cache TTL
 max_services_per_min = 50
 
+[secrets.vault]
+address = ""
+token_file = ""
+role_id_file = ""
+secret_id_file = ""
+mount = "secret"
+path_template = "rt/{tenant}/{project}/{environment}/"
+poll = "60s"
+ca_file = ""
+
 [ingress]
 trusted_proxies = []
 header_timeout = "20s"
@@ -153,6 +191,7 @@ max_conns_per_ip = 64           # Reduced from 256
 h2_max_streams = 10             # Reduced from 100
 sse_streams_per_key = 2         # Reduced from 10
 backlog = 4096
+rate_keys_max = 0
 
 [egress]
 denied_ports = [25, 465, 587]

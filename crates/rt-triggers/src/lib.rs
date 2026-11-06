@@ -4,10 +4,12 @@
 
 pub mod async_engine;
 pub mod calls;
+pub mod data_events;
 pub mod delayed;
 pub mod events;
 pub mod pubsub;
 pub mod queue_engine;
+pub mod rate_rules;
 pub mod ratelimit;
 pub mod routes;
 pub mod schedules;

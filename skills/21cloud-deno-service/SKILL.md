@@ -36,6 +36,8 @@ References (read when needed):
 9. **Do not ship a types package import.** None exists: declare `Ctx` and event interfaces in your own code (copy from
    [references/handlers.md](references/handlers.md)).
 
+Schema changes: put `migrations/NNNN_name.sql` in the source instead of `CREATE TABLE IF NOT EXISTS` in handlers. They run once, in order, before a promote, in one transaction; `BEGIN`/`COMMIT` are refused and there are no down-migrations. See `21ci-deploy`.
+
 ## Handler forms
 
 ```ts
@@ -201,3 +203,7 @@ Complete apps: [events](https://github.com/21-ci/runtime/tree/main/sample/apps/e
 
 Testing: keep pure logic in modules without `std:*` imports and unit-test them with `deno test` or `node --test`
 (the apps do this); verify the rest by deploying and invoking (`21ci invoke <svc> /path --fail`).
+
+## Data-change events
+
+`PUT /v1/services/{s}/data-events` (or `21ci data events --set FILE`, needs `data:read`) publishes SQL and KV changes to a topic in the service's namespace; consume them with `stream(batch, ctx)` and dedupe on `event_id`. See `docs/handlers.md`.

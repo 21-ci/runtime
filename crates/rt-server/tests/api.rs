@@ -10,10 +10,18 @@ mod common;
 
 #[path = "api/access.rs"]
 mod access;
+#[path = "api/app_bundle.rs"]
+mod app_bundle;
+#[path = "api/backups.rs"]
+mod backups;
 #[path = "api/branches.rs"]
 mod branches;
 #[path = "api/control.rs"]
 mod control;
+#[path = "api/data_browse.rs"]
+mod data_browse;
+#[path = "api/data_events_secrets.rs"]
+mod data_events_secrets;
 #[path = "api/edge_control.rs"]
 mod edge_control;
 #[path = "api/edge_keys.rs"]
@@ -22,22 +30,32 @@ mod edge_keys;
 mod edge_mcp;
 #[path = "api/edge_upload.rs"]
 mod edge_upload;
+#[path = "api/from_url.rs"]
+mod from_url;
 #[path = "api/introspection.rs"]
 mod introspection;
 #[path = "api/invocations_api.rs"]
 mod invocations_api;
 #[path = "api/mcp.rs"]
 mod mcp;
+#[path = "api/migrations.rs"]
+mod migrations;
+#[path = "api/monitoring.rs"]
+mod monitoring;
 #[path = "api/openapi.rs"]
 mod openapi;
 #[path = "api/projects.rs"]
 mod projects;
 #[path = "api/promote.rs"]
 mod promote;
+#[path = "api/scratch.rs"]
+mod scratch;
 #[path = "api/sdk.rs"]
 mod sdk;
 #[path = "api/switch.rs"]
 mod switch;
+#[path = "api/telemetry.rs"]
+mod telemetry;
 #[path = "api/tenancy.rs"]
 mod tenancy;
 #[path = "api/tokens.rs"]

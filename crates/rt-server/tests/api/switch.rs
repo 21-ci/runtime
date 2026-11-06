@@ -355,6 +355,8 @@ async fn dry_run_reports_the_diff_and_changes_nothing() {
     assert_eq!(env.s(), 200, "{}", env.text);
     let sec = put(&r.node, &r.t.key, &format!("/v1/services/{}/secrets/BRANCH_KEY", r.source), json!({"value": "secret-value"})).await;
     assert_eq!(sec.s(), 204, "{}", sec.text);
+    let sch = post(&r.node, &r.t.key, &format!("/v1/services/{}/schedules", r.source), json!({"kind": "cron", "cron": "0 0 1 1 *", "payload": {}})).await;
+    assert_eq!(sch.s(), 201, "{}", sch.text);
     let pat = patch(&r.node, &r.t.key, &format!("/v1/services/{}", r.source), json!({"triggers": {"cron": false}})).await;
     assert_eq!(pat.s(), 200, "{}", pat.text);
     let rows = r.rows().await.len();

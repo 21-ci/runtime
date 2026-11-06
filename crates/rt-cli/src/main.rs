@@ -58,7 +58,8 @@ fn run(cli: &Cli, json: bool) -> Result<()> {
     }
 
     let path = config::config_path(cli.config.as_deref())?;
-    let settings = ConfigFile::load(&path)?.resolve(cli.context.as_deref(), cli.as_tenant.as_deref(), &|k| {
+    let config_file = ConfigFile::load(&path)?;
+    let settings = config_file.resolve(cli.context.as_deref(), cli.as_tenant.as_deref(), &|k| {
         std::env::var(k).ok()
     })?;
     let app = App {
@@ -70,6 +71,8 @@ fn run(cli: &Cli, json: bool) -> Result<()> {
     match &cli.command {
         Command::Whoami => cmd::plan::whoami(&app),
         Command::Limits => cmd::limits::run(&app),
+        Command::Telemetry { cmd: t } => cmd::telemetry::run(&app, t),
+        Command::Usage => cmd::limits::usage(&app),
         Command::Plan { cmd } => cmd::plan::run(&app, cmd),
         Command::Tenant { cmd } => cmd::tenant::run(&app, cmd),
         Command::Key { cmd } => cmd::key::run(&app, cmd),
@@ -80,6 +83,11 @@ fn run(cli: &Cli, json: bool) -> Result<()> {
         Command::Push(a) => cmd::push::run(&app, a),
         Command::Versions(a) => cmd::versions::list(&app, a),
         Command::Rollback(a) => cmd::versions::rollback(&app, a),
+        Command::Branch { cmd } => cmd::branch::run(&app, cmd),
+        Command::Switch(a) => cmd::switch::run(&app, a),
+        Command::Migrations { cmd } => cmd::migrations::run(&app, cmd),
+        Command::Promote(a) => cmd::migrations::promote(&app, a),
+        Command::FromUrl(a) => cmd::versions::from_url(&app, a),
         Command::Rebuild(a) => cmd::versions::rebuild(&app, a),
         Command::BuildLogs(a) => cmd::versions::build_logs(&app, a),
         Command::Source(a) => cmd::versions::source(&app, a),
@@ -102,6 +110,8 @@ fn run(cli: &Cli, json: bool) -> Result<()> {
         Command::Events(a) => cmd::events::run(&app, a),
         Command::Invoke(a) => cmd::invoke::run(&app, a),
         Command::Node { cmd } => cmd::node::run(&app, cmd),
+        Command::Backup { cmd } => cmd::backup::run(&app, cmd),
+        Command::App { cmd } => cmd::app::run(&app, cmd, &config_file),
         Command::Openapi(a) => cmd::misc::openapi(&app, a),
         Command::Docs => cmd::misc::docs(&app),
         Command::Doctor => cmd::doctor::run(&app, &path),

@@ -15,7 +15,7 @@ tenant is isolated by the language sandbox, per-task resource limits, an egress 
 1. [Threat model and trust boundaries](#threat-model-and-trust-boundaries)
 2. [Listeners](#listeners)
 3. [Authentication](#authentication)
-4. [Tenancy, plans and quotas](#tenancy-plans-and-quotas)
+4. [Tenancy, plans and quotas](#tenancy-plans-and-quotas) and [events](#events-pubsub-streams-and-async-invocations)
 5. [Projects, environments and service calls](#projects-environments-and-service-calls)
    - [Operator SDKs and bindings](#operator-sdks-and-bindings)
 6. [Request path: headers and checks](#request-path-headers-and-checks)
@@ -24,14 +24,15 @@ tenant is isolated by the language sandbox, per-task resource limits, an egress 
 9. [Egress / SSRF guard](#egress--ssrf-guard)
 10. [WebSockets and durable objects](#websockets-and-durable-objects)
 11. [Storage isolation](#storage-isolation)
-12. [Secrets](#secrets)
-13. [Builds and supply chain](#builds-and-supply-chain)
-14. [MCP endpoint](#mcp-endpoint)
-15. [Observability and audit](#observability-and-audit)
-16. [Hardening settings](#hardening-settings)
-17. [Known limitations](#known-limitations)
-18. [Operator hardening checklist](#operator-hardening-checklist)
-19. [Reporting a vulnerability](#reporting-a-vulnerability)
+12. [Backups](#backups)
+13. [Secrets](#secrets) and [data-change events and external secrets](#data-change-events-and-external-secrets)
+14. [Builds and supply chain](#builds-and-supply-chain)
+15. [MCP endpoint](#mcp-endpoint)
+16. [Observability and audit](#observability-and-audit)
+17. [Telemetry](#telemetry) and [Hardening settings](#hardening-settings)
+18. [Known limitations](#known-limitations)
+19. [Operator hardening checklist](#operator-hardening-checklist)
+20. [Reporting a vulnerability](#reporting-a-vulnerability)
 
 ---
 
@@ -171,15 +172,16 @@ publishes them on host `127.0.0.1` only.
 |---|---|
 | `services:read` | List and read services, projects, environments, versions, topics, consumers and invocations. This includes message payloads: `GET /v1/topics/{t}/messages`, a consumer's dead-letter list (with record headers and bodies) and the MCP `read_topic` tool |
 | `services:write` | Create, update and delete services, projects and topics |
-| `deploy` | Deploy, rebuild, roll back |
+| `deploy` | Deploy, rebuild, roll back, switch a service to a branch's code ([a privilege boundary](#switches-and-branches)) |
 | `invoke` | Call `access="key"` routes |
 | `logs:read` | Logs and stats |
 | `env:write` | Set env vars |
 | `secrets:write` | Set and delete secrets |
 | `queue:write` | Enqueue, publish, append to topics, consumer resets, DLQ redrive and purge, invocation redrive and purge |
-| `data:admin` | Export a consistent snapshot of a service's `data.db`; drop a durable object's storage |
+| `data:admin` | Export a consistent snapshot of a service's `data.db`; drop a durable object's storage; copy a parent's data into a branch (`copy_data`) |
 | `keys:write` | Self-service keys (`/v1/keys`) |
 | `sockets:write` | Close a service's WebSockets through the control API (audited `sockets.closed_by_api`) |
+| `data:read` | Read a service's rows, KV values and blob listing (see "Data browser"). Opt-in: implied by no other scope, and existing keys do not gain it |
 
 A key can also be **restricted to some projects and environments**: `project_ids` (`prj_…` ids; `null` means every
 project of the tenant, including ones created later) and `environments` (labels; `null` means every environment). A
@@ -188,6 +190,32 @@ a service (REST or the MCP `create_service` tool) only in an admitted project an
 insufficient_scope` otherwise). A key can also **expire**
 (`expires_at_ms <= now` means invalid). Project create, update and delete need a key with no project or environment
 restriction, or the operator.
+
+### Switches and branches
+
+A **switch is a privilege boundary**. Code on a branch runs with the branch's secrets and data. A switch makes the same code live on the parent, where it reads the parent's secrets and data and answers on its URL. So `services:write` on a branch, or `deploy` on the branch alone, is not enough: `POST /v1/services/{s}/switch` needs `deploy` **on the parent**, reached through `load_service`. A key restricted to another project or environment gets `404`.
+
+- The source is held to the key's scope and to the parent's tenant and project; anything else is `404`, so existence is not revealed. A branch or another service as the source also needs `services:read`.
+- The digest is read from the source's row. The body has no field for one.
+- System services are refused as parent (`403 reserved`) and as source (`403 scratch_source_reserved`).
+- Secrets and env are never copied by a switch. `env_names_from_parent` copies names with empty values; warnings list names, never values.
+- `If-Match` guards against switching a service that changed since it was read. The MCP tools `switch_service` and `rollback_switch` are marked destructive, so clients ask for confirmation.
+- Review what goes live before you switch. The runtime checks who switched and which digest, not what the code does with the secrets.
+
+**Previews** (`POST /v1/scratch`) run untrusted branch code. Their isolation is enforced in the runtime, not by configuration of either side: `rt-triggers` refuses calls in both directions and enqueues on the route's `isolated` flag, `rt-host` refuses streams, pub/sub, schedules and platform bindings (`preview_isolated`), SDK calls are `sdk_not_granted`, and the store re-applies the config policy after every `PATCH`. The slug's suffix is not access control. A preview's code becomes trusted only through a `switch`, which needs `deploy`.
+
+**`copy_data`** puts the parent's database and blobs in another service, so it needs `data:admin` on top of `services:write`. It is capped by `deploy.dry_run_max_mb`, audited as `scratch.copied_data` (source and bytes, never data), and forces `access: key` on a public service. The copy then lives under the branch's own access settings and egress rules, and a key with `services:write` on the branch can deploy code that reads it. Durable alarms stay behind. Without `copy_data` a branch starts empty.
+
+**Pub/sub and stream consumers** are not inherited by a branch: in a shared environment it would be another member of the parent's groups and answer its request/reply calls. `events_of_parent: true` keeps them and needs `deploy`; without it they are cleared at create and after every `PATCH`.
+
+**Backups in a bucket:** S3 retention only prunes ids with a row in this node's `meta.db`, so two nodes on one prefix do not delete each other's archives. Objects with no row are left for the operator.
+
+**A branch's policy** is forced at create and after every `PATCH`: `scaling.min_instances` 0, timed triggers off unless `schedules`. Egress follows the parent's rules unless `egress_of_parent: false`, so a branch can reach the same third parties as its parent.
+
+**Known limits, stated plainly:**
+
+- **The runtime cannot recognize a console deployed as an ordinary tenant service.** The refusals above match only the system tenant and the reserved `sys-` slug prefix. A console that runs under a normal tenant and slug can be branched, copied and switched by any key with the scopes for it. Deploy it in the system tenant or under the reserved prefix, or keep it in a project that no broad key can touch.
+- **`git_sha` is not recorded yet.** The audit field exists and is `null`, because no version records its commit. The audit trail names the actor and the digest, and does not say which commit that was.
 
 ### Self-service keys (`keys:write`)
 
@@ -209,12 +237,35 @@ restriction, or the operator.
 Verified keys are cached for **1 s** (4096 entries). Revoking a key bumps an epoch and removes its cache entry. A
 lookup that raced the revocation deletes what it inserted, so a revoked key is never re-cached.
 
+### Deploying from a URL
+
+Reading a view resolves its columns with the authorizer off, so a `SQLITE_DIRECTONLY` function in a view (`load_extension`, `fts3_tokenizer`) is refused by SQLite ("unsafe use of"), not by the callback: guests get `sql_not_authorized` and bundle import refuses the schema. `deploy.failed` is audited with the code and the host only.
+
+`POST …/versions/from-url` makes the node fetch a tenant-chosen URL and hand the bytes back as readable version source,
+so it could read anything the node can reach if it were looser than a guest's `fetch`. It is not:
+
+- It goes through `GuardedEgress` with a guard of its own: every hop `https`, ports, one DNS lookup, every address public
+  and not the node's, the self-denylist, at most 3 redirects, 64 MiB. There is no allow-list for private Git hosts.
+- The service's `egress` rules and the plan's `egress_default` apply, and the bytes count toward the daily egress quota,
+  so a `deploy` key cannot read through it what the service's guests may not reach.
+- **Caller headers stop at a cross-origin redirect, all of them**, since `PRIVATE-TOKEN` and the like are not standard
+  credentials. `Host`, `x-rt-*` and hop-by-hop names are refused.
+- **`headers` values and the URL's query and userinfo are credentials**: not stored, logged, echoed, put in events or in
+  the idempotency fingerprint. The body type has no `Debug`. The audit event names the host only.
+- Extraction is the upload's (`normalize_path` before anything is stripped, file and size limits, inflate ratio; entries
+  outside `subdir` still count), so a bomb outside the subdir is still a bomb. The fetched file sits in an unlinked
+  temporary file, and is read into memory under a governor reservation.
+- `versions.meta` is client-written. It is a claim for display and audit, never a decision: `versions.migrations` comes
+  from validation only, and the commit in an audit event says what the deployer claimed.
+
 ### Long-lived maps
 
 Every per-key, per-IP, per-tenant or per-service map on the request path has a cap or an eviction: the key cache
 (4096), the failed-auth limiter (`LIMITER_CAPACITY`, swept), idempotency entries (24 h, pruned past 100k), SSE
 counters (credentials with no open stream dropped past 1024), per-service ingress buckets and `ip_allow` lists
-(dropped with their service on every route refresh), SDK caller gates (idle tenants dropped past 10k), lock slots
+(dropped with their service on every route refresh), by-IP rate rule cells (`ingress.rate_keys_max`, 1/8 per service;
+idle ones pruned after 10 min), data-change dirty flags (one per service with a writer, removed on purge), from-url
+fetch slots (2 per tenant, 32 per node, removed on release), SDK caller gates (idle tenants dropped past 10k), lock slots
 (removed on release), socket tickets (swept), env bundles (idle TTL), usage counters (removed once flushed).
 Events: the pub/sub index (subscriptions × services, rebuilt per generation), pub/sub round-robin counters per namespace
 (group, request and fan-out counters, pruned to the live namespaces whenever the subscription index changes), stream
@@ -222,12 +273,25 @@ round-robin counters per topic (bounded by topics), the stream engine's cursor c
 consumers × partitions), and throttle counters per service (removed on success). Async in-flight attempts are capped
 at 256 per node.
 
+### Ingress rate rules
+
+`ingress.rate_rules` apply when the raw path **or** its canonical form matches, the opposite of `allow_paths`, so a form
+the guest would read as the limited path cannot escape: encoding (nested too), dot segments, `\\`, `//`, a trailing
+slash and ASCII case all count. A path with no canonical form is `400` on a service with rules. A stored rule whose
+pattern no longer compiles limits every path, and a stored `rps: 0` admits nobody. `by: ip` uses the trusted-proxy
+client address, so `X-Forwarded-For` from an untrusted peer or past a malformed hop cannot mint clients. A request with
+no address shares the rule's overflow cell. Cells are capped per node and per service (1/8), and active ones are
+never evicted, so filling the map does not earn a fresh burst, though new clients then share the overflow cell of the
+rule. `;` parameters are not stripped, and a `GET` rule does not cover `HEAD`.
+
 ### Control API bodies
 
 JSON bodies are read up to 1 MiB. Artifact uploads are read up to 64 MiB, and only after the caller passed auth,
 scope and service checks: a node buffers at most 4 uploads at once, and charges each one's `Content-Length` (64 MiB
 when unknown) to the memory governor before reading it. A fifth upload, or one the governor refuses, gets `429
 rate_limited`.
+
+`DataBrowseGate` (`rt-api`): a semaphore per tenant and a rate window per service, only for ones that exist and were browsed; idle entries are dropped past 4096.
 
 ### Failed-auth limiter
 
@@ -261,10 +325,20 @@ with the `x-rt-tenant` header. Each tenant has a **plan**. These are the free pl
 | `egress_default` | `Allow` | `allow_cross_tenant_calls` | `false` |
 | `max_async_pending` | 10k (pending async invocations per service) | `max_topics` | 10 |
 | `max_topic_partitions` | 4 | `max_stream_mb` (record bytes across the tenant's topics; not in `storage_mb`) | 100 |
-| `max_stream_retention_hours` | 72 | | |
+| `max_stream_retention_hours` | 72 | `max_scratch` | 5 |
+| `scratch_ttl_max` | 7 days | `max_projects` | 20 |
+| `max_environments_per_project` | 10 | `max_branches` | 10 |
+| `max_secrets_per_service` | 100 | `max_custom_hosts` | 10 |
+| `cpu_ms_per_day` | 0 (no cap) | `max_versions_retained` | 0 (no cap) |
+| `log_retention_days` | 0 (no cap) | `max_fetches_per_call` | 0 (no cap) |
+| `max_log_lines_per_call` | 0 (no cap) | | |
 
 - The quota enforcer checks service count, schedule count and frequency, allowed triggers, an rps token bucket,
-  daily invocations, builds per hour, queue depth, daily egress and storage.
+  daily invocations, builds per hour, queue depth, daily egress and storage, and the caps on projects, environments,
+  branches, secrets and custom hosts (`403 quota_exceeded` names the limit; `GET /v1/usage` reports each).
+- `cpu_ms_per_day` (`0` = no cap) refuses new requests with `429 cpu_quota` until UTC midnight. Schedules, one-off
+  schedules and queue delivery stop too: fires are skipped and nothing is leased, so no delivery attempt is used. That
+  check reads in-memory counters, never `meta.db`.
 - A service's `min_instances` and `max_instances` are clamped to the plan's `max_instances`. The sum of
   `min_instances` across a tenant must stay within `max_warm_floor_total`, otherwise `422 limit_exceeds_plan`.
   One tenant can't pin the node's memory with warm instances.
@@ -571,6 +645,14 @@ Don't keep per-user data in module globals when reuse is on.
 
 ## Egress / SSRF guard
 
+**Debug builds only: the e2e origin allowance.** Under `#[cfg(debug_assertions)]`, and so absent from release builds,
+`RT_TEST_LOCAL_ORIGIN=<host>:<port>` with `RT_TEST_LOCAL_CA_FILE=<pem>` lets the archive fetcher reach exactly that
+origin although its address is private, trusting that CA. `RT_TEST_LOCAL_ORIGIN_GUESTS=1` extends the same origin to
+guest `fetch` (the console's calls to its Git host). Host rules and every other address stay refused. The R4 harness
+(`runtime-web/e2e/git-deploy`) is the only user. `crates/rt-host/tests/local_test_origin.rs` checks every use is gated,
+and release has an empty module in its place, so an ungated caller does not compile. Never run a debug build in
+production.
+
 Every outbound request from guest code (`fetch`, `wasi:http`), bindings and build fetches goes through one
 `EgressGuard`.
 
@@ -725,8 +807,15 @@ also in a warm isolate that is kept for the next task.
 
 - **One SQLite file per service.** A guest has no way to name another service's file.
 - **Blob names are generated by the host.** The guest's key is stored only in the `_rt_blobs` index and never
-  becomes a path, so there is no path traversal. Files are created with `create_new`, mode `0600`. Keys are 1 to
+  becomes a path, so there is no path traversal. The name in the row is checked against the generated format
+  whenever it becomes a path ([Backups](#backups)). Files are created with `create_new`, mode `0600`. Keys are 1 to
   1024 bytes.
+
+### Data browser
+
+`/v1/services/{s}/data/*` and the `data_*` MCP tools read data from outside the guest, and have no write path. Each layer stands alone (`crates/rt-store/src/browse.rs`): a connection of its own per request, opened `SQLITE_OPEN_READ_ONLY` plus `query_only` and never the writer or a pooled reader, whose statement cache could hold a statement judged by the looser guest authorizer; exactly one statement, `sqlite3_stmt_readonly`, with columns; an allowlist authorizer (`SELECT`, reads, functions, and only the pragmas `table_info`, `table_xinfo`, `index_list`, `index_info`, `foreign_key_list`), which refuses `_rt_*`, all `sqlite_*` tables including `sqlite_schema` and `sqlite_dbpage`, `dbstat`, other `pragma_*` functions, and `load_extension`; a 2 s budget and row, byte and cell caps. Sorts may spill to a temp file until the budget ends them. A request waits at most 1 s for a reader permit and a connection slot, then `503 sql_busy`; it never evicts.
+
+Every read writes its event (`data.queried`, `data.kv_read`, `data.blobs_read`) to `meta.db` before it answers, and a failed write refuses the read. Events hold the actor, a SHA-256 of the SQL or key, counts and the outcome; never SQL text, arguments or values. The runtime keeps no per-path access log, so `/data/kv/{key}` paths are not logged. The system tenant, `sys-` services and tenants on plan `rtweb` cannot be browsed (`403 reserved`). Rows reaching an assistant are prompt-injection content: MCP wraps them as `untrusted_data`. If at-rest encryption lands, this route reveals what it protects, like the export.
 
 ### SQLite authorizer (every guest statement)
 
@@ -755,6 +844,10 @@ also in a warm isolate that is kept for the next task.
 
 When a tenant is over its storage quota, its databases still serve reads and deletes but can't grow.
 
+### SQL migrations
+
+`versions.migrations` is written only from upload validation or the write-once `POST …/versions/{v}/migrations` (WASM), never from `meta`, which clients write. Migrations run at a promote on the writer, in one transaction, under the authorizer above, statement by statement and never from the prepared-statement cache, with a budget of `deploy.migration_budget`. Only the `_rt_migrations` rows are written with the authorizer off. Scope `deploy` can change a schema, as guest code already can. Errors carry a sanitized SQLite message and no host paths; audit and events carry names and hashes, never SQL. SQL is kept in `meta.db`, at most 900 KiB per version. There is no per-hour limit yet: dry runs have the heavy-job rule, and promotes the budget and the per-service lock.
+
 ### Synchronous `std:sqlite` (`bun:sqlite`)
 
 - Uses the same authorizer, limits, caps and page ceiling as the async path.
@@ -762,6 +855,56 @@ When a tenant is over its storage quota, its databases still serve reads and del
 - Transactions only go through host `begin`/`commit` (savepoints for nesting). A failed `COMMIT` rolls back. A
   transaction left open by a killed task is rolled back. The connection never silently falls back to autocommit
   while a transaction is open.
+
+---
+
+## Backups
+
+`/v1/node/status`, `/v1/node/series`, `/v1/node/stats` and `/v1/node/events` are operator only as well: they carry host facts and rows of every tenant, a tenant key gets `403 insufficient_scope`, and MCP has no tool for them. Host facts never include a host path (the disk has a label). `x-rt-tenant` narrows `/v1/node/stats` to one tenant; anything mapped to a tenant-facing surface must set it.
+
+`/v1/node/backups*` is operator only; a tenant key gets `403 insufficient_scope`. MCP has no backup tool. Download and delete are audited (`backup.created`, `backup.downloaded`, `backup.deleted`).
+
+**An archive is hostile input**, signed or not. `crates/rt-backup/src/untrusted.rs` holds the rules, and app import uses the same module:
+
+| Threat | Rule |
+|---|---|
+| Forged archive with consistent digests | `manifest.mac`: HMAC-SHA256 of the manifest under HKDF `rt/backup-mac/v1` of the master key, checked in constant time before the manifest is parsed. `--no-auth` is an explicit operator choice and skips this check only |
+| Path traversal, absolute paths | A tar path is parsed into a closed set of shapes, and the target rebuilt from the parts. Anything else is refused |
+| Symlinks, hardlinks, devices | Regular files only, created `O_CREAT \| O_EXCL \| O_NOFOLLOW`, mode `0600`, under a directory the restore made |
+| Crafted `_rt_blobs.file` (`/data/master.key`) | `Path::join` with an absolute name replaces the base, so a row could read or unlink any host file. Every row must have the exact generated name format, name a file in the archive at the recorded size, and be the only row naming it. Independently, the store reaches blob files only through a checked helper, so a bad name is refused at `get`, and `delete` and overwrite unlink nothing |
+| Decompression bomb | Output capped at the size the manifest declares, whose sum is checked against free disk; zstd window at most 128 MiB |
+| Hostile database | Opened defensively (no triggers, no views, no trusted schema), `quick_check`ed. Node databases may hold no trigger or view; a service database none on `_rt_*`. A newer schema is refused |
+| Archive path from a row | `…/archive`, `DELETE` and retention build the path from a `bkp_<ulid>` id. `backups.local_path` is never followed, since a restored `meta.db` can say anything |
+
+**The console.** `…/archive` holds every tenant's data, and `DELETE` destroys the recovery path. A console binding lists explicit paths (`rt_api::backups::CONSOLE_BINDING_PATHS`), because `*` in `allowed_paths` spans segments.
+
+**Exclusions.** The master key, root token and `rt.toml` never enter an archive. Sealed secrets are in `meta.db`, and need the master key to open.
+
+**Encryption.** With `backup.encrypt_to`, the tar is streamed through `age` to the file, so no plaintext archive is on disk (one database snapshot at a time stays in the private scratch directory while packed), and `/archive` serves ciphertext only. Recipients are public, so anyone with bucket write access can encrypt to them: the MAC, not `age`, authenticates, and `.sha256`/`.complete` are transport only. Without recipients an archive is plaintext: treat it like the data volume. Local mode is `0600`/`0700`.
+
+**S3.** Required to be encrypted unless `allow_plaintext_remote`. Credentials come from files or env, are zeroized and redacted, and errors carry only status codes. Each session checks the endpoint against the egress rules (TLS, no private or reserved address except explicit loopback, denied ports and hosts), pins the client to the checked addresses, and follows no redirect or proxy. The host is on the guest self-denylist.
+
+**A restore brings back the past.** Revoked keys, disabled tenants and removed grants return, and the audit trail of the window is lost. `rt backup restore` prints the snapshot age and active key count, offers `--revoke-keys-before` (cascading to minted keys), and writes a `node.restored` event, reported as `last_restored_at` in the status.
+
+### App bundles
+
+`POST /v1/services/import` takes a file from anyone (`crates/rt-backup/src/app.rs`, `crates/rt-store/src/import_check.rs`). A fork's bundle takes the same path. Nothing in a bundle runs at import.
+
+| Attack | Defense |
+|---|---|
+| Crafted `_rt_blobs.file` | `untrusted::check_service_db`, as for a restore: exact generated name, a listed file at the recorded size, one row each |
+| Tar traversal, links, devices, long-name or pax entries | Raw tar entries, regular files only, exact path shapes, listed in the manifest, once each, created `O_EXCL \| O_NOFOLLOW`, mode 0600 |
+| Decompression bomb | Spool counted as it arrives (`import.max_bundle_mb`); declared sizes at most 8 times that and at most 200:1 above 64 MiB, checked with free disk before reading; each entry capped at its declared size; bounded zstd window |
+| Truncated or altered bundle | Each entry's size and SHA-256 must match; a listed entry that is missing refuses the bundle |
+| Altered runtime tables | The `sqlite_master` text of each `_rt_*` object must equal, byte for byte, what this binary creates. Unknown `_rt_*` objects, and any object on a `_rt_*` table that is not the node's own, are refused |
+| Malicious triggers, views, virtual tables | The file is opened with triggers and views off and no trusted schema. Triggers and views naming `_rt_`, any schema naming a function the authorizer denies, and virtual tables other than `fts5` and `rtree` are refused. The rest is replayed on an empty in-memory database under the guest authorizer, and what would fire each trigger is compiled, never run |
+| Timers | `_rt_durable_alarm` is emptied, with triggers off, so no guest code wakes because data arrived |
+| Manifest as config | Unknown fields refuse the bundle at every level. Settings go through `POST /v1/services`, so plan, trigger and `sys-` checks apply. `tenant`, `project`, `environment` and scratch state never come from it |
+| Poisoned artifacts | Compiled artifacts are never imported. Digests are recomputed, and each version is validated and built from source, including the Wasm policy check |
+
+**Fork.** A key's `?from=` goes through `load_service`, so another tenant's service is `404`. Only the root token reaches across tenants. **Export** needs `data:admin` and is audited, since a bundle holds data and env values; sealed secrets stay behind, as names. **Limits.** One export or import per tenant, at most 256 bundle records per node, 1 hour each, none across a restart. A crash between creating the service and finishing the import can leave an incomplete service, which the operator deletes; a client that disconnects cannot, because the import runs on its own task.
+
+**Deleted data.** Archives keep deleted tenants' data until retention removes them.
 
 ---
 
@@ -831,6 +974,14 @@ transformed value (encoded, split) is not caught.
 
 ---
 
+## Data-change events and external secrets
+
+**Data-change events.** Generated `_rt_ev_*` triggers add to the reserved `_rt_changes` table in the guest's own transaction. The authorizer allows that one insert only when the accessor is such a trigger; guests cannot read, write, make, drop or alter any of it, and `DROP TABLE` on a subscribed table is refused until it is unsubscribed. Generated SQL quotes every name read from the schema. Copies (branches, bundles) lose the triggers and rows, and an import refuses a bundle holding `_rt_ev_*`. A topic is looked up only in the service's own tenant, project and environment. Enabling requires `data:read`, also through `PATCH`. A `row` payload stays in the stream for its retention after the row is deleted. Audit: `data_events.updated`.
+
+**External secrets.** A Vault path is `path_template` filled from the authenticated tenant and the service's project and environment, plus a tenant-chosen relative path refused on `..`, `//`, `%` and leading `/`; startup refuses a template without all three variables. Requests go through a trusted `GuardedEgress` with no redirects, verified TLS (plain http to loopback only), and the Vault host joins the guest egress self-denylist. The token is read from a file, marked sensitive, and never logged or returned; Vault's own text never reaches a tenant. Restrict the node's Vault policy per tenant prefix as well. An outage keeps the last sealed value, and running services do no Vault I/O. Revocation lags by `poll`. Audit: `secret.ref_written`, `secret.ref_deleted`; events: `secret.synced`, `secret.sync_failed` (names and codes only).
+
+---
+
 ## Builds and supply chain
 
 | Control | Behavior |
@@ -873,17 +1024,18 @@ Builds run in-process. There is no separate OS sandbox for the build step.
 | Scope | Tools |
 |---|---|
 | none | `whoami`, `get_limits` |
-| `services:read` | `list_projects`, `list_environments`, `list_sdks`, `get_sdk_contract`, `list_services`, `get_service`, `list_versions`, `list_schedules`, `list_objects`, `list_sockets`, `list_topics`, `read_topic`, `list_consumers`, `list_invocations` |
-| `services:write` | `create_project`, `create_service`, `update_service`, `delete_service`, `create_topic` |
-| `deploy` | `deploy_code`, `rollback` |
+| `services:read` | `list_projects`, `list_environments`, `list_sdks`, `get_sdk_contract`, `list_services`, `get_service`, `list_versions`, `migrations_status`, `list_schedules`, `list_objects`, `list_sockets`, `list_topics`, `read_topic`, `list_consumers`, `list_invocations`, `list_branches`, `get_switch` |
+| `services:write` | `create_project`, `create_service`, `update_service`, `delete_service`, `create_topic`, `create_branch`, `create_scratch` (`copy_data` also needs `data:admin`, checked by the route), `delete_branch` |
+| `deploy` | `deploy_code`, `deploy_from_url`, `rollback`, `switch_service` (a branch or another service as the source also needs `services:read`, checked by the route), `rollback_switch` |
 | `sockets:write` | `close_socket` |
+| `data:read` | `data_tables`, `data_query`, `data_kv_list`, `data_kv_get`, `data_blobs_list` |
 | `logs:read` | `get_logs`, `get_stats` |
 | `env:write` + `services:read` | `set_env` |
 | `secrets:write` | `set_secret` |
 | `keys:write` | `list_tokens`, `create_token`, `revoke_token` |
 | `queue:write` | `reset_consumer`, `redrive_invocations` |
 
-`list_topics`, `read_topic`, `list_consumers` and `list_invocations` need `services:read`, and `create_topic` needs
+`list_topics`, `read_topic`, `list_consumers`, `get_data_events` and `list_invocations` need `services:read`, and `create_topic` needs
 `services:write`. Topic delete and update, append, publish and DLQ purge are not MCP tools. `read_topic` returns
 record bodies as untrusted data, not instructions.
 
@@ -897,13 +1049,26 @@ target `rt::audit`.
 | Area | Events |
 |---|---|
 | Tenants, services | `tenant.created/updated/deleted`, `service.created/updated/deleted`, `service.environment_changed`, `scratch.created/deleted`, `scratch.copied_data` (source and bytes, never data) |
-| Versions | `deploy`, `rebuild`, `rollback`, `live.changed` |
+| Versions | `deploy`, `rebuild`, `rollback`, `live.changed`, `switch`, `version.migrations_set` |
 | Config | `env.written` (names only), `secret.written`, `secret.deleted` |
 | Hosts | `host.attached/detached/verified/expired` |
 | Schedules, queues | `schedule.created/updated/deleted`, `dlq.redrive`, `dlq.purge` |
 | Events | `topic.created/updated/deleted/appended` (`appended` carries `{count}` only), `pubsub.published` (`{subject, receivers}`), `consumer.reset`, `consumer.dlq_purged`, `invocations.redriven`, `invocations.purged` |
-| Data, projects, keys | `data.exported`, `project.created/updated/deleted`, `key.created`, `key.deleted` (with `cascaded`) |
+| App bundles | `app.exported`, `app.downloaded`, `app.imported`, `app.import_refused` (names and counts, never env values) |
+| Backups, restore | `backup.created`, `backup.downloaded`, `backup.deleted`, `node.restored` (written into the restored `meta.db`) |
+| Data, projects, keys | `data.exported`, `data.queried`, `data.kv_read`, `data.blobs_read`, `project.created/updated/deleted`, `key.created`, `key.deleted` (with `cascaded`) |
 | Security | `security.artifact_tamper` (separate event) |
+
+The data of the version events that flip a service:
+
+| Event | `data` |
+|---|---|
+| `version.migrations_set` | `{version, migrations: [{name, sha256}]}` (never the SQL) |
+| `switch` | `{switch, from, to, source_service, source_version, digest, git_sha, sockets_closed}` |
+| `rollback` from `POST …/switches/{id}/rollback` | `{switch, rollback, from, to, digest, git_sha}`: `switch` is the switch undone, `rollback` the new one |
+| `rollback` from `PUT …/live` to an older version; `live.changed` otherwise | `{from, to, sockets_closed}` |
+
+`git_sha` is always `null` for now (see [Switches and branches](#switches-and-branches)). A consumer must expect both shapes of `rollback`.
 
 **Logs.**
 - Node tracing never contains env or secret values.
@@ -920,10 +1085,23 @@ Failed authentications are rate-limited but not logged individually.
 
 ---
 
+## Telemetry
+
+A node with a telemetry URL sends one anonymous report a day. A build without `RT_TELEMETRY_URL` and with no URL configured sends nothing.
+
+- **Payload**, exactly: `install_id` (16 random bytes in hex, derived from nothing, created on the first send), `version`, and the counts `requests` (last 24 hours), `projects`, `services`, `organizations` (without the system tenant) and `users` (the count a console pushes with `PUT /v1/telemetry/console`, `null` when absent or older than 48 hours). No names, slugs, addresses, secrets or guest data.
+- **Inspect it:** `21ci telemetry show` or `GET /v1/telemetry/preview` (operator). `rt telemetry show` reads `meta.db` offline, so it shows `requests` as 0. All of them use the function that builds the real report; none sends anything or creates an id.
+- **Opt out:** `DO_NOT_TRACK=1` beats everything, then `telemetry.enabled = false`. `RT_TELEMETRY_URL` at run time beats `telemetry.url`. `telemetry.url = ""` sends nothing; `"auto"` is the build-time URL. A URL that is not plain `https` sends nothing.
+- **Network:** `GuardedEgress` for both transports, so SSRF, port and host rules apply, with no redirects, no pooling, no cookies and no authorization header. WebSocket first; one POST only if that got no answer. 10 seconds per attempt, no other retries, nothing again for a day. Charged to no tenant.
+- **Failure:** one debug log line. No readiness check sees it, and the task is aborted at shutdown. The first report is 24 hours after the first start. `rt serve` logs a notice at startup while telemetry is on.
+- **Limits:** reports are not authenticated, so totals are estimates. A restored backup keeps the `install_id`. The receiver sees the node's address during the connection; its own rules are in its README.
+- **Audit:** `telemetry.console` records the pushed count.
+
 ## Hardening settings
 
 | Setting | Default | Effect |
 |---|---|---|
+| `telemetry.enabled`, `telemetry.url`, `DO_NOT_TRACK` | `true`, `"auto"`, unset | The daily report ([Telemetry](#telemetry)) |
 | `RT_ROOT_TOKEN[_FILE]` | unset | Unset: control API disabled (release) or open on loopback only (debug). The `.env.example` `change-me…` placeholder is refused at startup, and so is a token shorter than 32 characters when `listeners.control` is not loopback. |
 | `RT_MASTER_KEY[_FILE]` | unset | Unset: auto-generated `<data_dir>/master.key`. Set it explicitly. |
 | `security.require_v8_sandbox` | `true` | The binary has no V8 sandbox, so startup fails unless this is `false`. The shipped defconfigs and the image set `false`, and a warning is logged. |
@@ -976,8 +1154,12 @@ These are **not** protected against today. Plan your deployment around them.
 | **Audit log** | Stored in `meta.db`, not signed or append-only. The operator (or an escaped guest) can change it. |
 | **Guest logs** | Only secret values of 8+ characters printed as they are get redacted. A guest that encodes or splits a secret (or a WASM guest whose stdout line is split at 64 KiB through one) stores it in logs. |
 | **Builds** | Run in-process with no OS sandbox. Allowlisted CDNs are trusted to serve what `rt.lock` pins. |
-| **S3 / OTLP** | Config keys are accepted but have no code behind them. Blobs and artifacts are local only. |
+| **S3 / OTLP** | Only backups can go to S3 (`[backup.s3]`). The S3 and OTLP keys for blobs, artifacts and traces are accepted but have no code behind them. Blobs and artifacts are local only. |
 | **Unused settings** | `secrets.cache_ttl` is not used; the env cache lives until it is invalidated or idle for 600 s. |
+| **Branch plan caps** | `max_branches` and the `copy_data` size limit are checked outside the insert transaction, so concurrent creates can overshoot by the number of requests in flight. |
+| **Rate-rule cell cap** | `ingress.rate_keys_max` has no upper bound, and its memory (about 96 bytes per key) is outside the memory governor. Keep it well under the node's budget. |
+| **Backup retention, mixed formats** | If one backup id exists remotely as both `.tar` and `.tar.age`, retention prunes only one of them. Delete the other by hand after changing `encrypt_to`. |
+| **Offline restore memory** | `rt backup verify` and `restore` may allocate up to 256 MiB from a manifest size in the archive before its MAC is checked. Run them on untrusted archives only with that much memory to spare. |
 
 If you host mutually untrusting tenants, run one node per trust domain (for example one VM per tenant group) until
 process and kernel isolation ship.
@@ -987,6 +1169,7 @@ process and kernel isolation ship.
 ## Operator hardening checklist
 
 - [ ] Run a **release** build.
+- [ ] Turn on `[backup]`, copy archives off the node, and practise a restore. List backup paths in a console binding one by one.
 - [ ] Set `RT_ROOT_TOKEN` (long, random) and `RT_MASTER_KEY` (`openssl rand -hex 32`) from a secret store, using
       the `_FILE` variants where you can. Back up the master key separately from the data volume.
 - [ ] Keep `control` and `metrics` on loopback, or behind a VPN or an authenticating proxy. Expose only `public`.

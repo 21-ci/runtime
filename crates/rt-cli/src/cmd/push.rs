@@ -28,6 +28,7 @@ fn str_of<'a>(v: &'a Value, key: &str) -> &'a str {
 pub fn run(app: &App, a: &PushArgs) -> Result<()> {
     // everything that can be wrong with the arguments is checked before the first request
     let art = artifact::build(&a.path)?;
+    let migrations = a.migrations.as_deref().map(super::migrations::read_dir).transpose()?;
     if let Some(r) = a.runtime {
         let want = super::service::runtime_str(r);
         if want != art.runtime.as_str() {
@@ -54,6 +55,11 @@ pub fn run(app: &App, a: &PushArgs) -> Result<()> {
             )));
         }
     }
+    if a.after_build && a.compile == Some(CompileArg::Lazy) {
+        return Err(CliError::usage(
+            "--after-build needs an eager build: drop --compile lazy",
+        ));
+    }
     let compile = match (a.compile, a.wait) {
         (Some(c), _) => Some(c.as_str()),
         (None, true) => Some("eager"),
@@ -67,12 +73,26 @@ pub fn run(app: &App, a: &PushArgs) -> Result<()> {
         project: a.project.as_deref(),
         environment: a.environment.as_deref(),
     };
-    let (id, created) = find_or_create(app, &c, &slug, art.runtime.as_str(), a.create, &place)?;
+    let parent = slug;
+    let (id, created, slug) = match &a.branch {
+        Some(name) => {
+            let (id, slug) = super::branch::resolve_branch(&c, &parent, name)?;
+            step(app, "Service", &format!("{id} (slug: {slug}, branch of {parent})"));
+            (id, false, slug)
+        }
+        None => {
+            let (id, created) = find_or_create(app, &c, &parent, art.runtime.as_str(), a.create, &place)?;
+            (id, created, parent.clone())
+        }
+    };
 
     // 2. upload (+ activate)
-    let activate = !a.no_activate;
+    let activate = !a.no_activate && !a.after_build;
     let mut query: Vec<(&str, String)> = Vec::new();
-    if activate {
+    // With migrations the flip is a separate request, after they are stored.
+    if a.after_build {
+        query.push(("activate", "after_build".into()));
+    } else if activate && migrations.is_none() {
         query.push(("activate", "1".into()));
         if a.close_sockets {
             query.push(("close_sockets", "1".into()));
@@ -86,12 +106,14 @@ pub fn run(app: &App, a: &PushArgs) -> Result<()> {
         "Upload",
         &format!("{}, {} bytes", art.content_type, art.bytes.len()),
     );
-    let reply = c.send_json(
-        c.req(Method::POST, &format!("/v1/services/{id}/versions"))
-            .query(&query)
-            .header(CONTENT_TYPE, art.content_type)
-            .body(art.bytes),
-    )?;
+    let mut upload = c
+        .req(Method::POST, &format!("/v1/services/{id}/versions"))
+        .query(&query)
+        .header(CONTENT_TYPE, art.content_type);
+    if a.meta_git {
+        upload = upload.header("x-rt-version-meta", git_meta_header(&a.path)?);
+    }
+    let reply = c.send_json(upload.body(art.bytes))?;
     let mut version = reply.body;
     let n = version.get("version").and_then(Value::as_u64).unwrap_or(0);
     let digest = str_of(&version, "source_digest").to_string();
@@ -100,6 +122,16 @@ pub fn run(app: &App, a: &PushArgs) -> Result<()> {
         "Version",
         &format!("{n} (build_state: {}, {digest})", str_of(&version, "build_state")),
     );
+
+    if let Some(body) = &migrations {
+        c.post(&format!("/v1/services/{id}/versions/{n}/migrations"), body)?;
+        if activate {
+            c.put(
+                &format!("/v1/services/{id}/live"),
+                &json!({"version": n, "close_sockets": a.close_sockets}),
+            )?;
+        }
+    }
 
     // 3. wait for the build
     if a.wait {
@@ -124,6 +156,9 @@ pub fn run(app: &App, a: &PushArgs) -> Result<()> {
     if activate {
         step(app, "Live", "yes");
         step(app, "Invoke", &invoke_url);
+        if let Some(name) = &a.branch {
+            step(app, "Next", &format!("21ci switch {parent} --from {name}"));
+        }
     } else {
         step(
             app,
@@ -220,4 +255,42 @@ fn wait_for_build(c: &Client, id: &str, n: u64, timeout: Duration, interval: Dur
         }
         std::thread::sleep(interval.min(deadline - now));
     }
+}
+
+/// `--meta-git`: `x-rt-version-meta` from the commit checked out at `path`, read with `git` on this
+/// machine (the node has none).
+fn git_meta_header(path: &std::path::Path) -> Result<String> {
+    use base64::Engine;
+    let dir = if path.is_dir() {
+        path
+    } else {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."))
+    };
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let sha = git(&["rev-parse", "HEAD"])
+        .ok_or_else(|| CliError::usage("--meta-git: this path is not in a git checkout, or git is not installed"))?;
+    let mut info = json!({"sha": sha});
+    if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        info["ref"] = json!(r);
+    }
+    if let Some(author) = git(&["log", "-1", "--format=%an"]) {
+        info["author"] = json!(author.chars().take(200).collect::<String>());
+    }
+    if let Some(subject) = git(&["log", "-1", "--format=%s"]) {
+        info["message"] = json!(subject.chars().take(200).collect::<String>());
+    }
+    let text = json!({"git": info}).to_string();
+    Ok(base64::engine::general_purpose::STANDARD.encode(text))
 }

@@ -29,6 +29,32 @@ async fn sleep_ms(ms: u64) {
 }
 
 #[tokio::test]
+async fn stats_all_equals_the_per_service_stats_in_one_read() {
+    let q = queue(1);
+    let (a, b, dead, none) = (svc(901), svc(902), svc(903), svc(904));
+    for _ in 0..3 {
+        q.enqueue(a, msg("x")).await.unwrap();
+    }
+    q.lease(a, 1, LONG).await.unwrap();
+    q.enqueue(b, msg("x")).await.unwrap();
+    q.enqueue(dead, msg("x")).await.unwrap();
+    let leased = q.lease(dead, 1, LONG).await.unwrap();
+    q.retry(leased[0].id, Duration::ZERO).await.unwrap();
+
+    let all = q.stats_all().await.unwrap();
+    for s in [a, b, dead] {
+        let (one, grouped) = (q.stats(s).await.unwrap(), all[&s]);
+        assert_eq!(
+            (one.depth, one.in_flight, one.dlq),
+            (grouped.depth, grouped.in_flight, grouped.dlq)
+        );
+    }
+    assert_eq!((all[&a].depth, all[&a].in_flight), (2, 1));
+    assert_eq!(all[&dead].dlq, 1);
+    assert!(!all.contains_key(&none));
+}
+
+#[tokio::test]
 async fn ac_queue_01_enqueue_then_lease_delivers_body_with_attempt_one() {
     let q = queue(5);
     let s = svc(1);

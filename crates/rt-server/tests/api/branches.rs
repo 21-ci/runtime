@@ -149,6 +149,39 @@ fn slugs(r: &Resp) -> Vec<String> {
 }
 
 node_test! {
+/// `code_of_parent`: the parent's live version, live on the branch from the first request, with
+/// the digest of the parent's. Takes `deploy`; a parent with nothing live gives an empty branch.
+async fn a_branch_can_start_from_the_parents_code() {
+    let node = start_node().await;
+    let t = new_tenant(&node, "pro").await;
+    let slug = uniq("par");
+    let id = ship(&node, &t.key, &slug, GUEST).await;
+    // A lazy live version has no finished build to adopt yet, and no branch is left behind.
+    let lazy = post(&node, &t.key, &branches(&id), json!({"name": "code", "code_of_parent": true})).await;
+    assert_refused(&lazy, 409, "version_not_ready");
+    ship_to(&node, &t.key, &id, GUEST).await;
+    let br = branch(&node, &t.key, &id, json!({"name": "code", "code_of_parent": true})).await;
+    assert_eq!(br["live_version"], json!(1), "{br}");
+    let bid = br["id"].as_str().expect("id");
+    let of = |sid: String, v: u32| {
+        let node = &node;
+        let key = t.key.clone();
+        async move {
+            get(node, &key, &format!("/v1/services/{sid}/versions/{v}")).await.json["source_digest"].clone()
+        }
+    };
+    assert_eq!(of(bid.to_string(), 1).await, of(id.clone(), 2).await);
+
+    let without = branch(&node, &t.key, &id, json!({"name": "bare"})).await;
+    assert_eq!(without["live_version"], Value::Null, "the default stays no code");
+
+    let empty = create_service(&node, &t.key, &uniq("nocode"), "deno").await;
+    let none = branch(&node, &t.key, &empty, json!({"name": "e", "code_of_parent": true})).await;
+    assert_eq!(none["live_version"], Value::Null);
+}
+}
+
+node_test! {
 /// `<parent-slug>-br-<name>`: names match `^[a-z][a-z0-9-]{0,23}$` without `--`, and the whole slug
 /// must still be a slug. A taken slug is `branch_exists`, whoever took it.
 async fn branch_slug_grammar() {
@@ -659,8 +692,35 @@ async fn branch_has_no_timed_triggers_by_default() {
 }
 
 node_test! {
-/// Pub/sub is scoped by environment: the branch mirrors the parent's subscription, and still gets
-/// nothing published to the parent's environment. Sharing a label is a choice, and shares.
+/// M8: a branch is not a second member of the parent's subscriptions and consumers unless asked,
+/// the asking takes `deploy`, and a `PATCH` cannot add them later.
+async fn branch_does_not_inherit_subscriptions_by_default() {
+    let node = start_node().await;
+    let t = new_tenant(&node, "pro").await;
+    let slug = uniq("par");
+    let id = ship(&node, &t.key, &slug, PUBSUB).await;
+    let p = patch(&node, &t.key, &format!("/v1/services/{id}"), json!({"events": {"subscribe": [{"subject": "orders.*"}]}})).await;
+    assert_eq!(p.s(), 200, "{}", p.text);
+
+    let write_only = make_key(&node, &t.id, &["services:write", "services:read"], None).await.1;
+    let b = branch(&node, &write_only, &id, json!({"name": "plain", "environment": "production"})).await;
+    assert!(b["events"]["subscribe"].as_array().is_none_or(Vec::is_empty), "{b}");
+    let path = format!("/v1/services/{}", b["id"].as_str().expect("id"));
+    let p = patch(&node, &t.key, &path, json!({"events": {"subscribe": [{"subject": "orders.*"}]}})).await;
+    assert_eq!(p.s(), 200, "{}", p.text);
+    assert!(p.json["events"]["subscribe"].as_array().is_none_or(Vec::is_empty), "forced after PATCH: {}", p.text);
+
+    let r = post(&node, &write_only, &branches(&id), json!({"name": "ask", "events_of_parent": true})).await;
+    assert_refused(&r, 403, "insufficient_scope");
+    let kept = branch(&node, &t.key, &id, json!({"name": "ask", "events_of_parent": true})).await;
+    assert_eq!(kept["events"]["subscribe"][0]["subject"], json!("orders.*"), "{kept}");
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// Pub/sub is scoped by environment: a branch that asked to mirror the parent's subscription still
+/// gets nothing published to the parent's environment. Sharing a label is a choice, and shares.
 async fn branch_cannot_read_parent_topic() {
     let node = start_node().await;
     let t = new_tenant(&node, "pro").await;
@@ -670,7 +730,7 @@ async fn branch_cannot_read_parent_topic() {
     assert_eq!(p.s(), 200, "{}", p.text);
     assert_eq!(invoke(&node, &slug, "/").await.s(), 200);
 
-    let b = branch(&node, &t.key, &id, json!({"name": "iso"})).await;
+    let b = branch(&node, &t.key, &id, json!({"name": "iso", "events_of_parent": true})).await;
     assert_eq!(b["events"]["subscribe"][0]["subject"], json!("orders.*"), "mirrored: {b}");
     ship_to(&node, &t.key, b["id"].as_str().expect("id"), PUBSUB).await;
     assert_eq!(invoke(&node, &format!("{slug}-br-iso"), "/").await.s(), 200);
@@ -687,7 +747,7 @@ async fn branch_cannot_read_parent_topic() {
     assert_eq!(publish("br-iso").await, 1, "the branch alone");
 
     // A label the parent's environment shares on request.
-    let shared = branch(&node, &t.key, &id, json!({"name": "shr", "environment": "production"})).await;
+    let shared = branch(&node, &t.key, &id, json!({"name": "shr", "environment": "production", "events_of_parent": true})).await;
     ship_to(&node, &t.key, shared["id"].as_str().expect("id"), PUBSUB).await;
     assert_eq!(invoke(&node, &format!("{slug}-br-shr"), "/").await.s(), 200);
     assert_eq!(publish("production").await, 2);
@@ -854,4 +914,31 @@ fn chrono_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_millis() as i64
+}
+
+node_test! {
+/// A branch has timed triggers off by policy. That only matters once a schedule exists on either side.
+async fn timed_triggers_differ_only_with_a_schedule() {
+    let node = start_node().await;
+    let t = new_tenant(&node, "pro").await;
+    let slug = uniq("par");
+    let id = ship(&node, &t.key, &slug, TICKS).await;
+    let b = branch(&node, &t.key, &id, json!({"name": "new"})).await;
+    ship_to(&node, &t.key, b["id"].as_str().expect("id"), TICKS).await;
+    let path = format!("/v1/services/{id}/switch");
+    let differ = |v: &Value| -> Option<Value> {
+        let w = v["warnings"].as_array()?;
+        w.iter().find(|x| x["code"] == json!("triggers_differ")).map(|x| x["names"].clone())
+    };
+
+    let dry = post(&node, &t.key, &path, json!({"from": {"branch": "new"}, "dry_run": true})).await;
+    assert_eq!(dry.s(), 200, "{}", dry.text);
+    assert_eq!(differ(&dry.json), None, "no schedules anywhere: {}", dry.text);
+
+    let s = post(&node, &t.key, &format!("/v1/services/{id}/schedules"), json!({"kind": "interval", "every_seconds": 3600, "payload": {}})).await;
+    assert_eq!(s.s(), 201, "{}", s.text);
+    let dry = post(&node, &t.key, &path, json!({"from": {"branch": "new"}, "dry_run": true})).await;
+    assert_eq!(differ(&dry.json), Some(json!(["interval"])), "{}", dry.text);
+    node.shutdown().await;
+}
 }

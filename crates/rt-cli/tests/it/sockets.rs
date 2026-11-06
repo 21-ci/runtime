@@ -67,6 +67,23 @@ fn sockets_close_closes_one_socket_with_a_code() {
 }
 
 #[test]
+fn sockets_close_all_closes_the_whole_service() {
+    let ctx = Ctx::new();
+    ctx.lookup("hello", "svc_1");
+    let m = ctx.server.mock(|when, then| {
+        when.method(DELETE)
+            .path("/v1/services/svc_1/sockets")
+            .query_param("code", "4000");
+        then.status(200).json_body(json!({"closed": 5}));
+    });
+    let out = ctx.run(&["sockets", "close", "hello", "--all", "--code", "4000"]).ok();
+    m.assert();
+    assert!(out.stdout.contains("Closed 5 sockets of hello"), "{}", out.stdout);
+    ctx.run(&["sockets", "close", "hello", "--all", "--tag", "x"])
+        .fails_with(2);
+}
+
+#[test]
 fn sockets_close_by_tag_closes_several() {
     let ctx = Ctx::new();
     ctx.lookup("hello", "svc_1");

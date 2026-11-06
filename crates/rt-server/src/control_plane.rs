@@ -104,6 +104,8 @@ pub struct InProcControlPlane {
     /// Set once the node is wired. Weak: the promoter lives in the API state, which reaches back
     /// here through the node facts.
     promoter: OnceLock<Weak<Promoter>>,
+    /// Where `after_build` activations run.
+    runtime: tokio::runtime::Handle,
 }
 
 impl InProcControlPlane {
@@ -120,6 +122,7 @@ impl InProcControlPlane {
             events,
             auto_rollback: true,
             promoter: OnceLock::new(),
+            runtime: tokio::runtime::Handle::current(),
         };
         me.spawn_event_writer(rx);
         me
@@ -197,6 +200,69 @@ impl InProcControlPlane {
             .map_err(|e| CpError::Internal(e.code().to_string()))?;
         let bundle = self.env_for(service, version).await?;
         Ok((version, Arc::new(bundle)))
+    }
+
+    /// `activate: "after_build"`: the build of `version` is done. Make it live through `promote()`,
+    /// migrations first, on a task of its own: migrations may take a minute, and the build slot and
+    /// the requests parked on this build must not wait for them. Taken once, so a later rebuild of
+    /// the version does not flip again; a version already passed by a newer live one stays out.
+    async fn after_build(&self, service: ServiceId, version: VersionNo, ready: bool) {
+        let actor = match self.meta.take_version_activation(service, version).await {
+            Ok(Some(actor)) => actor,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(%service, version = version.0, error = %e, "after_build activation not read");
+                return;
+            }
+        };
+        let Ok(Some(svc)) = self.meta.get_service(rt_store::TenantScope::Operator, service).await else {
+            return; // deleted while it built
+        };
+        let events = self.events.clone();
+        let tenant = svc.tenant_id;
+        let send = move |kind: &str, data: serde_json::Value| {
+            let mut ev = NodeEvent::new(kind, chrono::Utc::now().timestamp_millis());
+            ev.tenant = Some(tenant);
+            ev.service = Some(service);
+            ev.data = data;
+            let _ = events.send(ev);
+        };
+        if !ready {
+            send(
+                "service.promote_failed",
+                serde_json::json!({"version": version.0, "code": "build_failed"}),
+            );
+            return;
+        }
+        let Some(promoter) = self.promoter.get().and_then(Weak::upgrade) else {
+            return; // the node is going down
+        };
+        let git_sha = match self.meta.get_version(service, version).await {
+            Ok(Some(v)) => v.git_sha().map(str::to_string),
+            _ => None,
+        };
+        // On the node's runtime: this call comes from a build machine's thread.
+        self.runtime.spawn(async move {
+            let req = PromoteReq::new(version).by(actor).only_forward();
+            match promoter.promote(&svc, req).await {
+                Ok(done) => send(
+                    "service.promoted",
+                    serde_json::json!({
+                        "version": version.0,
+                        "switch": done.switch.id.to_string(),
+                        "from": done.switch.from_version.map(|v| v.0),
+                        "git_sha": git_sha,
+                        "migrations_applied": done.migrations_applied.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+                        "warnings": done.warnings,
+                    }),
+                ),
+                // A failed migration also raised `service.migration_failed` with its details.
+                Err(e) => send(
+                    "service.promote_failed",
+                    serde_json::json!({"version": version.0, "code": e.code}),
+                ),
+            }
+        });
     }
 
     /// Remember that `service`'s `version` waits for the build of `digest`.
@@ -282,6 +348,10 @@ impl QuotaEnforcer for MeteredQuotas {
 
     fn egress_left(&self, tenant: rt_types::TenantId) -> Option<u64> {
         self.inner.egress_left(tenant)
+    }
+
+    fn cpu_exhausted(&self, tenant: rt_types::TenantId) -> bool {
+        self.inner.cpu_exhausted(tenant)
     }
 
     fn usage_today(&self, tenant: rt_types::TenantId) -> Option<rt_sec::QuotaUsage> {
@@ -432,6 +502,7 @@ impl ControlPlane for InProcControlPlane {
                     self.auto_rollback(service, version).await;
                 }
             }
+            self.after_build(service, version, state == BuildState::Ready).await;
         }
         Ok(())
     }
@@ -471,7 +542,7 @@ impl InProcControlPlane {
             return;
         };
         if promoter
-            .promote(&svc, PromoteReq::new(prev.number).by("auto_rollback"))
+            .promote(&svc, PromoteReq::new(prev.number).by("auto_rollback").no_migrations())
             .await
             .is_ok()
         {
@@ -699,6 +770,8 @@ mod tests {
         let clock: Arc<dyn rt_sched::Clock> = Arc::new(rt_sched::SystemClock::new());
         let mem: Arc<dyn rt_mem::MemoryGovernor> = rt_testkit::TestGovernor::new(1 << 30);
         let promoter = Promoter::new(rt_api::promote::PromoterDeps {
+            data: rt_store::LocalServiceData::open(rt_store::DataConfig::new(tempfile::tempdir().expect("dir").keep()))
+                .expect("data"),
             meta: meta.clone(),
             scheduler: rt_sched::Scheduler::builder(rt_sched::SchedConfig::default(), clock.clone(), mem)
                 .executor(

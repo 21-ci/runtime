@@ -27,7 +27,7 @@ theme:
   favicon: assets/images/favicon.svg
   font:
     text: Inter
-    code: JetBrains Mono
+    code: IBM Plex Mono
   icon:
     admonition:
       note: material/pencil-circle
@@ -78,12 +78,14 @@ plugins:
 # Not site pages: the repository README for docs/ (GitHub index) and the internal notes that never ship.
 exclude_docs: |
   README.md
+  design/
 
 # Generates docs/assets/openapi.json (cleaned copy of openapi/openapi.json) for the API explorer. Git-ignored.
 hooks:
   - scripts/docs_hooks.py
 
 extra_css:
+  - assets/stylesheets/design.css
   - assets/stylesheets/extra.css
 
 extra_javascript:

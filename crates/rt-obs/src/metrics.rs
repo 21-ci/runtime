@@ -33,6 +33,9 @@ pub mod names {
     pub const SCHED_SPINNING_SECONDS_TOTAL: &str = "rt_sched_spinning_seconds_total";
     pub const SYSMON_TICK_SECONDS: &str = "rt_sysmon_tick_seconds";
 
+    pub const BACKUP_DURATION_SECONDS: &str = "rt_backup_duration_seconds";
+    pub const BACKUP_LAST_SUCCESS_TIMESTAMP: &str = "rt_backup_last_success_timestamp";
+    pub const BACKUP_PEAK_WAL_BYTES: &str = "rt_backup_peak_wal_bytes";
     pub const MEM_BUDGET_BYTES: &str = "rt_mem_budget_bytes";
     pub const MEM_COMMITTED_BYTES: &str = "rt_mem_committed_bytes";
     pub const MEM_RSS_BYTES: &str = "rt_mem_rss_bytes";
@@ -56,7 +59,9 @@ pub mod names {
 
     pub const HTTP_REQUESTS_TOTAL: &str = "rt_http_requests_total";
     pub const INGRESS_CONN_REJECTED_TOTAL: &str = "rt_ingress_conn_rejected_total";
+    pub const INGRESS_RATE_LIMITED_TOTAL: &str = "rt_ingress_rate_limited_total";
     pub const EGRESS_REQUESTS_TOTAL: &str = "rt_egress_requests_total";
+    pub const TELEMETRY_SENDS_TOTAL: &str = "rt_telemetry_sends_total";
     pub const EGRESS_BYTES_TOTAL: &str = "rt_egress_bytes_total";
 
     pub const SCHEDULE_FIRES_TOTAL: &str = "rt_schedule_fires_total";
@@ -111,6 +116,9 @@ pub const NODE_METRIC_NAMES: &[&str] = &[
     names::SCHED_HOG_HANDOFFS_TOTAL,
     names::SCHED_SPINNING_SECONDS_TOTAL,
     names::SYSMON_TICK_SECONDS,
+    names::BACKUP_DURATION_SECONDS,
+    names::BACKUP_LAST_SUCCESS_TIMESTAMP,
+    names::BACKUP_PEAK_WAL_BYTES,
     names::MEM_BUDGET_BYTES,
     names::MEM_COMMITTED_BYTES,
     names::MEM_RSS_BYTES,
@@ -130,6 +138,7 @@ pub const NODE_METRIC_NAMES: &[&str] = &[
     names::BUILD_SECONDS,
     names::HTTP_REQUESTS_TOTAL,
     names::INGRESS_CONN_REJECTED_TOTAL,
+    names::INGRESS_RATE_LIMITED_TOTAL,
     names::EGRESS_REQUESTS_TOTAL,
     names::EGRESS_BYTES_TOTAL,
     names::SCHEDULE_FIRES_TOTAL,
@@ -198,6 +207,9 @@ pub struct Metrics {
     pub sched_spinning_seconds_total: Gauge,
     pub sysmon_tick_seconds: Histogram,
     // Memory
+    pub backup_duration_seconds: IntGauge,
+    pub backup_last_success_timestamp: IntGauge,
+    pub backup_peak_wal_bytes: IntGauge,
     pub mem_budget_bytes: IntGauge,
     pub mem_committed_bytes: IntGaugeVec, // category
     pub mem_rss_bytes: IntGauge,
@@ -223,8 +235,10 @@ pub struct Metrics {
     pub http_requests_total: IntCounterVec, // listener, status_class
     /// Connections closed at accept by `ingress.max_conns_per_ip`.
     pub ingress_conn_rejected_total: IntCounter,
-    pub egress_requests_total: IntCounterVec, // result
+    pub ingress_rate_limited_total: IntCounterVec, // rule (its index on the service, never an IP)
+    pub egress_requests_total: IntCounterVec,      // result
     pub egress_bytes_total: IntCounter,
+    pub telemetry_sends_total: IntCounterVec, // result
     // Triggers
     pub schedule_fires_total: IntCounter,
     pub schedule_skipped_total: IntCounter,
@@ -365,6 +379,14 @@ impl Metrics {
         r.register(Box::new(sched_spinning_seconds_total.clone()))?;
         let sysmon_tick_seconds = hist(&r, SYSMON_TICK_SECONDS, "Sysmon tick duration")?;
 
+        let backup_duration_seconds = int_gauge(&r, BACKUP_DURATION_SECONDS, "Duration of the last good backup")?;
+        let backup_last_success_timestamp =
+            int_gauge(&r, BACKUP_LAST_SUCCESS_TIMESTAMP, "Unix time of the last good backup")?;
+        let backup_peak_wal_bytes = int_gauge(
+            &r,
+            BACKUP_PEAK_WAL_BYTES,
+            "Largest WAL after a snapshot in the last backup",
+        )?;
         let mem_budget_bytes = int_gauge(&r, MEM_BUDGET_BYTES, "Memory budget")?;
         let mem_committed_bytes = gauge_vec_int(&r, MEM_COMMITTED_BYTES, "Committed bytes by category", &["category"])?;
         let mem_rss_bytes = int_gauge(&r, MEM_RSS_BYTES, "Process RSS")?;
@@ -397,9 +419,16 @@ impl Metrics {
             INGRESS_CONN_REJECTED_TOTAL,
             "Connections closed at accept by the per-IP connection cap",
         )?;
+        let ingress_rate_limited_total = counter_vec(
+            &r,
+            INGRESS_RATE_LIMITED_TOTAL,
+            "Requests refused by an ingress rate rule",
+            &["rule"],
+        )?;
         let egress_requests_total = counter_vec(&r, EGRESS_REQUESTS_TOTAL, "Guest egress requests", &["result"])?;
         let egress_bytes_total = int_counter(&r, EGRESS_BYTES_TOTAL, "Guest egress bytes")?;
 
+        let telemetry_sends_total = counter_vec(&r, TELEMETRY_SENDS_TOTAL, "Telemetry reports", &["result"])?;
         let schedule_fires_total = int_counter(&r, SCHEDULE_FIRES_TOTAL, "Schedule fires")?;
         let schedule_skipped_total = int_counter(&r, SCHEDULE_SKIPPED_TOTAL, "Skipped schedule fires")?;
         let schedule_denied_total = int_counter(
@@ -523,6 +552,7 @@ impl Metrics {
             build_seconds.with_label_values(&[kind]);
         }
         http_requests_total.with_label_values(&["public", "2xx"]).inc_by(0);
+        ingress_rate_limited_total.with_label_values(&["0"]).inc_by(0);
         for result in ["ok", "denied"] {
             egress_requests_total.with_label_values(&[result]).inc_by(0);
         }
@@ -569,6 +599,9 @@ impl Metrics {
             sched_hog_handoffs_total,
             sched_spinning_seconds_total,
             sysmon_tick_seconds,
+            backup_duration_seconds,
+            backup_last_success_timestamp,
+            backup_peak_wal_bytes,
             mem_budget_bytes,
             mem_committed_bytes,
             mem_rss_bytes,
@@ -588,7 +621,9 @@ impl Metrics {
             build_seconds,
             http_requests_total,
             ingress_conn_rejected_total,
+            ingress_rate_limited_total,
             egress_requests_total,
+            telemetry_sends_total,
             egress_bytes_total,
             schedule_fires_total,
             schedule_skipped_total,

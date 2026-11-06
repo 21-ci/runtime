@@ -29,6 +29,7 @@ tracing-subscriber.workspace = true
 dashmap.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -47,6 +47,7 @@ pub fn entry(tenant: u128, service: u128, slug: &str, version: u32) -> RouteEntr
         project: rt_types::ProjectId::from_u128(tenant),
         environment: rt_types::DEFAULT_ENVIRONMENT.to_string(),
         call: rt_types::CallAccess::default(),
+        isolated: false,
     }
 }
 
@@ -346,6 +347,22 @@ impl QueueStore for FakeQueueStore {
             oldest_age_ms: oldest.max(0) as u64,
             dlq,
         })
+    }
+
+    async fn stats_all(&self) -> Result<HashMap<ServiceId, QueueStats>, StoreError> {
+        let services: std::collections::HashSet<ServiceId> = {
+            let g = self.inner.lock();
+            g.msgs
+                .iter()
+                .map(|m| m.service)
+                .chain(g.dlq.iter().map(|(svc, _)| *svc))
+                .collect()
+        };
+        let mut all = HashMap::new();
+        for s in services {
+            all.insert(s, self.stats(s).await?);
+        }
+        Ok(all)
     }
 
     async fn dlq_list(&self, s: ServiceId, limit: usize) -> Result<Vec<DlqEntry>, StoreError> {

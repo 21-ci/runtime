@@ -129,7 +129,8 @@ fn last_change(adm: &Value) -> Option<String> {
 pub fn run(app: &App, a: &StatsArgs) -> Result<()> {
     let c = app.client()?;
     let svc = resolve(&c, &a.svc)?;
-    let query: Vec<(&str, String)> = a.window.iter().map(|w| ("window", w.clone())).collect();
+    let mut query: Vec<(&str, String)> = a.window.iter().map(|w| ("window", w.clone())).collect();
+    query.extend(a.series.iter().map(|v| ("step", v.clone())));
     let s = c.get(&svc.path("/stats"), &query)?;
     if app.json {
         fmt::print_json(&s);
@@ -166,6 +167,39 @@ pub fn run(app: &App, a: &StatsArgs) -> Result<()> {
     if !rows.is_empty() {
         fmt::emitln("");
         fmt::emit(&fmt::table(&["PHASE", "P50_MS", "P95_MS", "P99_MS"], &rows));
+    }
+    if let Some(series) = s.get("series").and_then(Value::as_array) {
+        let cell = |p: &Value, k: &str| p.get(k).map(fmt::compact).unwrap_or_else(|| "-".into());
+        let rows: Vec<Vec<String>> = series
+            .iter()
+            .map(|p| {
+                [
+                    "ts",
+                    "count",
+                    "errors",
+                    "queue_p95",
+                    "init_p95",
+                    "exec_p95",
+                    "total_p95",
+                ]
+                .iter()
+                .map(|k| cell(p, k))
+                .collect()
+            })
+            .collect();
+        fmt::emitln("");
+        fmt::emit(&fmt::table(
+            &[
+                "TS",
+                "COUNT",
+                "ERRORS",
+                "QUEUE_P95",
+                "INIT_P95",
+                "EXEC_P95",
+                "TOTAL_P95",
+            ],
+            &rows,
+        ));
     }
     Ok(())
 }

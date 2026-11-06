@@ -289,6 +289,7 @@ fn quota_response(e: &QuotaError) -> Response {
     match e {
         QuotaError::RateLimited { retry_after } => limited(429, "rate_limited", *retry_after),
         QuotaError::InvocationsPerDay { retry_after } => limited(429, "quota_exceeded", *retry_after),
+        QuotaError::CpuPerDay { retry_after } => limited(429, "cpu_quota", *retry_after),
         QuotaError::Exceeded { .. } => plain_error(429, "quota_exceeded"),
         _ => plain_error(429, "rate_limited"),
     }
@@ -643,6 +644,30 @@ async fn invoke(State(s): State<ApiState>, Extension(listener): Extension<Listen
             let ok = client.is_some_and(|ip| allow.allows(ip));
             if !ok {
                 return plain_error(403, "forbidden");
+            }
+        }
+        // Per-path rules first, so a flood of one path does not spend the whole service's budget.
+        // A service without rules pays this one branch.
+        if !rules.rate_rules.is_empty() {
+            let verdict = s.ingress.rate_rules.check(
+                &s.clock,
+                entry.service,
+                &rules.rate_rules,
+                parts.method.as_str(),
+                &route.path,
+                client,
+                || rt_triggers::rate_rules::RateCaps::resolve(cfg.ingress.rate_keys_max, s.mem.budget_bytes()),
+            );
+            match verdict {
+                rt_triggers::rate_rules::RateVerdict::Allow => {}
+                rt_triggers::rate_rules::RateVerdict::Malformed => return plain_error(400, "bad_request"),
+                rt_triggers::rate_rules::RateVerdict::Limited { rule, retry_after } => {
+                    s.metrics
+                        .ingress_rate_limited_total
+                        .with_label_values(&[rule.to_string().as_str()])
+                        .inc();
+                    return limited(429, "rate_limited", retry_after);
+                }
             }
         }
         if rules.rate_limit.rps > 0 {
@@ -1360,3 +1385,7 @@ mod tests {
         assert!(r.headers().get("x-rt-idempotent-replay").is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "invoke_rate_tests.rs"]
+mod rate_tests;

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rt_obs::{HdrStatsStore, Percentiles, ServiceStats, StatsStore, Window};
+use rt_obs::{HdrStatsStore, Percentiles, SeriesStep, ServiceStats, StatsStore, Window};
 use rt_types::{BuildFailReason, BuildFailure, KillReason, Outcome, RejectReason, Reply, ServiceId, TaskTimings};
 
 const T0: i64 = 1_760_000_000_000 / 60_000 * 60_000; // minute aligned
@@ -400,4 +400,167 @@ fn percentiles_of_a_window_reflect_only_the_buckets_inside_it() {
     let hour = f.stats(svc, Window::H1);
     assert_eq!(hour.count, 200);
     within_5pct(hour.exec.p99_ms, 1_000.0, "1h p99 includes it");
+}
+
+// ---------------------------------------------------------------------------------------------
+// R2: ring compaction (1-min to 1 h, 5-min to 6 h, 1-h to 24 h), series, counts
+// ---------------------------------------------------------------------------------------------
+
+/// One request per minute for `minutes`, ending at the fixture's clock.
+fn traffic(f: &Fixture, svc: ServiceId, minutes: i64) {
+    for _ in 0..minutes {
+        record(f, svc, &timings(1.0, 1.0, 50.0), &ok());
+        f.store.merge_shards();
+        f.advance(MINUTE);
+    }
+}
+
+#[test]
+fn a_full_day_of_traffic_keeps_about_a_tenth_of_the_buckets() {
+    let f = fixture();
+    let svc = ServiceId::new();
+    traffic(&f, svc, 24 * 60);
+    f.store.merge_shards();
+    let buckets = f.store.footprint().buckets;
+    assert!(buckets <= 160, "1,440 minutes must compact, got {buckets} buckets");
+    assert!(buckets >= 100, "the three tiers are all populated, got {buckets}");
+}
+
+#[test]
+fn compaction_keeps_every_count_and_percentile_of_the_day() {
+    let f = fixture();
+    let svc = ServiceId::new();
+    traffic(&f, svc, 23 * 60);
+    let s = f.stats(svc, Window::H24);
+    assert_eq!(s.count, 23 * 60, "merging buckets loses nothing");
+    assert_eq!(s.outcomes.get("ok"), Some(&(23 * 60)));
+    within_5pct(s.exec.p99_ms, 50.0, "p99 over compacted buckets");
+}
+
+#[test]
+fn the_last_hour_stays_exact_at_one_minute() {
+    let f = fixture();
+    let svc = ServiceId::new();
+    traffic(&f, svc, 3 * 60);
+    record(&f, svc, &timings(1.0, 1.0, 50.0), &ok()); // the current minute too
+    assert_eq!(
+        f.stats(svc, Window::H1).count,
+        60,
+        "H1 must not see a partial coarse bucket"
+    );
+    assert_eq!(f.stats(svc, Window::M5).count, 5);
+}
+
+#[test]
+fn a_record_merged_late_lands_in_its_coarse_tier() {
+    let f = fixture();
+    let svc = ServiceId::new();
+    record(&f, svc, &timings(0.0, 0.0, 5.0), &ok());
+    f.advance(7 * 60 * MINUTE); // merged only now: its minute is long past the fine tier
+    assert_eq!(f.stats(svc, Window::H24).count, 1);
+    assert_eq!(f.store.footprint().buckets, 1);
+}
+
+#[test]
+fn a_service_with_no_buckets_left_is_forgotten() {
+    let f = fixture();
+    let svc = ServiceId::new();
+    record(&f, svc, &timings(0.0, 0.0, 5.0), &ok());
+    f.store.merge_shards();
+    assert_eq!(f.store.footprint().services, 1);
+    f.advance(26 * 60 * MINUTE);
+    f.store.merge_shards();
+    let fp = f.store.footprint();
+    assert_eq!((fp.services, fp.buckets), (0, 0));
+}
+
+#[test]
+fn compaction_off_is_the_uncompacted_baseline() {
+    let now = Arc::new(AtomicI64::new(T0));
+    let clock = now.clone();
+    let store = HdrStatsStore::without_compaction(Arc::new(move || clock.load(Ordering::SeqCst)));
+    let svc = ServiceId::new();
+    for _ in 0..180 {
+        store.record(svc, &timings(0.0, 0.0, 5.0), &ok());
+        store.merge_shards();
+        now.fetch_add(MINUTE, Ordering::SeqCst);
+    }
+    assert_eq!(store.footprint().buckets, 180);
+}
+
+#[test]
+fn series_has_one_point_per_step_with_traffic_and_phase_p95s() {
+    let f = fixture();
+    let svc = ServiceId::new();
+    for _ in 0..10 {
+        record(&f, svc, &timings(2.0, 3.0, 40.0), &ok());
+    }
+    record(&f, svc, &timings(2.0, 3.0, 40.0), &Outcome::GuestError);
+    f.advance(10 * MINUTE); // minutes 1..9 idle: sparse, no zero points
+    record(&f, svc, &timings(2.0, 3.0, 40.0), &ok());
+    f.store.merge_shards();
+    let now = f.now.load(Ordering::SeqCst);
+    let pts = f.store.series(svc, now - 60 * MINUTE, now + MINUTE, SeriesStep::M1);
+    assert_eq!(pts.len(), 2);
+    assert_eq!((pts[0].ts, pts[0].count, pts[0].errors), (T0, 11, 1));
+    within_5pct(pts[0].exec_p95, 40.0, "exec");
+    within_5pct(pts[0].queue_p95, 2.0, "queue");
+    within_5pct(pts[0].init_p95, 3.0, "init");
+    within_5pct(pts[0].total_p95, 45.0, "total");
+    assert_eq!((pts[1].ts, pts[1].count), (T0 + 10 * MINUTE, 1));
+}
+
+#[test]
+fn series_groups_by_the_step_and_respects_the_range() {
+    let f = fixture();
+    let svc = ServiceId::new();
+    traffic(&f, svc, 30);
+    let now = f.now.load(Ordering::SeqCst);
+    let by5 = f.store.series(svc, now - 30 * MINUTE, now, SeriesStep::M5);
+    assert!(by5.len() <= 7, "{}", by5.len());
+    assert_eq!(by5.iter().map(|p| p.count).sum::<u64>(), 30);
+    assert!(
+        by5.iter().all(|p| p.ts.rem_euclid(5 * MINUTE) == 0),
+        "aligned to the step"
+    );
+    assert!(by5.windows(2).all(|w| w[0].ts < w[1].ts), "oldest first");
+    let tail = f.store.series(svc, now - 2 * MINUTE, now, SeriesStep::M1);
+    assert_eq!(tail.iter().map(|p| p.count).sum::<u64>(), 2);
+    assert!(f.store.series(ServiceId::new(), T0, now, SeriesStep::H1).is_empty());
+}
+
+#[test]
+fn counts_cover_active_services_only_and_summary_gives_total_percentiles() {
+    let f = fixture();
+    let (busy, idle) = (ServiceId::new(), ServiceId::new());
+    record(&f, idle, &timings(0.0, 0.0, 1.0), &ok());
+    f.store.merge_shards();
+    f.advance(120 * MINUTE);
+    for _ in 0..4 {
+        record(&f, busy, &timings(0.0, 0.0, 20.0), &Outcome::GuestError);
+    }
+    f.store.merge_shards();
+    let now = f.now.load(Ordering::SeqCst);
+    let all = f.store.counts_all(now - 60 * MINUTE, now + 1);
+    assert_eq!(all.len(), 1, "a service outside the range is not listed");
+    assert_eq!(all[0].0, busy);
+    assert_eq!((all[0].1.count, all[0].1.errors), (4, 4));
+    within_5pct(
+        f.store.total_percentiles(busy, now - MINUTE, now + 1).p95_ms,
+        20.0,
+        "p95",
+    );
+    assert_eq!(
+        f.store.total_percentiles(idle, now - MINUTE, now + 1),
+        Percentiles::default()
+    );
+}
+
+#[test]
+fn series_steps_parse_the_documented_spellings() {
+    assert_eq!(SeriesStep::parse("1m"), Some(SeriesStep::M1));
+    assert_eq!(SeriesStep::parse("5m"), Some(SeriesStep::M5));
+    assert_eq!(SeriesStep::parse("1h"), Some(SeriesStep::H1));
+    assert_eq!(SeriesStep::parse("2m"), None);
+    assert_eq!(SeriesStep::H1.minutes(), 60);
 }

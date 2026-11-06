@@ -36,6 +36,7 @@ fn entry(tenant: u128, service: u128, project: u128, env: &str) -> RouteEntry {
         project: ProjectId::from_u128(project),
         environment: env.to_string(),
         call: CallAccess::default(),
+        isolated: false,
     }
 }
 

@@ -803,3 +803,21 @@ fn close_sockets_is_forwarded_with_activate() {
     ])
     .fails_with(2);
 }
+
+#[test]
+fn after_build_asks_the_node_to_activate_when_the_build_is_ready() {
+    let ctx = Ctx::new();
+    existing(&ctx);
+    let dir = tempfile::tempdir().unwrap();
+    write_tree(dir.path(), &[("hello.ts", TS)]);
+    let file = dir.path().join("hello.ts");
+    let m = ctx.server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/services/svc_1/versions")
+            .query_param("activate", "after_build");
+        then.status(202).json_body(upload_ok(2));
+    });
+    ctx.run(&["push", file.to_str().unwrap(), "--service", "hello", "--after-build"])
+        .ok();
+    m.assert();
+}

@@ -493,7 +493,8 @@ and notice requirements, no trademark grant). See [About](about/index.md).
 | KMS or Vault secrets backend | No | Yes |
 | Durable, exportable audit log | Events API and logs only | Yes |
 | SSO, OIDC and RBAC for the control API | No | Yes |
-| Web console and fleet management | No | Yes |
+| Web console ([Runtime Web](https://github.com/21-ci/runtime-web), Apache-2.0) | Yes | Yes |
+| Fleet management | No | Yes |
 
 Paid modules live outside the core and plug into it through extension points, so the open core is complete on its own.
 

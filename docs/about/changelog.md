@@ -8,11 +8,25 @@ description: User-facing changes to 21 Cloud Functions Runtime, newest first, gr
 User-facing changes to the runtime, newest first. Each day is grouped into Added, Changed, Fixed, Security and
 Performance. Internal refactoring and test-only changes are left out.
 
-!!! info "Version 0.1.0 is not released yet"
-    The workspace version is **0.1.0** and there is no tagged release. Every entry below belongs to the unreleased
-    0.1.0 work on the development branch. When 0.1.0 is tagged, this page will gain a dated release heading.
+!!! info "Release notes by version"
+    `CHANGELOG.md` in the repository holds the notes of each tagged release, written by release-please. This page
+    groups user-facing changes by theme.
 
-## 0.1.0 (unreleased)
+## Next release (unreleased)
+
+Scheduled backups with S3 and age encryption, branches and switches, migrations with `21ci promote`, deploying from a
+URL, app bundles, the read-only data browser, data-change events, external secrets from Vault, ingress rate rules and
+anonymous telemetry.
+
+**Upgrade notes**
+
+- **Telemetry is on by default in builds with a telemetry URL.** Once a day the node sends one anonymous report of
+  counts, first 24 hours after start. Opt out with `DO_NOT_TRACK=1` or `telemetry.enabled = false`; see the exact
+  payload with `21ci telemetry show`. Details: [Security](https://github.com/21-ci/runtime/blob/main/SECURITY.md#telemetry).
+- **Runtime Web needs this release.** Its console calls the new routes; move `RT_PINNED_VERSION` in its `install.sh`
+  to this release, and follow the upgrade notes in its changelog.
+
+## 0.1.0
 
 ### In progress
 

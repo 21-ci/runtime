@@ -19,6 +19,7 @@ pub mod keys;
 pub mod mac;
 pub mod master;
 pub mod quota;
+pub mod secret_source;
 pub mod secrets;
 
 use std::sync::Arc;

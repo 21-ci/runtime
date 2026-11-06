@@ -96,6 +96,17 @@ pub async fn reseal_secrets(meta: &dyn MetaStore, backend: &dyn SecretsBackend) 
 /// (`RT_MASTER_KEY[_FILE]` or `<data_dir>/master.key`, plus `RT_MASTER_KEY_PREVIOUS[_FILE]`).
 pub async fn run_reseal(config: &Config, secrets: &NodeSecrets) -> anyhow::Result<ResealReport> {
     let data_dir = Path::new(&config.node.data_dir);
+    let (master, previous) = master_keys(config, secrets)?;
+    let meta_path = data_dir.join("meta.db");
+    anyhow::ensure!(meta_path.is_file(), "{} does not exist", meta_path.display());
+    let meta = SqliteMetaStore::open(&meta_path).context("meta.db")?;
+    let backend = crate::wiring::local_secrets(&master, previous.as_ref());
+    Ok(reseal_secrets(meta.as_ref(), &backend).await?)
+}
+
+/// The master key and the previous one, as an offline command finds them.
+pub(crate) fn master_keys(config: &Config, secrets: &NodeSecrets) -> anyhow::Result<(MasterKey, Option<MasterKey>)> {
+    let data_dir = Path::new(&config.node.data_dir);
     let master = match &secrets.master_key {
         Some(s) => MasterKey::from_hex(s.expose()).context("RT_MASTER_KEY")?,
         None => {
@@ -109,11 +120,7 @@ pub async fn run_reseal(config: &Config, secrets: &NodeSecrets) -> anyhow::Resul
         Some(s) => Some(MasterKey::from_hex(s.expose()).context("RT_MASTER_KEY_PREVIOUS")?),
         None => None,
     };
-    let meta_path = data_dir.join("meta.db");
-    anyhow::ensure!(meta_path.is_file(), "{} does not exist", meta_path.display());
-    let meta = SqliteMetaStore::open(&meta_path).context("meta.db")?;
-    let backend = crate::wiring::local_secrets(&master, previous.as_ref());
-    Ok(reseal_secrets(meta.as_ref(), &backend).await?)
+    Ok((master, previous))
 }
 
 #[cfg(test)]

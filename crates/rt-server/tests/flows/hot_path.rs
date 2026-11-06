@@ -54,6 +54,91 @@ impl CountingMeta {
 
 #[async_trait]
 impl MetaStore for CountingMeta {
+    async fn telemetry_state(&self) -> Result<rt_store::TelemetryState> {
+        self.inner.telemetry_state().await
+    }
+    async fn telemetry_note_start(&self, now_ms: i64) -> Result<rt_store::TelemetryState> {
+        self.inner.telemetry_note_start(now_ms).await
+    }
+    async fn telemetry_install_id(&self, candidate: String) -> Result<String> {
+        self.inner.telemetry_install_id(candidate).await
+    }
+    async fn telemetry_mark_sent(&self, now_ms: i64) -> Result<()> {
+        self.inner.telemetry_mark_sent(now_ms).await
+    }
+    async fn telemetry_set_console_users(&self, users: u64, now_ms: i64) -> Result<()> {
+        self.inner.telemetry_set_console_users(users, now_ms).await
+    }
+    async fn telemetry_counts(&self) -> Result<rt_store::TelemetryCounts> {
+        self.inner.telemetry_counts().await
+    }
+    async fn reserve_fetching_version(&self, id: rt_types::ServiceId) -> Result<rt_types::Version> {
+        self.inner.reserve_fetching_version(id).await
+    }
+    async fn fill_fetching_version(
+        &self,
+        id: rt_types::ServiceId,
+        n: rt_types::VersionNo,
+        v: rt_types::NewVersion,
+        files: Vec<rt_types::MigrationFile>,
+    ) -> Result<rt_types::Version> {
+        self.inner.fill_fetching_version(id, n, v, files).await
+    }
+    async fn fail_interrupted_fetches(&self) -> Result<u64> {
+        self.inner.fail_interrupted_fetches().await
+    }
+    async fn import_begin(&self, tenant: rt_types::TenantId, slug: String) -> Result<String> {
+        self.inner.import_begin(tenant, slug).await
+    }
+    async fn import_bind(&self, import: String, service: rt_types::ServiceId) -> Result<()> {
+        self.inner.import_bind(import, service).await
+    }
+    async fn import_end(&self, import: String) -> Result<()> {
+        self.inner.import_end(import).await
+    }
+    async fn open_imports(&self) -> Result<Vec<(String, Option<rt_types::ServiceId>)>> {
+        self.inner.open_imports().await
+    }
+    async fn add_version_with_migrations(
+        &self,
+        id: rt_types::ServiceId,
+        v: rt_types::NewVersion,
+        files: Vec<rt_types::MigrationFile>,
+    ) -> Result<rt_types::Version> {
+        self.hit("add_version_with_migrations");
+        self.inner.add_version_with_migrations(id, v, files).await
+    }
+    async fn set_version_migrations(
+        &self,
+        id: rt_types::ServiceId,
+        v: rt_types::VersionNo,
+        files: Vec<rt_types::MigrationFile>,
+    ) -> Result<()> {
+        self.hit("set_version_migrations");
+        self.inner.set_version_migrations(id, v, files).await
+    }
+    async fn version_migration_files(
+        &self,
+        id: rt_types::ServiceId,
+        v: rt_types::VersionNo,
+    ) -> Result<Vec<rt_types::MigrationFile>> {
+        self.hit("version_migration_files");
+        self.inner.version_migration_files(id, v).await
+    }
+    async fn set_version_deploy(
+        &self,
+        id: rt_types::ServiceId,
+        v: rt_types::VersionNo,
+        meta: Option<serde_json::Value>,
+        activate_by: Option<String>,
+    ) -> Result<()> {
+        self.hit("set_version_deploy");
+        self.inner.set_version_deploy(id, v, meta, activate_by).await
+    }
+    async fn take_version_activation(&self, id: rt_types::ServiceId, v: rt_types::VersionNo) -> Result<Option<String>> {
+        self.hit("take_version_activation");
+        self.inner.take_version_activation(id, v).await
+    }
     async fn expired_scratch(&self, now: rt_types::UnixMs, limit: u32) -> Result<Vec<rt_types::Service>> {
         self.hit("expired_scratch");
         self.inner.expired_scratch(now, limit).await
@@ -369,6 +454,34 @@ impl MetaStore for CountingMeta {
         self.inner.put_env(id, env).await
     }
 
+    async fn put_secret_ref(&self, id: ServiceId, name: &str, path: &str, field: &str) -> Result<()> {
+        self.inner.put_secret_ref(id, name, path, field).await
+    }
+    async fn delete_secret_ref(&self, id: ServiceId, name: &str) -> Result<bool> {
+        self.inner.delete_secret_ref(id, name).await
+    }
+    async fn list_secret_refs(&self, id: ServiceId) -> Result<Vec<rt_store::SecretRef>> {
+        self.inner.list_secret_refs(id).await
+    }
+    async fn set_secret_ref_status(
+        &self,
+        id: ServiceId,
+        name: &str,
+        kv_version: Option<i64>,
+        synced_at_ms: Option<i64>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.inner
+            .set_secret_ref_status(id, name, kv_version, synced_at_ms, error)
+            .await
+    }
+    async fn scan_secret_refs(
+        &self,
+        after: Option<(ServiceId, String)>,
+        limit: u32,
+    ) -> Result<Vec<rt_store::SecretRefTarget>> {
+        self.inner.scan_secret_refs(after, limit).await
+    }
     async fn list_secrets(&self, id: ServiceId) -> Result<Vec<SecretMeta>> {
         self.hit("list_secrets");
         self.inner.list_secrets(id).await
@@ -447,6 +560,11 @@ impl MetaStore for CountingMeta {
     async fn prune_host_releases(&self, released_before_ms: rt_types::UnixMs) -> Result<u64> {
         self.hit("prune_host_releases");
         self.inner.prune_host_releases(released_before_ms).await
+    }
+
+    async fn tenant_counts(&self, tenant: TenantId) -> rt_store::Result<rt_store::meta::TenantCounts> {
+        self.hit("tenant_counts");
+        self.inner.tenant_counts(tenant).await
     }
 
     async fn count_pending_hosts(&self, tenant: TenantId) -> Result<u64> {

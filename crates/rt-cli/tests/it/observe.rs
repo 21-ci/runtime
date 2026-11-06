@@ -344,6 +344,18 @@ fn logs_follow_stream_that_breaks_exits_3() {
 
 // ---- stats -----------------------------------------------------------------------------------
 
+#[test]
+fn stats_series_sends_the_step_and_prints_the_points() {
+    let ctx = Ctx::new();
+    ctx.server.mock(|when, then| {
+        when.method(GET).path("/v1/services/svc_1/stats").query_param("step", "5m");
+        then.status(200).json_body(json!({"count": 1, "errors": 0,
+            "series": [{"ts": 60000, "count": 1, "errors": 0, "queue_p95": 1.0, "init_p95": 2.0, "exec_p95": 3.0, "total_p95": 6.0}]}));
+    });
+    let out = ctx.run(&["stats", "svc_1", "--series", "5m"]).ok();
+    assert!(out.stdout.contains("TOTAL_P95") && out.stdout.contains("60000"));
+}
+
 fn stats_body() -> Value {
     json!({
         "count": 100, "errors": 2, "error_rate": 0.02,

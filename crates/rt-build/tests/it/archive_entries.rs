@@ -140,3 +140,141 @@ fn a_json_deploy_with_an_unsafe_file_name_is_rejected_with_the_reason() {
         );
     }
 }
+
+// ---- from-url: an archive narrowed to its source ------------------------------------------------
+
+fn shape(strip: u32, subdir: Option<&str>) -> rt_types::ArchiveShape {
+    rt_types::ArchiveShape {
+        strip_components: strip,
+        subdir: subdir.map(str::to_string),
+        entry: None,
+    }
+}
+
+fn gz(raw: &[u8]) -> Vec<u8> {
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(raw).unwrap();
+    e.finish().unwrap()
+}
+
+fn repo() -> Vec<u8> {
+    gnu_tar(&[
+        ("repo-abc/README.md", tar::EntryType::Regular, b"readme"),
+        ("repo-abc/docs/link", tar::EntryType::Symlink, b""),
+        ("repo-abc/apps/x/main.ts", tar::EntryType::Regular, MAIN),
+        (
+            "repo-abc/apps/x/lib/a.ts",
+            tar::EntryType::Regular,
+            b"export const a = 1;\n",
+        ),
+        ("repo-abc/apps/xy/other.ts", tar::EntryType::Regular, b"x"),
+    ])
+}
+
+fn names_in(tar_bytes: &[u8]) -> Vec<String> {
+    tar::Archive::new(Cursor::new(tar_bytes))
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
+        .collect()
+}
+
+#[test]
+fn an_archive_is_narrowed_to_its_subdir_and_validates_as_an_upload() {
+    let b = default_builder();
+    let out = b
+        .reshape_archive(&Bytes::from(gz(&repo())), &shape(1, Some("apps/x/")))
+        .unwrap();
+    // `apps/xy` is not `apps/x`, and a link outside the subdir does not matter.
+    assert_eq!(names_in(&out), vec!["lib/a.ts", "main.ts"]);
+    UploadValidator::validate(&b, RuntimeKind::Deno, "application/x-tar", &out).unwrap();
+}
+
+#[test]
+fn the_same_tree_has_the_same_digest_whatever_the_archive_around_it() {
+    let b = default_builder();
+    let one = b
+        .reshape_archive(&Bytes::from(gz(&repo())), &shape(1, Some("apps/x")))
+        .unwrap();
+    let two = b
+        .reshape_archive(&Bytes::from(repo()), &shape(1, Some("apps/x")))
+        .unwrap();
+    assert_eq!(one, two);
+}
+
+#[test]
+fn the_entry_argument_is_what_rt_json_would_say() {
+    let b = default_builder();
+    let raw = gnu_tar(&[
+        ("r/app.ts", tar::EntryType::Regular, MAIN),
+        ("r/rt.json", tar::EntryType::Regular, br#"{"imports":{"a":"./app.ts"}}"#),
+    ]);
+    let s = rt_types::ArchiveShape {
+        entry: Some("app.ts".into()),
+        ..shape(1, None)
+    };
+    let out = b.reshape_archive(&Bytes::from(raw), &s).unwrap();
+    let v = UploadValidator::validate(&b, RuntimeKind::Deno, "application/x-tar", &out).unwrap();
+    assert_eq!(v.entry.as_deref(), Some("app.ts"));
+}
+
+#[test]
+fn an_entry_that_escapes_is_refused_before_anything_is_stripped() {
+    let b = default_builder();
+    let mut raw = tar::Builder::new(Vec::new());
+    let mut h = tar::Header::new_gnu();
+    h.as_gnu_mut().unwrap().name[..16].copy_from_slice(b"top/../../evil.t");
+    h.set_size(1);
+    h.set_mode(0o644);
+    h.set_cksum();
+    raw.append(&h, &b"x"[..]).unwrap();
+    let e = b
+        .reshape_archive(&Bytes::from(raw.into_inner().unwrap()), &shape(1, None))
+        .unwrap_err();
+    assert!(matches!(e, ValidationError::Invalid(_)), "{e:?}");
+}
+
+#[test]
+fn a_link_inside_the_subdir_is_refused() {
+    let b = default_builder();
+    let raw = gnu_tar(&[
+        ("r/main.ts", tar::EntryType::Regular, MAIN),
+        ("r/passwd", tar::EntryType::Symlink, b""),
+    ]);
+    let e = b.reshape_archive(&Bytes::from(raw), &shape(1, None)).unwrap_err();
+    assert!(matches!(e, ValidationError::Invalid(_)), "{e:?}");
+}
+
+#[test]
+fn a_bomb_outside_the_subdir_still_counts() {
+    let b = default_builder();
+    let zeros = vec![0u8; 11 * 1024 * 1024];
+    let raw = gnu_tar(&[
+        ("r/big.bin", tar::EntryType::Regular, &zeros),
+        ("r/a/main.ts", tar::EntryType::Regular, MAIN),
+    ]);
+    let e = b
+        .reshape_archive(&Bytes::from(gz(&raw)), &shape(1, Some("a")))
+        .unwrap_err();
+    assert!(matches!(e, ValidationError::TooLarge(_)), "{e:?}");
+    let small = gz(&vec![0u8; 512 * 40_000]);
+    let e = b.reshape_archive(&Bytes::from(small), &shape(0, None)).unwrap_err();
+    assert!(matches!(e, ValidationError::TooLarge(_)), "{e:?}");
+}
+
+#[test]
+fn what_is_no_archive_or_matches_nothing_is_refused() {
+    let b = default_builder();
+    let e = b
+        .reshape_archive(&Bytes::from_static(b"export default 1"), &shape(0, None))
+        .unwrap_err();
+    assert!(matches!(e, ValidationError::Invalid(_)), "{e:?}");
+    let e = b
+        .reshape_archive(&Bytes::from(repo()), &shape(1, Some("nope")))
+        .unwrap_err();
+    assert!(matches!(e, ValidationError::Invalid(_)), "{e:?}");
+    let e = b
+        .reshape_archive(&Bytes::from(repo()), &shape(1, Some("../x")))
+        .unwrap_err();
+    assert!(matches!(e, ValidationError::Invalid(_)), "{e:?}");
+}

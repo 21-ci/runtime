@@ -22,10 +22,13 @@ pub mod rpc;
 pub mod schedule;
 pub mod self_endpoints;
 pub mod sockets;
+pub mod vault;
 pub mod ws_client;
 
 pub use blocking::{FairBlockingPool, FairPoolConfig};
 pub use calls::{BindingError, CallError, Calls, ConfigBindings, EnqueueOpts, PlatformBindings, TaskCtx};
+#[cfg(debug_assertions)]
+pub use egress::local_test_origin;
 pub use egress::{
     is_https_downgrade, is_redirect, redirect_method, ConnectRewrite, EgressBudget, EgressError, EgressGuard,
     EgressGuardConfig, EgressIo, EgressPolicy, EgressUsage, GuardedEgress, Request, Resolver, Response, SystemResolver,

@@ -18,11 +18,12 @@ pub const SELF_DENYLIST_REFRESH: Duration = Duration::from_secs(300);
 /// interface addresses, which the denylist already holds.
 pub fn self_endpoint_hosts(cfg: &Config) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let urls = cfg
-        .binding
-        .iter()
-        .map(|b| b.base_url.as_str())
-        .chain([cfg.s3.endpoint.as_str(), cfg.otel.endpoint.as_str()]);
+    let urls = cfg.binding.iter().map(|b| b.base_url.as_str()).chain([
+        cfg.s3.endpoint.as_str(),
+        cfg.backup.s3.endpoint.as_str(),
+        cfg.otel.endpoint.as_str(),
+        cfg.secrets.vault.address.as_str(),
+    ]);
     for raw in urls {
         if let Some(h) = endpoint_host(raw) {
             if !out.contains(&h) {

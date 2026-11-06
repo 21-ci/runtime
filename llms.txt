@@ -12,9 +12,9 @@ Docs site: https://21-ci.github.io/runtime/ . Source: https://github.com/21-ci/r
 - [Control API](https://github.com/21-ci/runtime/blob/main/docs/api.md): auth and scopes, routes, service config blocks, error codes, invoke API, plans
 - [CLI (21ci)](https://github.com/21-ci/runtime/blob/main/docs/cli.md): contexts, every command, scopes, CI usage, exit codes
 - [Configuration](https://github.com/21-ci/runtime/blob/main/docs/config.md): `rt.toml`, profiles, sections, live vs restart-required keys
-- [Deployment and operations](https://github.com/21-ci/runtime/blob/main/docs/deploy.md): ports, environment, reverse proxy and TLS, health, backup, upgrade, master-key rotation
+- [Deployment and operations](https://github.com/21-ci/runtime/blob/main/docs/deploy.md): ports, environment, reverse proxy and TLS, health, scheduled backups (S3, age encryption) and restore, branches and switches, deploying from a URL, telemetry and its opt-out, upgrade, master-key rotation
 - [MCP server](https://github.com/21-ci/runtime/blob/main/docs/mcp.md): `POST /mcp` tools for AI assistants, connecting Claude Code, Claude Desktop, Cursor
-- [Security](https://github.com/21-ci/runtime/blob/main/SECURITY.md): threat model, Deno and WASM sandboxes, egress guard, storage isolation, WebSocket caps, secrets, hardening checklist
+- [Security](https://github.com/21-ci/runtime/blob/main/SECURITY.md): threat model, Deno and WASM sandboxes, egress guard, storage isolation, WebSocket caps, backups, secrets, telemetry, known limitations, hardening checklist
 
 ## API and interfaces
 

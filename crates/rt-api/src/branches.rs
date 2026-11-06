@@ -12,7 +12,10 @@ use axum::routing::{delete, post};
 use axum::{Json, Router};
 use rt_sec::{Actor, AuditEvent, QuotaOp};
 use rt_store::{ServiceFilter, StoreError, TenantScope};
-use rt_types::{EgressRules, NewService, Scope, ScratchConfig, ScratchKind, Service, ServiceConfig, TenantId, UnixMs};
+use rt_types::{
+    EgressRules, NewService, Scope, ScratchConfig, ScratchKind, Service, ServiceConfig, TenantId, UnixMs,
+    VersionOrigin, NO_EGRESS_HOST,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use utoipa::ToSchema;
@@ -21,17 +24,15 @@ use crate::auth::Auth;
 use crate::control::{
     audit, check_events_allowed, check_limits, check_scaling_bounds, fingerprint, idem_replay, idem_store, load_branch,
     load_service, not_system_parent, page_req, parse_environment, refresh_routes, remove_service, service_view,
-    valid_branch_name, valid_slug, value_resp, warm_floor_cap,
+    switch_actor, valid_branch_name, valid_slug, value_resp, warm_floor_cap,
 };
 use crate::dto::{PageQuery, ServicePage, ServiceView};
 use crate::error::{ApiError, ErrorEnvelope};
 use crate::extract::{ApiJson, ApiQuery};
 use crate::projects::check_environment_in_project;
+use crate::promote::PromoteReq;
 use crate::state::{ApiState, ControlEvent};
 
-/// `egress_of_parent: false`: an allowlist of one host that cannot resolve (`.invalid`, RFC 2606).
-/// An empty list would mean "no allowlist", not "nothing".
-const NO_EGRESS_HOST: &str = "no-egress.invalid";
 /// Expired branches removed per sweep; the rest wait for the next one.
 const SWEEP_BATCH: u32 = 50;
 
@@ -46,9 +47,18 @@ pub struct CreateBranchBody {
     /// Copy the parent's data and blobs (`data:admin`; forces `access: key`). Default empty.
     #[serde(default)]
     pub copy_data: bool,
+    /// Start from the parent's live version: adopted by digest and live on the branch before this
+    /// call answers (`deploy`). Default none: the branch has no code until a push. A parent with
+    /// nothing live leaves it so.
+    #[serde(default)]
+    pub code_of_parent: bool,
     /// Let interval and cron triggers run. Default off.
     #[serde(default)]
     pub schedules: bool,
+    /// Keep the parent's pub/sub subscriptions and stream consumers (`deploy`). Default none: in a
+    /// shared environment the branch would answer messages meant for the parent.
+    #[serde(default)]
+    pub events_of_parent: bool,
     /// Delete the branch and its data after this time (unix ms).
     pub expires_at: Option<UnixMs>,
     /// Add the names of the parent's env and secrets with empty values. Never a value.
@@ -92,7 +102,7 @@ pub(crate) async fn refuse_with_branches(s: &ApiState, svc: &Service) -> Result<
 }
 
 /// The bytes `copy_data` would copy, against the node's cap and the tenant's storage.
-async fn check_copy_size(s: &ApiState, parent: &Service) -> Result<(), ApiError> {
+pub(crate) async fn check_copy_size(s: &ApiState, parent: &Service) -> Result<(), ApiError> {
     let db = s.data.sql(parent.id).size_bytes().await?;
     let blobs = s.data.blob(parent.id).total_bytes().await?;
     let total = db.saturating_add(blobs);
@@ -105,6 +115,22 @@ async fn check_copy_size(s: &ApiState, parent: &Service) -> Result<(), ApiError>
     }
     s.quotas
         .check(parent.tenant_id, QuotaOp::Storage { delta_bytes: total })?;
+    Ok(())
+}
+
+/// Puts the parent's live version live on the new branch. Its migrations run on the branch's own
+/// data through the usual promote.
+async fn adopt_parent_code(s: &ApiState, a: &Auth, parent: &Service, branch: &Service) -> Result<(), ApiError> {
+    let Some(version) = parent.live_version else {
+        return Ok(());
+    };
+    let origin = VersionOrigin {
+        service: parent.id,
+        version,
+    };
+    s.promoter
+        .promote(branch, PromoteReq::adopt(origin).by(switch_actor(a)).no_wait())
+        .await?;
     Ok(())
 }
 
@@ -132,7 +158,8 @@ async fn fill_branch(s: &ApiState, parent: &Service, branch: &Service, b: &Creat
 #[utoipa::path(post, path = "/v1/services/{s}/branches", tag = "services", request_body = CreateBranchBody,
     params(("s" = String, Path, description = "the parent service")),
     responses((status = 201, body = ServiceView), (status = 403, body = ErrorEnvelope), (status = 404, body = ErrorEnvelope),
-        (status = 409, body = ErrorEnvelope), (status = 413, body = ErrorEnvelope), (status = 422, body = ErrorEnvelope)))]
+        (status = 409, body = ErrorEnvelope), (status = 413, body = ErrorEnvelope), (status = 422, body = ErrorEnvelope),
+        (status = 429, body = ErrorEnvelope), (status = 507, body = ErrorEnvelope)))]
 async fn branches_create(
     State(s): State<ApiState>,
     a: Auth,
@@ -143,6 +170,9 @@ async fn branches_create(
     a.require_scope(Scope::ServicesWrite)?;
     if b.copy_data {
         a.require_scope(Scope::DataAdmin)?;
+    }
+    if b.events_of_parent || b.code_of_parent {
+        a.require_scope(Scope::Deploy)?;
     }
     let fp = fingerprint(&[b"branch", id.as_bytes(), format!("{b:?}").as_bytes()]);
     let (replay, _idem_turn) = idem_replay(&s, &a, &h, fp).await?;
@@ -196,16 +226,19 @@ async fn branches_create(
     let plan = s.plans.plan_for(tenant);
     let current = s.meta.count_services(tenant).await?;
     s.quotas.check(tenant, QuotaOp::CreateService { current })?;
+    let counts = s.meta.tenant_counts(tenant).await?;
+    crate::limits::check_count("max_branches", counts.branches, plan.max_branches)?;
 
     let config = branch_config(
         &parent,
         ScratchConfig {
-            of: parent.id,
+            of: Some(parent.id),
             kind: ScratchKind::Branch,
             name: b.name.clone(),
             expires_at: b.expires_at,
             copied_data: b.copy_data,
             schedules: b.schedules,
+            events: b.events_of_parent,
             own_environment: false,
         },
         b.egress_of_parent.unwrap_or(true),
@@ -213,10 +246,12 @@ async fn branches_create(
     // The plan may have shrunk since the parent was written.
     check_limits(&plan, &config.limits)?;
     check_scaling_bounds(&plan, s.config.load().sched.min_run_time_max_ms, &config.scaling)?;
+    // A branch publishes nothing: its data is its own and no topic of the parent's may see it.
+    let mut config = config;
+    config.events.data_events = None;
     check_events_allowed(&plan, config.durable, &config.events)?;
 
     // Only a label added by this call goes away with the branch: an earlier one may have other users.
-    let mut config = config;
     let added = own_environment
         && s.meta
             .add_project_environment(tenant, &parent.project, &environment)
@@ -267,6 +302,18 @@ async fn branches_create(
         }
     };
     refresh_routes(&s).await?;
+    if b.code_of_parent {
+        if let Err(e) = adopt_parent_code(&s, &a, &parent, &branch).await {
+            let _ = remove_service(&s, a.scope, &branch, false).await;
+            return Err(e);
+        }
+    }
+    // The promote moved its live version and etag.
+    let branch = s
+        .meta
+        .get_service(a.scope, branch.id)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
     audit(
         &s,
         &a,
@@ -388,7 +435,7 @@ fn emit_expired(s: &ApiState, tenant: TenantId, svc: &Service, now: UnixMs) {
         service: Some(svc.id),
         action: "scratch.deleted".to_string(),
         data: json!({
-            "of": svc.config.scratch.as_ref().map(|c| c.of.to_string()),
+            "of": svc.config.scratch.as_ref().and_then(|c| c.of).map(|of| of.to_string()),
             "name": svc.config.scratch.as_ref().map(|c| c.name.clone()),
             "reason": "expired",
         }),

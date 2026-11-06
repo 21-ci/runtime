@@ -20,10 +20,10 @@ use dashmap::DashMap;
 use rt_config::Config;
 use rt_sched::{Clock, Scheduler};
 use rt_sec::PlanSource;
-use rt_store::{MetaStore, PageReq, StoreError};
+use rt_store::{MetaStore, PageReq, ServiceDataStore, StoreError, TenantScope};
 use rt_types::{
-    Etag, NewSwitch, NodeEvent, Service, ServiceId, Switch, SwitchId, SwitchKind, SwitchPatch, SwitchState, TenantId,
-    UnixMs, VersionNo, VersionOrigin,
+    plan_migrations, BuildState, Etag, MigrationEntry, NewSwitch, NodeEvent, Service, ServiceId, Switch, SwitchId,
+    SwitchKind, SwitchPatch, SwitchState, TenantId, UnixMs, VersionNo, VersionOrigin,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
@@ -47,6 +47,18 @@ const DRAIN_POLL: Duration = Duration::from_millis(250);
 /// Added to the longest a task can take.
 const DRAIN_MARGIN_MS: u64 = 30_000;
 
+/// Saturating: a huge asked timeout is a long wait, not a wrapped short one.
+fn millis(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+#[test]
+fn millis_saturate() {
+    assert_eq!(millis(std::time::Duration::from_secs(2)), 2000);
+    assert_eq!(millis(std::time::Duration::MAX), u64::MAX);
+}
+
 /// Re-read the routes and the service table.
 #[async_trait]
 pub trait RouteRefresh: Send + Sync {
@@ -64,6 +76,11 @@ pub struct PromoteReq {
     pub no_wait: bool,
     /// Wait this long for the previous version instead of the longest a task can take.
     pub drain_timeout: Option<Duration>,
+    /// Run the target's pending SQL migrations first. Off for rollbacks, which never migrate.
+    pub migrate: bool,
+    /// Refuse (`superseded`) when the target is not newer than what is live: an `after_build`
+    /// activation that finished late must not roll a newer deploy back.
+    pub only_forward: bool,
 }
 
 /// The version to make live.
@@ -84,7 +101,14 @@ impl PromoteReq {
             created_by: None,
             no_wait: false,
             drain_timeout: None,
+            migrate: true,
+            only_forward: false,
         }
+    }
+
+    pub fn only_forward(mut self) -> Self {
+        self.only_forward = true;
+        self
     }
 
     /// Adopt `origin` and flip to it, tracked as a switch.
@@ -98,6 +122,11 @@ impl PromoteReq {
 
     pub fn kind(mut self, kind: SwitchKind) -> Self {
         self.kind = kind;
+        self
+    }
+
+    pub fn no_migrations(mut self) -> Self {
+        self.migrate = false;
         self
     }
 
@@ -128,10 +157,13 @@ pub struct Promoted {
     pub service: Service,
     pub switch: Switch,
     pub warnings: Vec<SwitchWarning>,
+    /// What ran in `migrating`, in order.
+    pub migrations_applied: Vec<MigrationEntry>,
 }
 
 /// What [`Promoter::new`] needs.
 pub struct PromoterDeps {
+    pub data: Arc<dyn ServiceDataStore>,
     pub meta: Arc<dyn MetaStore>,
     pub scheduler: Scheduler,
     pub config: Arc<ArcSwap<Config>>,
@@ -139,6 +171,14 @@ pub struct PromoterDeps {
     pub clock: Arc<dyn Clock>,
     pub events: UnboundedSender<NodeEvent>,
     pub refresher: Arc<dyn RouteRefresh>,
+}
+
+/// A flip that holds the lock and has its row: what a client can be told before migrations run.
+struct Begun {
+    slot: Slot,
+    flip: tokio::sync::OwnedMutexGuard<()>,
+    row: Switch,
+    to: VersionNo,
 }
 
 struct ActiveDrain {
@@ -154,7 +194,7 @@ struct ActiveDrain {
 /// never looks like a flip in progress.
 #[derive(Default)]
 struct ServiceLocks {
-    flip: tokio::sync::Mutex<()>,
+    flip: Arc<tokio::sync::Mutex<()>>,
     drains: tokio::sync::Mutex<Vec<ActiveDrain>>,
 }
 
@@ -214,22 +254,58 @@ impl Promoter {
         let eff = cfg.service_effective(svc.profile, &svc.config, &plan);
         let longest = eff.wall_ms.value.max(eff.queue_timeout.value.as_millis() as u64);
         let wait = asked
-            .map_or(longest.saturating_add(DRAIN_MARGIN_MS), |d| d.as_millis() as u64)
-            .min(cfg.deploy.drain_max.as_millis() as u64);
+            .map_or(longest.saturating_add(DRAIN_MARGIN_MS), millis)
+            .min(millis(cfg.deploy.drain_max));
         self.deps.clock.unix_ms().saturating_add(wait as i64)
     }
 
     /// Flip `svc` to `req.to`. After the commit nothing fails the call: a refresh that keeps
     /// failing comes back as a warning, because the flip already happened.
     pub async fn promote(&self, svc: &Service, req: PromoteReq) -> Result<Promoted, ApiError> {
+        let begun = self.begin(svc, &req).await?;
+        self.finish(svc, req, begun).await
+    }
+
+    /// [`Promoter::promote`] that answers once the switch row exists; migrations and the flip go on
+    /// by themselves, whatever becomes of the caller. The row says how it ended.
+    pub async fn promote_detached(
+        &self,
+        svc: &Service,
+        req: PromoteReq,
+    ) -> Result<(Switch, tokio::task::JoinHandle<Result<Promoted, ApiError>>), ApiError> {
+        let me = self
+            .me
+            .upgrade()
+            .ok_or_else(|| ApiError::new("internal", "the node is going down"))?;
+        let begun = self.begin(svc, &req).await?;
+        let row = begun.row.clone();
+        let svc = svc.clone();
+        let done = tokio::spawn(async move { me.finish(&svc, req, begun).await });
+        Ok((row, done))
+    }
+
+    /// The lock, the checks, adoption and the row.
+    async fn begin(&self, svc: &Service, req: &PromoteReq) -> Result<Begun, ApiError> {
         let slot = self.slot(svc.id);
-        let _flip = if req.no_wait {
+        let flip = if req.no_wait {
             slot.flip
-                .try_lock()
+                .clone()
+                .try_lock_owned()
                 .map_err(|_| ApiError::new("switch_in_progress", "another switch of this service is running"))?
         } else {
-            slot.flip.lock().await
+            slot.flip.clone().lock_owned().await
         };
+        if let (true, PromoteTarget::Version(to)) = (req.only_forward, req.target) {
+            let now = self
+                .deps
+                .meta
+                .get_service(rt_store::TenantScope::Operator, svc.id)
+                .await?
+                .ok_or_else(ApiError::not_found)?;
+            if now.live_version.is_some_and(|live| live >= to) {
+                return Err(ApiError::new("superseded", "a version at least as new is live"));
+            }
+        }
         // Adoption first: the row names the adopted number. Reused per origin, so a flip refused
         // below leaves a version the next attempt takes.
         let (to, source) = match req.target {
@@ -243,13 +319,12 @@ impl Promoter {
                 (adopted.number, Some(origin))
             }
         };
-        let mut drains = slot.drains.lock().await;
         let new = NewSwitch {
             kind: req.kind,
             source,
             from_version: None, // written by the flip, with what was really live
             to_version: to,
-            created_by: req.created_by,
+            created_by: req.created_by.clone(),
         };
         let row = match self.deps.meta.create_switch(svc.id, new.clone()).await {
             Err(StoreError::Conflict("switch_in_progress")) => {
@@ -259,7 +334,28 @@ impl Promoter {
             other => other?,
         };
         self.emit("service.switch.started", svc.tenant_id, svc.id, &row);
+        Ok(Begun { slot, flip, row, to })
+    }
 
+    /// Migrations, the commit, the drain and the route refresh of a flip that has begun.
+    async fn finish(&self, svc: &Service, req: PromoteReq, begun: Begun) -> Result<Promoted, ApiError> {
+        let Begun {
+            slot,
+            flip: _flip,
+            row,
+            to,
+        } = begun;
+        let migrate = req.migrate && req.kind != SwitchKind::Rollback;
+        let migrations_applied = if migrate {
+            match self.run_migrations(svc, &row, req.if_match).await {
+                Ok(done) => done,
+                Err(e) => return Err(self.migration_failed(svc, row, e).await),
+            }
+        } else {
+            Vec::new()
+        };
+
+        let mut drains = slot.drains.lock().await;
         let deadline = self.drain_deadline(svc, req.drain_timeout);
         let (service, mut switch) = match self.deps.meta.flip_switch(svc.id, row.id, req.if_match, deadline).await {
             Ok(done) => done,
@@ -318,7 +414,91 @@ impl Promoter {
             service,
             switch,
             warnings,
+            migrations_applied,
         })
+    }
+
+    /// The `migrating` step: nothing at all without a list, one read when nothing is pending.
+    /// A crash after the commit leaves them applied and not live; the next promote skips them.
+    async fn run_migrations(
+        &self,
+        svc: &Service,
+        row: &Switch,
+        if_match: Option<Etag>,
+    ) -> Result<Vec<MigrationEntry>, StoreError> {
+        let to = row.to_version;
+        let target = self
+            .deps
+            .meta
+            .get_version(svc.id, to)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        if target.migrations.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A service that was never live may not be in the node's table yet, and its database would
+        // get no room to grow. A failure here shows up as `database or disk is full`.
+        let _ = self.refresh().await;
+        let sql = self.deps.data.sql(svc.id);
+        let applied = sql.applied_migrations().await?;
+        let pending = plan_migrations(&target.migrations, &applied).map_err(|f| StoreError::Migration(Box::new(f)))?;
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Every refusal of the flip that can be known now comes before the schema changes.
+        if target.build_state == BuildState::Failed {
+            return Err(StoreError::Conflict("version_not_ready"));
+        }
+        if let Some(want) = if_match {
+            let now = self.deps.meta.get_service(TenantScope::Operator, svc.id).await?;
+            if now.is_none_or(|s| s.etag != want) {
+                return Err(StoreError::PreconditionFailed);
+            }
+        }
+        let patch = SwitchPatch {
+            state: Some(SwitchState::Migrating),
+            ..SwitchPatch::default()
+        };
+        let migrating = self.deps.meta.update_switch(svc.id, row.id, patch).await?;
+        self.emit("service.switch.migrating", svc.tenant_id, svc.id, &migrating);
+        let files = self.deps.meta.version_migration_files(svc.id, to).await?;
+        let budget = self.deps.config.load().deploy.migration_budget;
+        let done = sql.migrate(files, to, budget).await?;
+        // Names and hashes only: the SQL itself goes in no event, log or audit record.
+        self.emit_migration(
+            "service.migrated",
+            svc,
+            serde_json::json!({"switch": row.id.to_string(), "version": to.0, "applied": done}),
+        );
+        Ok(done)
+    }
+
+    pub(crate) fn emit_migration(&self, kind: &str, svc: &Service, data: serde_json::Value) {
+        let mut ev = NodeEvent::new(kind, self.deps.clock.unix_ms());
+        ev.tenant = Some(svc.tenant_id);
+        ev.service = Some(svc.id);
+        ev.data = data;
+        let _ = self.deps.events.send(ev);
+    }
+
+    /// Live and schema are unchanged: close the row and say what stopped it.
+    async fn migration_failed(&self, svc: &Service, row: Switch, e: StoreError) -> ApiError {
+        let code = e.code();
+        if let Some(closed) = self.close(svc.id, row.id, SwitchState::Failed, Some(code)).await {
+            self.emit("service.switch.failed", svc.tenant_id, svc.id, &closed);
+        }
+        if let StoreError::Migration(f) = &e {
+            self.emit_migration(
+                "service.migration_failed",
+                svc,
+                serde_json::json!({
+                    "switch": row.id.to_string(), "version": row.to_version.0, "code": code,
+                    "file": f.file, "statement_index": f.statement_index, "line": f.line,
+                    "sqlite_code": f.sqlite_code,
+                }),
+            );
+        }
+        e.into()
     }
 
     /// This node's flips run under the flip lock we hold, so an open row is one whose closing failed
