@@ -9,9 +9,11 @@ A node is one process, `rt`, with one data directory. The recommended way to run
 the runtime repository. For development you can also run it straight from a source checkout. This page covers both,
 plus the `21ci` CLI.
 
-!!! info "There are no published binaries or images yet"
-    You build the image (or the binary) from a checkout of the runtime repository. All commands on this page run from
-    the root of that checkout.
+!!! info "Published releases"
+    Releases publish the binaries, the `ghcr.io/21-ci/rt` image and the packages. The
+    [README quickstart](https://github.com/21-ci/runtime#quickstart) covers Homebrew, the install script, `docker run` and
+    apt. This page builds from a checkout of the runtime repository, which is the development path. All commands on this
+    page run from the root of that checkout.
 
 ## What a node exposes
 

@@ -8,6 +8,25 @@ use crate::cli::{NodeCmd, NodeConfigCmd};
 use crate::error::{CliError, Result};
 use crate::fmt;
 
+/// `s[key]` as a table of `cols` (or the raw JSON with `-o json`), then the next cursor if any.
+fn rows_or_json(app: &App, s: &Value, key: &str, cols: &[&str]) {
+    if app.json {
+        fmt::print_json(s);
+        return;
+    }
+    let rows: Vec<Vec<String>> = s
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(|r| cols.iter().map(|c| cell(r, c)).collect()).collect())
+        .unwrap_or_default();
+    let headers: Vec<String> = cols.iter().map(|c| c.to_uppercase()).collect();
+    let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+    fmt::emit(&fmt::table(&headers, &rows));
+    if let Some(c) = s.get("next_cursor").and_then(Value::as_str) {
+        fmt::emitln(&format!("next cursor: {c}"));
+    }
+}
+
 pub fn run(app: &App, cmd: &NodeCmd) -> Result<()> {
     match cmd {
         NodeCmd::Status => {
@@ -35,6 +54,20 @@ pub fn run(app: &App, cmd: &NodeCmd) -> Result<()> {
                     s.get("memory").map(fmt::compact).unwrap_or_else(|| "-".into()),
                 ),
             ]));
+            if let Some(h) = s.get("host").filter(|h| h.is_object()) {
+                let part = |k: &str| h.get(k).map(fmt::compact).unwrap_or_else(|| "-".into());
+                fmt::emit(&fmt::kv(&[
+                    ("Uptime", format!("{} s", part("uptime_s"))),
+                    ("Container", part("container")),
+                    ("Cores", part("cores")),
+                    ("Load", part("load")),
+                    ("CPU %", part("cpu_pct")),
+                    ("Disk", part("disk")),
+                    ("Network", part("net")),
+                    ("Services", part("services")),
+                    ("Storage bytes", part("storage_bytes")),
+                ]));
+            }
         }
         NodeCmd::Scheduler => {
             let s = app.client()?.get("/v1/node/scheduler", &[])?;
@@ -46,6 +79,49 @@ pub fn run(app: &App, cmd: &NodeCmd) -> Result<()> {
         }
         // the cache snapshot has no fixed shape: JSON in both modes
         NodeCmd::Cache => fmt::print_json(&app.client()?.get("/v1/node/cache", &[])?),
+        NodeCmd::Series { range } => {
+            let q: Vec<(&str, String)> = range.iter().map(|r| ("range", r.clone())).collect();
+            let s = app.client()?.get("/v1/node/series", &q)?;
+            rows_or_json(
+                app,
+                &s,
+                "points",
+                &["ts", "cpu_pct", "load1", "mem_committed", "disk_free", "rx", "tx"],
+            );
+        }
+        NodeCmd::Stats {
+            from,
+            to,
+            counts,
+            cursor,
+            limit,
+        } => {
+            let mut q: Vec<(&str, String)> = Vec::new();
+            q.extend(from.map(|v| ("from", v.to_string())));
+            q.extend(to.map(|v| ("to", v.to_string())));
+            if *counts {
+                q.push(("fields", "counts".into()));
+            }
+            q.extend(cursor.iter().map(|v| ("cursor", v.clone())));
+            q.extend(limit.map(|v| ("limit", v.to_string())));
+            let s = app.client()?.get("/v1/node/stats", &q)?;
+            rows_or_json(
+                app,
+                &s,
+                "items",
+                &[
+                    "service", "tenant", "slug", "count", "errors", "p50", "p95", "p99", "dlq", "depth",
+                ],
+            );
+        }
+        NodeCmd::Events { after, kinds, limit } => {
+            let mut q: Vec<(&str, String)> = Vec::new();
+            q.extend(after.iter().map(|v| ("after", v.clone())));
+            q.extend(kinds.iter().map(|v| ("kinds", v.clone())));
+            q.extend(limit.map(|v| ("limit", v.to_string())));
+            let s = app.client()?.get("/v1/node/events", &q)?;
+            rows_or_json(app, &s, "items", &["id", "ts", "tenant", "service", "kind"]);
+        }
         NodeCmd::Drain => {
             let c = app.client()?;
             c.send(c.req(Method::POST, "/v1/node/drain"))?;

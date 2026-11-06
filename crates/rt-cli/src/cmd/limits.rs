@@ -61,3 +61,29 @@ pub fn run(app: &App) -> Result<()> {
     fmt::emit(&fmt::table(&["QUOTA", "LIMIT", "USED", "LEFT", "PERIOD"], &rows));
     Ok(())
 }
+
+/// `21ci usage`: every quota of `GET /v1/usage`, in the order the server sends them.
+pub fn usage(app: &App) -> Result<()> {
+    let u = app.client()?.get("/v1/usage", &[])?;
+    if app.json {
+        fmt::print_json(&u);
+        return Ok(());
+    }
+    fmt::emit(&fmt::kv(&[("Plan", fmt::str_field(&u, "plan"))]));
+    let mut rows = Vec::new();
+    if let Some(quotas) = u.get("quotas").and_then(Value::as_object) {
+        for (name, q) in quotas {
+            let size = name.ends_with("_bytes");
+            rows.push(vec![
+                name.clone(),
+                num(q.get("limit").unwrap_or(&Value::Null), size),
+                num(q.get("used").unwrap_or(&Value::Null), size),
+                num(q.get("remaining").unwrap_or(&Value::Null), size),
+                fmt::str_field(q, "period"),
+            ]);
+        }
+    }
+    fmt::emitln("");
+    fmt::emit(&fmt::table(&["QUOTA", "LIMIT", "USED", "LEFT", "PERIOD"], &rows));
+    Ok(())
+}

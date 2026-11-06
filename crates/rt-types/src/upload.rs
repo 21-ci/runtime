@@ -38,6 +38,8 @@ pub struct ValidatedUpload {
     /// WASM: the component's top-level exports (`wasi:http/incoming-handler@0.2.x`,
     /// `std:host/socket-handler@0.1.0`, …); empty for Deno.
     pub exports: Vec<String>,
+    /// Deno: the `migrations/NNNN_name.sql` files of the upload, in order. Empty for WASM.
+    pub migrations: Vec<crate::migrations::MigrationFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -73,10 +75,30 @@ pub struct RpcContractText {
     pub unchecked: Vec<String>,
 }
 
+/// Which part of a fetched archive is the source (`POST …/versions/from-url`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArchiveShape {
+    /// Leading path components to drop from every entry (`1` for a GitHub tarball's `repo-sha/`).
+    pub strip_components: u32,
+    /// After stripping: only this directory, which becomes the root.
+    pub subdir: Option<String>,
+    /// Entry module, as `entry` of `rt.json` would name it.
+    pub entry: Option<String>,
+}
+
 /// Validates an upload without network or disk access.
 pub trait UploadValidator: Send + Sync {
     fn validate(&self, kind: RuntimeKind, content_type: &str, body: &Bytes)
         -> Result<ValidatedUpload, ValidationError>;
+
+    /// A zip or (gzipped) tar narrowed to `shape`, as a canonical uncompressed tar: entries sorted,
+    /// no timestamps, so the same tree has the same digest. Same safety and limits as an upload.
+    fn reshape_archive(&self, body: &Bytes, shape: &ArchiveShape) -> Result<Bytes, ValidationError> {
+        let _ = (body, shape);
+        Err(ValidationError::InvalidArtifact(
+            "archives are not available on this node".to_string(),
+        ))
+    }
 
     /// The RPC surface of a Deno upload (its `rpc` export or `defineSdk` methods), read from the
     /// source without running it. `Err` with a message when it has none.

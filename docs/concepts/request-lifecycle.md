@@ -139,9 +139,10 @@ inside the handler's read (`request_too_large`), because the body is passed to t
 | 3 | A run slot: the service's adaptive limit, the tenant's plan cap, the node's `sched.max_inflight` less the reserve for calls | run now, or **wait** in the service's FIFO queue |
 | 4 | Room to wait: the node's `sched.max_queued` and `sched.max_queued_mb`, with a service and a tenant each limited to half | `503 overloaded` with `Retry-After` |
 
-If no slot is free, the task waits in a per-service FIFO queue. When slots free up, services are served round-robin
-within their tenant and tenants round-robin among themselves, one task per turn, so a tenant with many busy services
-gets no more than a tenant with one. A task that waits longer than the service's queue timeout ends as
+If no slot is free, the task waits in its service's queue. When slots free up, the waiting tasks are granted in
+[admission order](scheduler.md#admission-order): calls first, then the tenant with the least recent slot time, then
+within that tenant the earliest deadline, which favours tasks predicted to be short without starving long ones. A
+tenant with many busy services does not crowd out a tenant with one. A task that waits longer than the service's queue timeout ends as
 `503 queue_timeout` with `Retry-After`. If the client disconnects while its request waits, the place is freed at once;
 a task that has already started keeps running.
 

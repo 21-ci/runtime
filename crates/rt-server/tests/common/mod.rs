@@ -55,6 +55,7 @@ pub fn pro_plan() -> Plan {
             wall_ms: 120_000,
             cpu_ms: 10_000,
             memory_mb: 512,
+            min_run_time_ms: 600_000,
         },
         builds_per_hour: 100_000,
         custom_host_suffixes: vec![".bots.example.com".to_string()],
@@ -64,10 +65,27 @@ pub fn pro_plan() -> Plan {
         max_sockets: 10_000,
         max_sockets_per_object: 10_000,
         ws_max_message_bytes: 1024 * 1024,
+        max_async_pending: 100_000,
+        max_topics: 1_000,
+        max_topic_partitions: 16,
+        max_stream_mb: 10_240,
+        max_stream_retention_hours: 720,
+        max_scratch: 1_000,
+        scratch_ttl_max: 604_800,
+        cpu_ms_per_day: 0,
+        max_projects: 0,
+        max_environments_per_project: 0,
+        max_branches: 0,
+        max_secrets_per_service: 0,
+        max_custom_hosts: 0,
+        max_versions_retained: 0,
+        log_retention_days: 0,
+        max_fetches_per_call: 0,
+        max_log_lines_per_call: 0,
     }
 }
 
-pub const ALL_SCOPES: [&str; 10] = [
+pub const ALL_SCOPES: [&str; 11] = [
     "services:read",
     "services:write",
     "deploy",
@@ -78,6 +96,7 @@ pub const ALL_SCOPES: [&str; 10] = [
     "queue:write",
     "data:admin",
     "sockets:write",
+    "data:read",
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -707,9 +726,18 @@ async fn read_all<S: AsyncReadExt + Unpin>(s: &mut S, timeout: Duration) -> Vec<
 /// Send raw bytes to `addr` and read the response until the peer closes (use `Connection: close`).
 /// `None` when the connection was refused or closed without a parsable response.
 pub async fn raw_tcp(addr: SocketAddr, request: &[u8], timeout: Duration) -> Option<RawResp> {
-    let mut s = tokio::net::TcpStream::connect(addr).await.ok()?;
-    s.write_all(request).await.ok()?;
-    let buf = read_all(&mut s, timeout).await;
+    let s = tokio::net::TcpStream::connect(addr).await.ok()?;
+    // Write and read at once: a node that answers before reading the whole request (a lying
+    // Content-Length, an early 413) closes while bytes are still in flight, and a writer that
+    // waited for write_all would see the reset instead of the answer already sent.
+    let (mut rd, mut wr) = s.into_split();
+    let request = request.to_vec();
+    let writer = tokio::spawn(async move {
+        let _ = wr.write_all(&request).await;
+        wr
+    });
+    let buf = read_all(&mut rd, timeout).await;
+    writer.abort();
     parse_raw(&buf)
 }
 

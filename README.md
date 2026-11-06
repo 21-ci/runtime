@@ -1,15 +1,17 @@
 <p align="center">
-  <img src=".github/assets/banner.svg" alt="21 Cloud Functions Runtime" width="880">
+  <img src="docs/assets/images/logo.svg" alt="21 Cloud" width="72">
 </p>
+
+<h1 align="center">21 Cloud Functions Runtime</h1>
 
 <p align="center">
   <a href="https://github.com/21-ci/runtime/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/21-ci/runtime/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://github.com/21-ci/runtime/actions/workflows/security.yml"><img alt="Security" src="https://github.com/21-ci/runtime/actions/workflows/security.yml/badge.svg?branch=main"></a>
   <a href="https://github.com/21-ci/runtime/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/21-ci/runtime?sort=semver"></a>
+  <a href="https://21-ci.github.io/runtime/"><img alt="Docs" src="https://img.shields.io/badge/docs-21--ci.github.io-2563eb"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
   <a href="https://codecov.io/gh/21-ci/runtime"><img alt="Coverage" src="https://codecov.io/gh/21-ci/runtime/branch/main/graph/badge.svg"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/21-ci/runtime"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/21-ci/runtime/badge"></a>
-  <a href="https://21-ci.github.io/runtime/"><img alt="Docs" src="https://img.shields.io/badge/docs-21-ci.github.io-4f7cff"></a>
-  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
 </p>
 
 <p align="center">
@@ -20,10 +22,10 @@
 <p align="center">
   <a href="https://21-ci.github.io/runtime/">Docs</a> ·
   <a href="#quickstart">Quickstart</a> ·
-  <a href="sample/README.md">Examples</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#development">Development</a> ·
   <a href="SECURITY.md">Security</a> ·
-  <a href="CONTRIBUTING.md">Contributing</a> ·
-  <a href="https://github.com/21-ci/runtime/discussions">Discussions</a>
+  <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
 ---
@@ -43,13 +45,30 @@ function can use without wiring up anything else.
 | | |
 |---|---|
 | **Two executors** | Deno: a fresh V8 isolate per task, frozen clock, Web APIs. WASM: a WASI 0.2 `wasi:http` component per task (Rust, JS via `jco`, any language with a component toolchain). Opt-in warm reuse for the lowest latency |
-| **Triggers** | HTTP (`/s/{slug}/…`, `{slug}.{base_domain}`, verified custom hosts), interval and cron schedules, durable queues with retries and a DLQ, service-to-service calls and typed RPC, WebSockets held by the node |
+| **Triggers** | HTTP (`/s/{slug}/…`, `{slug}.{base_domain}`, verified custom hosts), interval and cron schedules, durable queues with retries and a DLQ, pub/sub subjects with request/reply, durable topics with consumer groups, async HTTP invocations with idempotency keys, service-to-service calls and typed RPC, WebSockets held by the node |
 | **State** | KV (TTL, `incr`, `cas`), SQL on a SQLite database per service, synchronous `bun:sqlite`-style SQLite, blobs, durable objects with alarms, named locks, env and AES-GCM sealed secrets |
 | **Multi-tenancy** | tenants, plans with quotas and limits, scoped API keys, projects and environments, ingress and egress rules per service, an SSRF guard on every outbound request, audit events |
 | **Scheduler** | Go-style G-M-P scheduler: admission control, per-tenant fair queues, work stealing, CPU and wall-clock limits with preemption, a memory governor that follows the cgroup |
 | **Operator SDKs** | publish your platform's SDK as a runtime service; tenants import its contract (`std:sdk`) and grants pick the release per call, so an SDK update never redeploys a tenant |
 | **Builds** | TypeScript transpiled at deploy, `npm:` and `jsr:` resolved at build time and pinned in `rt.lock`, lazy or eager compilation, content-addressed artifacts, one-command rollback |
 | **Operations** | REST control API with OpenAPI 3.1 and a Scalar UI, the `21ci` CLI, an MCP endpoint for coding agents, Prometheus metrics, health probes, SSE log streams, per-service stats, five tuning profiles |
+
+## Screenshots
+
+Output of `21ci` against a local node: a branch and its switch history, then stats and usage.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/cli-branch-switch-dark.png">
+    <img src="docs/assets/screenshots/cli-branch-switch-light.png" alt="21ci branch list and 21ci switch status output" width="760">
+  </picture>
+</p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/cli-monitoring-dark.png">
+    <img src="docs/assets/screenshots/cli-monitoring-light.png" alt="21ci stats and 21ci usage output" width="760">
+  </picture>
+</p>
 
 ## Architecture
 
@@ -181,6 +200,8 @@ Deno services import `std:*` modules; WASM components get the same capabilities 
 | `std:sqlite` | synchronous SQLite with the `bun:sqlite` API |
 | `std:blob` | blob storage with streamed upload and download |
 | `std:queue` | enqueue to a service's durable queue: retries, delays, dead-letter queue |
+| `std:pubsub` | ephemeral subjects: `publish` to subscribers (fan-out, at most once), `request` to one responder |
+| `std:stream` | durable, partitioned topics: `append` with keys and dedup ids, `read` replay, consumer groups with `failAt` and dead letters |
 | `std:schedule` | one-off tasks at a time or after a delay (at-least-once) |
 | `std:lock` | named mutexes per service |
 | `std:services` | calls to other services and typed RPC (`21ci types <service>` generates the `.d.ts`) |
@@ -196,7 +217,7 @@ Reference: [docs/handlers.md](docs/handlers.md) and the [docs site](https://21-c
 
 | | |
 |---|---|
-| [sample/deno](sample/deno) | `hello`, `kv-counter`, `sql-todo`, `sqlite-sync`, `blob-upload`, `npm-zod`, `scheduled-queue`, `service-call`, `env-secrets`, `platform-sdk` |
+| [sample/deno](sample/deno) | `hello`, `kv-counter`, `sql-todo`, `sqlite-sync`, `blob-upload`, `npm-zod`, `scheduled-queue`, `streams`, `service-call`, `env-secrets`, `platform-sdk` |
 | [sample/wasm](sample/wasm) | `rust-hello` (Rust component), `js-componentize` (JavaScript via `jco`) |
 | [sample/apps](sample/apps) | complete apps with tests and smoke scripts: a Telegram bot, event registrations, an electronic queue, a chat room on durable objects, an edge gateway in Rust/WASM, a currency-rates service |
 | [sample/operator-sdk](sample/operator-sdk) | an operator SDK published as a runtime service |
@@ -248,6 +269,17 @@ node, one process: there is no clustering yet. Known gaps (prebuilt V8 without i
 no seccomp profile beyond the basics, no OTLP export) are listed in
 [SECURITY.md, "Known limitations"](SECURITY.md#known-limitations).
 
+## Development
+
+```bash
+git clone https://github.com/21-ci/runtime && cd runtime
+make build        # Rust 1.95 from rust-toolchain.toml; the first build downloads the prebuilt V8
+make dev          # local node on 127.0.0.1 (control :8081, token dev-root-token)
+make test         # WASM fixtures + every crate's tests
+```
+
+`make help` lists every target. Images: `docker compose up -d --build` (development stack, secrets from `.env`).
+
 ## Documentation
 
 | | |
@@ -261,27 +293,24 @@ no seccomp profile beyond the basics, no OTLP export) are listed in
 | [docs/mcp.md](docs/mcp.md) | the MCP endpoint for coding agents |
 | [SECURITY.md](SECURITY.md) | threat model, limits, hardening checklist, reporting, verifying releases |
 
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) (dev setup, tests and coverage, DCO). Coding agents start at
+[AGENTS.md](AGENTS.md). Releases: [RELEASING.md](RELEASING.md) (publishing a version, every channel, one-time setup).
+Design language for the docs and READMEs: [DESIGN.md](https://github.com/21-ci/runtime-web/blob/main/DESIGN.md) in
+runtime-web.
+
+## Security
+
+Report security issues privately, as described in [SECURITY.md](SECURITY.md#reporting-a-vulnerability)
+(security@21ci.uz).
+
 ## Community
 
 - Questions and ideas: [GitHub Discussions](https://github.com/21-ci/runtime/discussions). Bugs and feature requests:
   [issues](https://github.com/21-ci/runtime/issues/new/choose). Help: [SUPPORT.md](SUPPORT.md).
-- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md) (dev setup, tests and coverage, DCO). Coding agents start
-  at [AGENTS.md](AGENTS.md).
-- Releases: [RELEASING.md](RELEASING.md) (publishing a version, every channel, one-time setup).
-- Security issues: privately, as described in [SECURITY.md](SECURITY.md#reporting-a-vulnerability)
-  (security@21ci.uz). Anything else: contact@21ci.uz.
+- Anything else: contact@21ci.uz.
 - Everyone follows the [Code of Conduct](CODE_OF_CONDUCT.md); project roles: [GOVERNANCE.md](GOVERNANCE.md).
-
-## Building from source
-
-```bash
-git clone https://github.com/21-ci/runtime && cd runtime
-make build        # Rust 1.95 from rust-toolchain.toml; the first build downloads the prebuilt V8
-make dev          # local node on 127.0.0.1 (control :8081, token dev-root-token)
-make test         # WASM fixtures + every crate's tests
-```
-
-`make help` lists every target. Images: `docker compose up -d --build` (development stack, secrets from `.env`).
 
 ## License
 

@@ -218,6 +218,48 @@ or `std:host/queue` (WASM), or with the CLI:
 A queue is consumed only while its service has a live version and its `queue` trigger is allowed; otherwise
 messages wait without using attempts. Patterns and the full API: [Service calls and queues](../guides/calls-and-queues.md).
 
+## Pub/sub
+
+A service subscribes to subjects in `events.subscribe` (`{subject, group?}`, at most 32). A subject is `.`-separated
+tokens: `*` matches one token and `>` (last token only) matches the rest, for example `orders.*.created` or
+`orders.>`. A publish (`std:pubsub` `publish(subject, body, opts)`, or `POST /v1/pubsub/publish`) delivers one copy to
+every matching service of the same tenant, project and environment. Services that name the same `group` share the
+deliveries round robin, so one member gets each message. `request()` picks one receiver in round robin and waits for
+its reply (5 s default, 30 s max).
+
+The handler is the `pubsub(msg, ctx)` export (Deno) and `ctx.trigger` is `"pubsub"`. A publish returns
+`{receivers, dropped}`: `receivers` is how many services a delivery was queued for, and `dropped` how many were
+skipped (fan-out above 100, a subscriber with 64 deliveries in flight, the tenant quota, or admission refused). A
+delivery is best effort: a dropped message is not retried. Use a topic when you need a record that is kept and
+replayed. The plan must allow `pubsub`, and a service whose plan does not allow it receives nothing.
+
+## Streams
+
+A **topic** is a partitioned, replayable log. Producers append records (`std:stream` `append` or `POST
+/v1/topics/{t}/messages`). Each partition keeps records in offset order, and a record with a `key` always goes to the
+same partition. A consumer block in `events.consume` (`{topic, group?, start?, batch_size?}`) receives batches with
+the handler export `stream(batch, ctx)`, and `ctx.trigger` is `"stream"`. Each consumer group keeps its own committed
+offset per partition, so groups read the same topic independently and a restart resumes where the group stopped.
+
+A failed record is retried up to `max_attempts` times (default 10), then moved to the consumer's dead letters, or the
+consumer blocks (`on_exhausted`: `dlq`, `skip` or `block`). Reset a group with `POST
+/v1/services/{s}/consumers/{topic}/{group}/reset` (`earliest`, `latest`, an offset or a time). Retention is set per
+topic (`retention_hours`, the plan's maximum applies) and `max_mb` caps the topic's bytes. Topics are tenant
+resources: create them with the control API or `21ci topic create`, and consume them with a service's `events.consume`.
+
+A topic with more than one partition needs `partition` when it is read directly (`read` / `GET .../messages`). The
+plan must allow `stream`.
+
+## Async invocations
+
+An HTTP invocation can run in the background. Set `async.enabled` on the service (default `false`), then send
+`Prefer: respond-async` or `X-Rt-Invocation-Type: Event`. The caller gets `202 {"id":"inv_…"}` at once, and the
+runtime runs the handler later with the same request. A `5xx` or `429` answer is retried up to `async.max_attempts`
+times (default 3). An invocation pending longer than `async.max_event_age_s` (default 3600) fails. Inspect and
+recover failed work with `GET /v1/services/{s}/invocations`, `POST .../invocations/redrive` and `DELETE
+.../invocations?state=failed`. The full contract, including headers, idempotency and limits, is in [the invoke
+API](../api.md#invoke-api).
+
 ## Service calls
 
 A service can call another service of the same tenant by slug. The call runs **in process**: no HTTP hop, no

@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::digest::Digest;
-use crate::ids::{EventId, KeyId, ProjectId, ScheduleId, ServiceId, TenantId, VersionNo};
+use crate::events::{AsyncInvokeConfig, EventsConfig};
+use crate::ids::{EventId, KeyId, ProjectId, ScheduleId, ServiceId, SwitchId, TenantId, VersionNo};
 use crate::kinds::{Profile, RuntimeKind};
 use crate::limits::CompileMode;
 use crate::outcome::BuildFailure;
@@ -70,10 +71,14 @@ pub enum Scope {
     /// Close a service's WebSockets through the control API.
     #[serde(rename = "sockets:write")]
     SocketsWrite,
+    /// Read a service's rows, KV values and blob listing through the control API (R9). Rows may be
+    /// personal data, so a key has it only when asked for by name.
+    #[serde(rename = "data:read")]
+    DataRead,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 11] = [
+    pub const ALL: [Scope; 12] = [
         Scope::ServicesRead,
         Scope::ServicesWrite,
         Scope::Deploy,
@@ -85,6 +90,7 @@ impl Scope {
         Scope::DataAdmin,
         Scope::KeysWrite,
         Scope::SocketsWrite,
+        Scope::DataRead,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -100,6 +106,7 @@ impl Scope {
             Scope::DataAdmin => "data:admin",
             Scope::KeysWrite => "keys:write",
             Scope::SocketsWrite => "sockets:write",
+            Scope::DataRead => "data:read",
         }
     }
 }
@@ -279,6 +286,10 @@ pub struct ScalingConfig {
     pub max_instances: Option<u32>,
     pub max_queued: Option<u32>,
     pub keep_resident: Option<bool>,
+    /// Keep-alive of a reused instance after it answered, in ms. Unset = inherit the executor's
+    /// idle TTL; `0` = dispose at once unless tasks of the service wait. At most
+    /// `min(plan.limits_max.min_run_time_ms, sched.min_run_time_max_ms)`.
+    pub min_run_time_ms: Option<u64>,
 }
 
 impl ScalingConfig {
@@ -329,6 +340,8 @@ impl TriggerSwitches {
             TriggerKind::Queue => self.queue,
             TriggerKind::Call => self.call,
             TriggerKind::Websocket => self.websocket,
+            // Declared by `events.subscribe` / `events.consume`; no switch of their own.
+            TriggerKind::Pubsub | TriggerKind::Stream => true,
         }
     }
 }
@@ -349,6 +362,63 @@ pub struct IngressRules {
     /// IPv4 and IPv6 CIDRs.
     pub ip_allow: Vec<String>,
     pub rate_limit: RateLimit,
+    /// Per-path limits, first match wins (SECURITY.md "Ingress rate rules").
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rate_rules: Vec<RateRule>,
+}
+
+/// What a [`RateRule`] counts per.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RateBy {
+    #[default]
+    Service,
+    Ip,
+}
+
+/// One per-path rate limit. `path` is in the [`crate::path_pattern`] syntax; no `methods` means all.
+/// `burst: 0` means `rps`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RateRule {
+    pub path: String,
+    pub methods: Vec<String>,
+    pub rps: u32,
+    pub burst: u32,
+    pub by: RateBy,
+}
+
+/// Most rate rules on one service.
+pub const MAX_RATE_RULES: usize = 32;
+/// Highest `rps` and `burst` of a rate rule.
+pub const MAX_RATE_RULE_VALUE: u32 = 1_000_000;
+
+/// Whether `rules` may be stored; the error names the rule, for the API caller.
+pub fn validate_rate_rules(rules: &[RateRule]) -> Result<(), String> {
+    if rules.len() > MAX_RATE_RULES {
+        return Err(format!("ingress.rate_rules: at most {MAX_RATE_RULES} rules"));
+    }
+    for (i, r) in rules.iter().enumerate() {
+        crate::path_pattern::PathPattern::parse(&r.path).map_err(|e| format!("ingress.rate_rules[{i}].path: {e}"))?;
+        if r.rps == 0 || r.rps > MAX_RATE_RULE_VALUE {
+            return Err(format!(
+                "ingress.rate_rules[{i}].rps: must be 1 to {MAX_RATE_RULE_VALUE}"
+            ));
+        }
+        if r.burst > MAX_RATE_RULE_VALUE {
+            return Err(format!(
+                "ingress.rate_rules[{i}].burst: must be at most {MAX_RATE_RULE_VALUE}"
+            ));
+        }
+        if r.methods.len() > 16 || r.methods.iter().any(|m| http_method_token(m).is_none()) {
+            return Err(format!("ingress.rate_rules[{i}].methods: at most 16 HTTP method names"));
+        }
+    }
+    Ok(())
+}
+
+fn http_method_token(m: &str) -> Option<()> {
+    (!m.is_empty() && m.len() <= 32 && m.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')).then_some(())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -520,6 +590,96 @@ pub struct ServiceConfig {
     /// WebSocket knobs. Omitted from JSON while unset.
     #[serde(skip_serializing_if = "WsServiceConfig::is_unset")]
     pub ws: WsServiceConfig,
+    /// Pub/sub subscriptions and stream consumers. Omitted from JSON while unset.
+    #[serde(skip_serializing_if = "EventsConfig::is_unset")]
+    pub events: EventsConfig,
+    /// Async invocation (`Prefer: respond-async`). Omitted from JSON while unset.
+    #[serde(rename = "async", skip_serializing_if = "AsyncInvokeConfig::is_unset")]
+    pub async_invoke: AsyncInvokeConfig,
+    /// Set on a branch or preview service, by its route only. Omitted from JSON otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<ScratchConfig>,
+}
+
+/// An allowlist of one host that cannot resolve (`.invalid`, RFC 2606): no egress. An empty list
+/// would mean "no allowlist", not "nothing".
+pub const NO_EGRESS_HOST: &str = "no-egress.invalid";
+
+impl ServiceConfig {
+    /// A preview: the runtime refuses it calls, queues, events, schedules and SDKs (R5).
+    pub fn is_preview(&self) -> bool {
+        self.scratch.as_ref().is_some_and(|s| s.kind == ScratchKind::Preview)
+    }
+
+    /// What a scratch service may not change: written at create and after every `PATCH`. A service
+    /// that is not scratch is left alone.
+    pub fn enforce_scratch_policy(&mut self) {
+        let Some(scratch) = &self.scratch else { return };
+        self.scaling.min_instances = Some(0);
+        if !scratch.schedules {
+            self.triggers.interval = false;
+            self.triggers.cron = false;
+        }
+        // In a shared environment it would be another member of the parent's groups.
+        if !scratch.events {
+            self.events.subscribe.clear();
+            self.events.consume.clear();
+        }
+        // `internal` has no public route at all, so it stays: only a public door is closed.
+        if scratch.copied_data && self.access == Access::Public {
+            self.access = Access::Key;
+        }
+        if scratch.kind == ScratchKind::Preview {
+            self.triggers = TriggerSwitches {
+                http: self.triggers.http,
+                interval: false,
+                cron: false,
+                queue: false,
+                call: false,
+                websocket: false,
+            };
+            self.call = CallAccess::default();
+            self.events = crate::events::EventsConfig::default();
+            self.async_invoke = AsyncInvokeConfig::default();
+            if self.egress.allowed_hosts.is_empty() {
+                self.egress.allowed_hosts = vec![NO_EGRESS_HOST.to_string()];
+            }
+        }
+    }
+}
+
+/// What kind of short-lived copy of a service this is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScratchKind {
+    Branch,
+    Preview,
+}
+
+/// Identity of a scratch service (`services.config.scratch`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScratchConfig {
+    /// The service this one is a scratch copy of. `None`: a preview that stands alone.
+    #[serde(default)]
+    pub of: Option<ServiceId>,
+    pub kind: ScratchKind,
+    pub name: String,
+    /// The sweep deletes it, with its data, after this time. `None`: until deleted.
+    #[serde(default)]
+    pub expires_at: Option<UnixMs>,
+    /// It holds a copy of the parent's data.
+    #[serde(default)]
+    pub copied_data: bool,
+    /// Its timed triggers may run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub schedules: bool,
+    /// A branch keeps pub/sub subscriptions and stream consumers. Off: it joins none of them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub events: bool,
+    /// Its environment label was made for it, and goes with it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own_environment: bool,
 }
 
 /// Per-service WebSocket knobs (`config.ws`, docs/handlers.md "WebSockets").
@@ -662,6 +822,9 @@ pub struct ServicePatch {
     pub deno: Option<DenoServiceConfig>,
     pub durable: Option<bool>,
     pub ws: Option<WsServiceConfig>,
+    pub events: Option<EventsConfig>,
+    #[serde(rename = "async")]
+    pub async_invoke: Option<AsyncInvokeConfig>,
 }
 
 /// Build state of a version.
@@ -690,12 +853,114 @@ pub struct Version {
     /// build reports it and for WASM.
     #[serde(default)]
     pub bundle_digest: Option<Digest>,
+    /// The version this one was adopted from by digest (`MetaStore::adopt_version`); `None` for an
+    /// upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<VersionOrigin>,
+    /// What this version carries, in order: set only from upload validation or the write-once WASM
+    /// route, copied by adoption.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub migrations: Vec<crate::migrations::MigrationEntry>,
+    /// What the deploy claims about this version (`{"git":{"sha",…},"label"}`), copied by adoption.
+    /// Client-written: display and audit only, never a decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
+/// `pending_reason` of a version whose archive is still being fetched (`from-url`). Shown as the
+/// build state `fetching`.
+pub const PENDING_FETCHING: &str = "fetching";
+
+impl Version {
+    pub fn is_fetching(&self) -> bool {
+        self.build_state == BuildState::Pending && self.pending_reason.as_deref() == Some(PENDING_FETCHING)
+    }
+
+    /// False while fetching, and for good when the fetch failed.
+    pub fn has_source(&self) -> bool {
+        self.source_digest != Digest::NONE
+    }
+
+    /// The commit this version claims to be built from.
+    pub fn git_sha(&self) -> Option<&str> {
+        self.meta.as_ref()?.pointer("/git/sha")?.as_str()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewVersion {
     pub source_digest: Digest,
     pub compile: CompileMode,
+}
+
+/// Where an adopted version came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionOrigin {
+    pub service: ServiceId,
+    pub version: VersionNo,
+}
+
+/// What started a tracked flip of the live version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchKind {
+    Promote,
+    Switch,
+    Rollback,
+}
+
+/// Progress of a tracked flip. `Preparing` and `Migrating` are before the flip and exclusive per
+/// service; `Draining` is after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchState {
+    Preparing,
+    Migrating,
+    Draining,
+    Completed,
+    DrainTimedOut,
+    Failed,
+}
+
+/// One row of `version_switches`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Switch {
+    pub id: SwitchId,
+    pub service_id: ServiceId,
+    pub kind: SwitchKind,
+    pub state: SwitchState,
+    /// The source version (`SwitchKind::Switch` only).
+    pub source: Option<VersionOrigin>,
+    pub from_version: Option<VersionNo>,
+    pub to_version: VersionNo,
+    /// A stable code, never driver text.
+    pub error: Option<String>,
+    /// The node restarted while this switch was unfinished.
+    pub interrupted: bool,
+    pub drain_deadline_ms: Option<UnixMs>,
+    pub created_by: Option<String>,
+    pub created_at_ms: UnixMs,
+    pub updated_at_ms: UnixMs,
+}
+
+/// A new switch; it starts in [`SwitchState::Preparing`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewSwitch {
+    pub kind: SwitchKind,
+    pub source: Option<VersionOrigin>,
+    pub from_version: Option<VersionNo>,
+    pub to_version: VersionNo,
+    pub created_by: Option<String>,
+}
+
+/// Fields of a switch to change; `None` keeps the stored value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SwitchPatch {
+    pub state: Option<SwitchState>,
+    pub from_version: Option<VersionNo>,
+    pub drain_deadline_ms: Option<UnixMs>,
+    /// `&'static` so that only a stable code fits, not formatted driver text.
+    pub error: Option<&'static str>,
 }
 
 /// Schedule definition.
@@ -793,6 +1058,9 @@ pub struct RouteEntry {
     /// Who may call this service (D-A1).
     #[serde(default)]
     pub call: CallAccess,
+    /// A preview: no calls in or out, no queue, events, schedules or SDKs (R5).
+    #[serde(default)]
+    pub isolated: bool,
 }
 
 /// Complete set of routes at one generation. Swapped atomically.
@@ -883,5 +1151,19 @@ impl fmt::Debug for EnvBundle {
                 &self.secrets.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
             )
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scaling block without `min_run_time_ms` inherits (unset).
+    #[test]
+    fn scaling_without_min_run_time_is_inherit() {
+        let s: ScalingConfig = serde_json::from_str(r#"{"min_instances":1}"#).unwrap();
+        assert_eq!(s.min_run_time_ms, None);
+        let z: ScalingConfig = serde_json::from_str(r#"{"min_run_time_ms":0}"#).unwrap();
+        assert_eq!(z.min_run_time_ms, Some(0));
     }
 }

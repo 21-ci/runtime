@@ -22,8 +22,8 @@ pub fn runtime_str(r: RuntimeArg) -> &'static str {
 }
 
 /// Blocks `--set` / `--unset` may touch (`call` has its own flags).
-const BLOCKS: [&str; 8] = [
-    "limits", "scaling", "triggers", "ingress", "egress", "deno", "wasm", "ws",
+const BLOCKS: [&str; 10] = [
+    "limits", "scaling", "triggers", "ingress", "egress", "deno", "wasm", "ws", "events", "async",
 ];
 
 /// One `--set` / `--unset` edit: `block`, the path inside it, the value (`None` = remove).
@@ -111,11 +111,12 @@ fn apply(base: Option<&Value>, edits: &[&Edit]) -> Value {
     root
 }
 
-/// The `--min-instances` / `--max-instances` flags.
+/// The `--min-instances` / `--max-instances` / `--min-run-time` flags.
 #[derive(Clone, Copy, Debug, Default)]
 struct Instances {
     min: Option<u32>,
     max: Option<u32>,
+    min_run_time: Option<std::time::Duration>,
 }
 
 impl Instances {
@@ -150,6 +151,13 @@ fn edits(
             });
         }
     }
+    if let Some(d) = instances.min_run_time {
+        out.push(Edit {
+            block: "scaling".into(),
+            path: vec!["min_run_time_ms".into()],
+            value: Some(json!(u64::try_from(d.as_millis()).unwrap_or(u64::MAX))),
+        });
+    }
     if let Some(r) = reuse_isolates {
         out.push(Edit {
             block: "deno".into(),
@@ -171,6 +179,20 @@ fn edits(
         out.push(parse_unset(u)?);
     }
     Ok(out)
+}
+
+/// `--rate-rule JSON`, repeated: the whole `ingress.rate_rules` list.
+fn rate_rules_edit(rules: &[String]) -> Result<Edit> {
+    let parsed = rules
+        .iter()
+        .map(|r| serde_json::from_str::<Value>(r))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| CliError::usage(format!("--rate-rule: not JSON: {e}")))?;
+    Ok(Edit {
+        block: "ingress".into(),
+        path: vec!["rate_rules".into()],
+        value: Some(Value::Array(parsed)),
+    })
 }
 
 /// Each touched block, merged onto `current` (the service view, or nothing on create).
@@ -198,6 +220,7 @@ pub fn run(app: &App, cmd: &ServiceCmd) -> Result<()> {
             min_instances,
             max_instances,
             durable,
+            min_run_time,
             set,
             project,
         } => {
@@ -211,6 +234,7 @@ pub fn run(app: &App, cmd: &ServiceCmd) -> Result<()> {
             let instances = Instances {
                 min: *min_instances,
                 max: *max_instances,
+                min_run_time: *min_run_time,
             };
             let edits = edits(*reuse_isolates, *reuse_instances, instances, set, &[])?;
             let mut body = json!({"slug": slug, "runtime": runtime_str(*runtime)});
@@ -248,16 +272,22 @@ pub fn run(app: &App, cmd: &ServiceCmd) -> Result<()> {
             min_instances,
             max_instances,
             durable,
+            min_run_time,
             set,
             unset,
+            rate_rule,
         } => {
             check_environment(environment.as_deref())?;
             let allowed_callers = canonical_callers(allowed_callers)?;
             let instances = Instances {
                 min: *min_instances,
                 max: *max_instances,
+                min_run_time: *min_run_time,
             };
-            let edits = edits(*reuse_isolates, *reuse_instances, instances, set, unset)?;
+            let mut edits = edits(*reuse_isolates, *reuse_instances, instances, set, unset)?;
+            if !rate_rule.is_empty() {
+                edits.push(rate_rules_edit(rate_rule)?);
+            }
             let mut body = json!({});
             for (k, v) in [
                 ("name", name),
@@ -279,7 +309,7 @@ pub fn run(app: &App, cmd: &ServiceCmd) -> Result<()> {
                 return Err(CliError::usage(
                     "nothing to change: give --name, --profile, --access, --env, --allowed-caller, \
                      --no-allowed-callers, --reuse-isolates, --reuse-instances, --min-instances, \
-                     --max-instances, --durable, --set or --unset",
+                     --max-instances, --min-run-time, --durable, --set or --unset",
                 ));
             }
             let c = app.client()?;
@@ -326,6 +356,55 @@ pub fn run(app: &App, cmd: &ServiceCmd) -> Result<()> {
                     ]
                 },
             );
+        }
+        ServiceCmd::Scratch {
+            of,
+            runtime,
+            project,
+            name,
+            ttl,
+            copy_data,
+            allow_hosts,
+        } => {
+            let c = app.client()?;
+            let mut body = json!({});
+            if let Some(of) = of {
+                body["of"] = json!(resolve(&c, of)?.id);
+            } else if let Some(r) = runtime {
+                body["runtime"] = json!(runtime_str(*r));
+            } else {
+                return Err(CliError::usage(
+                    "name --of SVC, or --runtime for a preview that stands alone",
+                ));
+            }
+            if let Some(p) = project {
+                body["project"] = json!(p);
+            }
+            if let Some(n) = name {
+                body["name"] = json!(n);
+            }
+            if let Some(d) = ttl {
+                body["ttl_seconds"] = json!(d.as_secs().max(1));
+            }
+            if *copy_data {
+                body["copy_data"] = json!(true);
+            }
+            if !allow_hosts.is_empty() {
+                body["allowed_hosts"] = json!(allow_hosts);
+            }
+            let view = c.post("/v1/scratch", &body)?;
+            if app.json {
+                fmt::print_json(&view);
+                return Ok(());
+            }
+            let slug = cell(&view, "slug");
+            fmt::emitln(&format!("Preview {slug} created ({}).", cell(&view, "id")));
+            fmt::emitln(&format!(
+                "Expires: {}",
+                fmt::ts_field(view.get("scratch").unwrap_or(&Value::Null), "expires_at")
+            ));
+            fmt::emitln(&format!("Invoke:  {}/s/{slug}/", app.settings.invoke));
+            fmt::emitln(&format!("Next:    21ci push --service {slug} <path>"));
         }
         ServiceCmd::Get(a) => {
             let c = app.client()?;
@@ -452,6 +531,26 @@ fn instances(s: &Value) -> Option<String> {
     ))
 }
 
+/// `scaling.min_run_time_ms` in words: the effective value and its source when the server sends
+/// one, else the service's own setting.
+fn keep_alive(s: &Value) -> String {
+    let (value, source) = match s.pointer("/effective/min_run_time_ms") {
+        Some(e) if e.is_object() => (
+            e.get("value").and_then(Value::as_u64),
+            e.get("source").and_then(Value::as_str).unwrap_or("service").to_string(),
+        ),
+        _ => (
+            s.pointer("/scaling/min_run_time_ms").and_then(Value::as_u64),
+            "service".to_string(),
+        ),
+    };
+    match value {
+        None => "inherit (node idle TTL)".into(),
+        Some(0) => "0 ms (disposed after the answer unless work waits)".into(),
+        Some(n) => format!("{n} ms ({source})"),
+    }
+}
+
 /// The triggers that are off; `all on` when none is.
 fn triggers(s: &Value) -> String {
     let off: Vec<&str> = s
@@ -494,8 +593,14 @@ fn show(app: &App, s: &Value) {
     if let Some(instances) = instances(s) {
         rows.push(("Instances", instances));
     }
+    rows.push(("Keep-alive", keep_alive(s)));
     rows.push(("Triggers", triggers(s)));
-    for (label, key) in [("Ingress", "ingress"), ("Egress", "egress")] {
+    for (label, key) in [
+        ("Ingress", "ingress"),
+        ("Egress", "egress"),
+        ("Events", "events"),
+        ("Async", "async"),
+    ] {
         let p = fmt::pairs(s.get(key));
         if p != "-" {
             rows.push((label, p));
@@ -531,6 +636,15 @@ fn show(app: &App, s: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_rule_flags_become_one_list() {
+        let e = rate_rules_edit(&[r#"{"path":"/a","rps":1}"#.into(), r#"{"path":"/b","rps":2}"#.into()]).unwrap();
+        assert_eq!(e.block, "ingress");
+        assert_eq!(e.path, ["rate_rules"]);
+        assert_eq!(e.value.unwrap()[1]["path"], "/b");
+        assert!(rate_rules_edit(&["nope".into()]).is_err());
+    }
 
     #[test]
     fn set_values_are_json_or_strings() {

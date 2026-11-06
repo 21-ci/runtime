@@ -39,10 +39,12 @@ RUN rm -f rust-toolchain.toml
 
 # The target dir lives in a cache mount, so it is NOT part of the layer: copy the binary out in the
 # same RUN. build.rs of rusty_v8 downloads the prebuilt V8 static library, so this stage needs network.
+# No default: an image built without it never sends telemetry unless configured.
+ARG RT_TELEMETRY_URL=
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --release --locked -p rt-server --bin rt \
+    RT_TELEMETRY_URL="$RT_TELEMETRY_URL" cargo build --release --locked -p rt-server --bin rt \
  && install -D -m 0755 target/release/rt /out/rt \
  && rustc --edition 2021 -C opt-level=s -C strip=symbols -o /out/rt-healthcheck packaging/docker/healthcheck.rs
 

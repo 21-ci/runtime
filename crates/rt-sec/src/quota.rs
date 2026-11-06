@@ -50,6 +50,9 @@ pub enum QuotaError {
     /// `429 quota_exceeded` + `retry-after` (until UTC midnight).
     #[error("daily invocation quota exceeded")]
     InvocationsPerDay { retry_after: Duration },
+    /// `429 cpu_quota` + `retry-after` (until UTC midnight).
+    #[error("daily CPU quota exceeded")]
+    CpuPerDay { retry_after: Duration },
     /// `429 build_quota`.
     #[error("build quota exceeded")]
     BuildQuota,
@@ -71,6 +74,7 @@ impl QuotaError {
             QuotaError::ScheduleTooFrequent { .. } => 422,
             QuotaError::RateLimited { .. }
             | QuotaError::InvocationsPerDay { .. }
+            | QuotaError::CpuPerDay { .. }
             | QuotaError::BuildQuota
             | QuotaError::QueueFull => 429,
             QuotaError::StorageQuota | QuotaError::EgressQuota => 413,
@@ -84,6 +88,7 @@ impl QuotaError {
             QuotaError::TriggerNotAllowed => "trigger_not_allowed",
             QuotaError::ScheduleTooFrequent { .. } => "schedule_too_frequent",
             QuotaError::RateLimited { .. } => "rate_limited",
+            QuotaError::CpuPerDay { .. } => "cpu_quota",
             QuotaError::BuildQuota => "build_quota",
             QuotaError::QueueFull => "queue_full",
             QuotaError::StorageQuota => "storage_quota",
@@ -102,6 +107,8 @@ pub struct QuotaUsage {
     pub egress_bytes: u64,
     /// Bytes stored (KV, SQL, blobs) as the enforcer tracks them.
     pub storage_bytes: u64,
+    /// CPU milliseconds used since UTC midnight.
+    pub cpu_ms: u64,
 }
 
 pub trait QuotaEnforcer: Send + Sync {
@@ -112,6 +119,12 @@ pub trait QuotaEnforcer: Send + Sync {
     fn egress_left(&self, tenant: TenantId) -> Option<u64> {
         let _ = tenant;
         None
+    }
+    /// Whether `tenant` has spent its `cpu_ms_per_day`. In-memory only and takes no invocation or
+    /// rate token: background triggers ask it before they lease or fire.
+    fn cpu_exhausted(&self, tenant: TenantId) -> bool {
+        let _ = tenant;
+        false
     }
     /// What `tenant` has used today (`None` = not tracked by this enforcer).
     fn usage_today(&self, tenant: TenantId) -> Option<QuotaUsage> {
@@ -148,6 +161,7 @@ struct TenantState {
     day: i64,
     invocations: u64,
     egress_bytes: u64,
+    cpu_ms: u64,
     /// Persistent: storage in use, adjusted by `record`.
     storage_bytes: u64,
     /// Token bucket (tenant-wide `plan.rps`).
@@ -163,6 +177,7 @@ impl TenantState {
             day: i64::MIN,
             invocations: 0,
             egress_bytes: 0,
+            cpu_ms: 0,
             storage_bytes: 0,
             tokens: f64::INFINITY,
             refilled: Instant::now(),
@@ -178,6 +193,7 @@ impl TenantState {
             self.day = day;
             self.invocations = 0;
             self.egress_bytes = 0;
+            self.cpu_ms = 0;
         }
     }
 }
@@ -229,6 +245,15 @@ impl LocalQuotaEnforcer {
         });
     }
 
+    /// Like [`Self::seed_daily`] for the CPU counter (`cpu_ms_per_day`).
+    pub fn seed_daily_cpu(&self, tenant: TenantId, day_ms: UnixMs, cpu_ms: u64) {
+        self.with_state(tenant, |st| {
+            if st.day == day_ms.div_euclid(DAY_MS) {
+                st.cpu_ms = st.cpu_ms.saturating_add(cpu_ms);
+            }
+        });
+    }
+
     fn until_midnight(&self) -> Duration {
         let now = self.clock.now_ms();
         let left = (now.div_euclid(DAY_MS) + 1) * DAY_MS - now;
@@ -270,6 +295,9 @@ impl QuotaEnforcer for LocalQuotaEnforcer {
                     // The day's budget first: a refused request takes no rate token (QUOTA-009).
                     if plan.invocations_per_day > 0 && st.invocations >= plan.invocations_per_day {
                         return Err(QuotaError::InvocationsPerDay { retry_after: retry });
+                    }
+                    if plan.cpu_ms_per_day > 0 && st.cpu_ms >= plan.cpu_ms_per_day {
+                        return Err(QuotaError::CpuPerDay { retry_after: retry });
                     }
                     if plan.rps > 0 {
                         let rate = f64::from(plan.rps);
@@ -339,11 +367,17 @@ impl QuotaEnforcer for LocalQuotaEnforcer {
         Some(self.with_state(tenant, |st| limit.saturating_sub(st.egress_bytes)))
     }
 
+    fn cpu_exhausted(&self, tenant: TenantId) -> bool {
+        let limit = self.plans.plan_arc(tenant).cpu_ms_per_day;
+        limit > 0 && self.with_state(tenant, |st| st.cpu_ms >= limit)
+    }
+
     fn usage_today(&self, tenant: TenantId) -> Option<QuotaUsage> {
         Some(self.with_state(tenant, |st| QuotaUsage {
             invocations: st.invocations,
             egress_bytes: st.egress_bytes,
             storage_bytes: st.storage_bytes,
+            cpu_ms: st.cpu_ms,
         }))
     }
 
@@ -352,6 +386,7 @@ impl QuotaEnforcer for LocalQuotaEnforcer {
     fn record(&self, tenant: TenantId, _service: ServiceId, delta: UsageDelta) {
         self.with_state(tenant, |st| {
             st.egress_bytes = st.egress_bytes.saturating_add(delta.egress_bytes);
+            st.cpu_ms = st.cpu_ms.saturating_add(delta.cpu_ms);
             if delta.storage_bytes >= 0 {
                 st.storage_bytes = st.storage_bytes.saturating_add(delta.storage_bytes.unsigned_abs());
             } else {
@@ -434,6 +469,63 @@ mod tests {
     }
 
     #[test]
+    fn cpu_exhausted_takes_no_token_and_ends_at_midnight() {
+        let (q, clock) = enforcer(Plan {
+            cpu_ms_per_day: 100,
+            invocations_per_day: 1,
+            ..Plan::default()
+        });
+        let t = TenantId::from_u128(1);
+        assert!(!q.cpu_exhausted(t));
+        q.record(
+            t,
+            ServiceId::from_u128(1),
+            UsageDelta {
+                cpu_ms: 100,
+                ..UsageDelta::default()
+            },
+        );
+        assert!(q.cpu_exhausted(t));
+        assert_eq!(
+            q.usage_today(t).map(|u| u.invocations),
+            Some(0),
+            "asking takes no invocation"
+        );
+        clock.0.fetch_add(DAY_MS, Ordering::SeqCst);
+        assert!(!q.cpu_exhausted(t), "a new day");
+    }
+
+    #[test]
+    fn cpu_per_day_refuses_new_invocations_until_midnight_and_is_per_tenant() {
+        let plan = Plan {
+            rps: 0,
+            cpu_ms_per_day: 100,
+            ..Plan::default()
+        };
+        let (q, clock) = enforcer(plan);
+        let (t, svc) = (TenantId::from_u128(1), ServiceId::from_u128(9));
+        q.seed_daily_cpu(t, NOON, 60);
+        assert!(q.check(t, QuotaOp::Invoke).is_ok(), "under the budget");
+        let cpu = UsageDelta {
+            cpu_ms: 40,
+            ..UsageDelta::default()
+        };
+        q.record(t, svc, cpu);
+        assert_eq!(q.usage_today(t).map(|u| u.cpu_ms), Some(100));
+        let e = q.check(t, QuotaOp::Invoke).expect_err("spent");
+        assert!(matches!(e, QuotaError::CpuPerDay { .. }));
+        assert_eq!((e.code(), e.http_status()), ("cpu_quota", 429));
+        assert_eq!(
+            q.usage_today(t).map(|u| u.invocations),
+            Some(1),
+            "a refusal does not count"
+        );
+        assert!(q.check(TenantId::from_u128(2), QuotaOp::Invoke).is_ok());
+        clock.0.store(NOON + DAY_MS / 2 + 1, Ordering::SeqCst);
+        assert!(q.check(t, QuotaOp::Invoke).is_ok(), "a new day");
+    }
+
+    #[test]
     fn usage_today_reports_what_the_checks_count_and_starts_over_at_midnight() {
         let plan = Plan {
             rps: 0,
@@ -464,7 +556,8 @@ mod tests {
             Some(QuotaUsage {
                 invocations: 7,
                 egress_bytes: 10,
-                storage_bytes: 40
+                storage_bytes: 40,
+                cpu_ms: 0
             })
         );
         assert_eq!(
@@ -478,7 +571,8 @@ mod tests {
             Some(QuotaUsage {
                 invocations: 0,
                 egress_bytes: 0,
-                storage_bytes: 40
+                storage_bytes: 40,
+                cpu_ms: 0
             }),
             "the daily counters reset at UTC midnight; stored bytes persist"
         );

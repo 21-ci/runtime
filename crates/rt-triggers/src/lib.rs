@@ -2,14 +2,20 @@
 //! service-to-service call dispatch. Every trigger produces a `TaskSpec` and calls
 //! `Scheduler::submit`; triggers never execute code themselves.
 
+pub mod async_engine;
 pub mod calls;
+pub mod data_events;
 pub mod delayed;
+pub mod events;
+pub mod pubsub;
 pub mod queue_engine;
+pub mod rate_rules;
 pub mod ratelimit;
 pub mod routes;
 pub mod schedules;
 pub mod sdk_limits;
 pub mod sockets;
+pub mod stream_engine;
 
 pub use calls::{child_depth, CallDispatcher, CallTaskFactory, EnqueueNotifier};
 pub use delayed::{DelayedEngine, DelayedEngineConfig, DelayedTaskFactory};

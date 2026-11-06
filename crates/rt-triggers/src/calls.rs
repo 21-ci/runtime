@@ -181,6 +181,10 @@ impl CallDispatcher {
         if target.tenant != from.tenant && !self.plans.plan_arc(from.tenant).allow_cross_tenant_calls {
             return Err(CallError::CrossTenant);
         }
+        // A preview stands alone, whatever the other side's `allowed_callers` says (R5).
+        if target.service != from.service && (target.isolated || self.is_isolated(from.service)) {
+            return Err(CallError::NotAllowed);
+        }
         Ok(target)
     }
 
@@ -243,6 +247,7 @@ fn sdk_route(t: &SdkTarget) -> RouteEntry {
         project: rt_types::default_project_id(rt_types::system_tenant()),
         environment: rt_types::default_environment(),
         call: CallAccess::default(),
+        isolated: false,
     }
 }
 
@@ -271,6 +276,10 @@ fn outcome_response(outcome: Outcome) -> Response {
 
 #[async_trait]
 impl Calls for CallDispatcher {
+    fn is_isolated(&self, service: ServiceId) -> bool {
+        self.routes.by_service(service).is_some_and(|e| e.isolated)
+    }
+
     async fn call(&self, from: &TaskCtx, slug: &str, req: Request) -> Result<Response, CallError> {
         let depth = child_depth(from.depth)?;
         let target = self.target(from, slug)?;
@@ -289,6 +298,8 @@ impl Calls for CallDispatcher {
 
         let mut spec = self.tasks.child_task(from, &target, req, depth)?;
         spec.caller = Some(self.caller_stamp(from));
+        // the parent holds one of the target's slots while it waits (see `TaskSpec::reentrant`)
+        spec.reentrant = target.service == from.service;
         // Child wall = min(own limit, parent remaining) (TRG-17).
         spec.limits.wall = spec.limits.wall.min(remaining);
         if spec.limits.wall < Duration::from_millis(1) {
@@ -336,6 +347,8 @@ impl Calls for CallDispatcher {
         }
         let mut spec = self.tasks.child_task(from, &target, req, depth)?;
         spec.caller = Some(self.caller_stamp(from));
+        // the parent holds one of the target's slots while it waits (see `TaskSpec::reentrant`)
+        spec.reentrant = target.service == from.service;
         spec.limits.wall = spec.limits.wall.min(remaining);
         self.run_child(from, &target, spec, Some(object)).await
     }
@@ -361,6 +374,12 @@ impl Calls for CallDispatcher {
                     format!("the SDK `{sdk}` is not granted to this service"),
                 )
             })?;
+        if entry.isolated {
+            return Err(RpcError::new(
+                "sdk_not_granted",
+                format!("the SDK `{sdk}` is not available to a preview"),
+            ));
+        }
         let plan = self.plans.plan_name(from.tenant);
         let caller = SdkCaller {
             tenant: from.tenant,
@@ -436,7 +455,7 @@ impl Calls for CallDispatcher {
 
     async fn enqueue(&self, from: &TaskCtx, slug: &str, body: Bytes, o: EnqueueOpts) -> Result<MsgId, CallError> {
         let target = self.target(from, slug)?;
-        if !target.triggers.queue {
+        if !target.triggers.queue || target.isolated {
             return Err(CallError::Forbidden);
         }
         let plan = self.plans.plan_arc(target.tenant);

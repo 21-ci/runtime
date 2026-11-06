@@ -670,8 +670,18 @@ async fn ac_ws_api_list_close() {
     .await;
     assert_eq!((r.s(), &r.json["closed"]), (200, &json!(1)), "{}", r.text);
     assert_eq!(ws_close_code(&mut b, Duration::from_secs(10)).await, Some(1000));
+    // Every socket of the service, by hand.
+    let mut c = ws_connect(&node, &slug, "/").await;
+    welcome(&mut c).await;
+    let r = delete(&node, &t.key, &format!("/v1/services/{id}/sockets?code=4002")).await;
+    // Sockets whose close handshake is still running count too.
+    assert_eq!(r.s(), 200, "{}", r.text);
+    assert!(r.json["closed"].as_u64() >= Some(1), "{}", r.text);
+    assert_eq!(ws_close_code(&mut c, Duration::from_secs(10)).await, Some(4002));
     // `sockets:write` is required to close.
     let (_, reader) = make_key(&node, &t.id, &["services:read"], None).await;
+    let r = delete(&node, &reader, &format!("/v1/services/{id}/sockets")).await;
+    assert_eq!(r.s(), 403, "{}", r.text);
     let r = delete(
         &node,
         &reader,

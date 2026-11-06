@@ -183,6 +183,7 @@ pub(crate) fn deno(limits: &UploadLimits, sdks: &BTreeSet<String>, upload: &Uplo
         return Err(VErr::Invalid(diags));
     }
 
+    let migrations = migrations_of(&ex.files)?;
     let size = upload.body.len() as u64;
     Ok(Validated {
         upload: ValidatedUpload {
@@ -191,6 +192,7 @@ pub(crate) fn deno(limits: &UploadLimits, sdks: &BTreeSet<String>, upload: &Uplo
             handler_form,
             size,
             exports: Vec::new(),
+            migrations,
         },
         files: ex
             .files
@@ -204,6 +206,22 @@ pub(crate) fn deno(limits: &UploadLimits, sdks: &BTreeSet<String>, upload: &Uplo
         import_map: ex.import_map.clone(),
         wasm: None,
     })
+}
+
+/// The `.sql` files under `migrations/`; anything else there is not a migration.
+fn migrations_of(files: &BTreeMap<String, bytes::Bytes>) -> Result<Vec<rt_types::MigrationFile>, VErr> {
+    let mut inputs = Vec::new();
+    for (path, content) in files {
+        let Some(rest) = path.strip_prefix("migrations/").filter(|r| r.ends_with(".sql")) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(content) else {
+            return Err(VErr::Invalid(vec![diag(path, 1, 1, "a migration is not valid UTF-8")]));
+        };
+        inputs.push((rest, text));
+    }
+    rt_types::build_migrations(inputs)
+        .map_err(|e| VErr::Invalid(vec![diag(&format!("migrations/{}", e.file), 1, 1, e.message)]))
 }
 
 fn analyze_media(path: &str) -> MediaType {
@@ -224,6 +242,7 @@ pub(crate) fn wasm(limits: &UploadLimits, upload: &Upload) -> Result<Validated, 
             handler_form: HandlerForm::Unknown,
             size,
             exports: info.exports.clone(),
+            migrations: Vec::new(),
         },
         files: Vec::new(),
         imports: Vec::new(),

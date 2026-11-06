@@ -139,7 +139,10 @@ fn collect(dir: &Path, rel: &str, out: &mut Vec<String>) -> std::io::Result<()> 
             }
         } else if kind.is_file()
             && name != "rt.json"
-            && name.rsplit_once('.').is_some_and(|(_, ext)| SOURCE_EXTS.contains(&ext))
+            && name.rsplit_once('.').is_some_and(|(_, ext)| {
+                // SQL only as migrations: a dump elsewhere in the directory stays on this machine.
+                SOURCE_EXTS.contains(&ext) || (ext == "sql" && rel_path.starts_with("migrations/"))
+            })
         {
             out.push(rel_path);
         }
@@ -241,6 +244,24 @@ fn build_dir(dir: &Path) -> Result<Artifact> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_directory_keeps_its_migrations_and_no_other_sql() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.ts"), "export default {};").unwrap();
+        fs::write(dir.path().join("dump.sql"), "-- private").unwrap();
+        fs::create_dir_all(dir.path().join("migrations/old")).unwrap();
+        fs::create_dir_all(dir.path().join("lib/migrations")).unwrap();
+        fs::write(dir.path().join("migrations/0001_init.sql"), "CREATE TABLE t (a);").unwrap();
+        fs::write(dir.path().join("lib/migrations/x.sql"), "-- not one").unwrap();
+        let art = build(dir.path()).unwrap();
+        assert_eq!(art.content_type, "application/json");
+        let v: Value = serde_json::from_slice(&art.bytes).unwrap();
+        let files = v["files"].as_object().unwrap();
+        assert_eq!(files["migrations/0001_init.sql"], "CREATE TABLE t (a);");
+        assert!(!files.contains_key("dump.sql"));
+        assert!(!files.contains_key("lib/migrations/x.sql"));
+    }
 
     #[test]
     fn slug_rules() {

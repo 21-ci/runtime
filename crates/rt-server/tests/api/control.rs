@@ -9,6 +9,7 @@ use reqwest::Method;
 use rt_store::{
     DataConfig, DelayedStore, LocalServiceData, NewDelayed, ServiceDataStore, SqlStatement, SqlValue, SqliteQueueStore,
 };
+use rt_testkit::NodeHarness;
 use rt_types::ServiceId;
 use serde_json::{json, Value};
 
@@ -688,6 +689,215 @@ async fn ac_api_11_data_export_is_a_valid_sqlite_file_with_the_same_rows() {
 }
 }
 
+/// One service with some rows; `(node, key, export path)`.
+async fn export_fixture() -> (NodeHarness, String, String) {
+    let node = start_node().await;
+    let t = new_tenant(&node, "pro").await;
+    let slug = uniq("range");
+    let svc = ship(&node, &t.key, &slug, guests::NOTES).await;
+    let r = invoke_with(&node, &slug, Method::POST, "/", &[], "a note").await;
+    assert_eq!(r.s(), 201, "{}", r.text);
+    (node, t.key, format!("/v1/services/{svc}/data/export"))
+}
+
+async fn export_req(node: &NodeHarness, key: &str, path: &str, headers: &[(&str, &str)]) -> reqwest::Response {
+    let mut req = api(node, key, Method::GET, path);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    req.send().await.expect("export")
+}
+
+fn hdr(r: &reqwest::Response, name: &str) -> String {
+    r.headers()
+        .get(name)
+        .map(|v| v.to_str().expect("ascii").to_string())
+        .unwrap_or_default()
+}
+
+async fn err_code(r: reqwest::Response) -> String {
+    let v: serde_json::Value = r.json().await.expect("error envelope");
+    v["error"]["code"].as_str().expect("code").to_string()
+}
+
+node_test! {
+/// The console's hops: small ranges with `If-Range` add up to the one snapshot `200` would give,
+/// taken once, even when the data changes in between (the console 413).
+async fn ac_api_11_range_hops_read_one_snapshot() {
+    let (node, key, path) = export_fixture().await;
+
+    let first = export_req(&node, &key, &path, &[("range", "bytes=0-99")]).await;
+    assert_eq!(first.status().as_u16(), 206);
+    assert_eq!(hdr(&first, "accept-ranges"), "bytes");
+    assert_eq!(hdr(&first, "content-length"), "100");
+    let etag = hdr(&first, "etag");
+    assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+    let total: usize = hdr(&first, "content-range").rsplit('/').next().expect("total").parse().expect("number");
+    assert!(hdr(&first, "content-range").starts_with("bytes 0-99/"));
+    let mut all = first.bytes().await.expect("body").to_vec();
+    assert!(all.starts_with(b"SQLite format 3\0"));
+
+    let hop = 4096;
+    while all.len() < total {
+        let range = format!("bytes={}-{}", all.len(), all.len() + hop - 1);
+        let r = export_req(&node, &key, &path, &[("range", &range), ("if-range", &etag)]).await;
+        assert_eq!(r.status().as_u16(), 206);
+        assert_eq!(hdr(&r, "etag"), etag, "the same snapshot");
+        all.extend_from_slice(&r.bytes().await.expect("body"));
+    }
+    assert_eq!(all.len(), total);
+
+    let dir = tempfile::tempdir().expect("tmp");
+    let sid: ServiceId = path.split('/').nth(3).expect("id").parse().expect("service id");
+    let d = dir.path().join("services").join(sid.to_string());
+    std::fs::create_dir_all(&d).expect("mkdir");
+    std::fs::write(d.join("data.db"), &all).expect("write");
+    let store = LocalServiceData::open(DataConfig::new(dir.path())).expect("open");
+    let res = store
+        .sql(sid)
+        .execute(SqlStatement { sql: "PRAGMA integrity_check".into(), args: vec![] })
+        .await
+        .expect("check");
+    assert_eq!(res.rows[0][0], SqlValue::Text("ok".into()));
+
+    // A suffix of the same snapshot, and an end past the file is clamped.
+    let r = export_req(&node, &key, &path, &[("range", "bytes=-10"), ("if-range", &etag)]).await;
+    assert_eq!(r.status().as_u16(), 206);
+    assert_eq!(&r.bytes().await.expect("body")[..], &all[total - 10..]);
+    let past = format!("bytes={}-{}", total - 1, total + 1000);
+    let r = export_req(&node, &key, &path, &[("range", &past), ("if-range", &etag)]).await;
+    assert_eq!(r.status().as_u16(), 206);
+    assert_eq!(hdr(&r, "content-length"), "1");
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// A malformed value and several ranges are refused without a snapshot, out of bounds with the size.
+async fn ac_api_11_bad_ranges_are_416() {
+    let (node, key, path) = export_fixture().await;
+    for bad in ["bytes=abc", "bytes=5-2", "bytes=", "bytes=0-1,3-4", "bytes=0-1, 3-4"] {
+        let r = export_req(&node, &key, &path, &[("range", bad)]).await;
+        assert_eq!(r.status().as_u16(), 416, "{bad}");
+        assert_eq!(err_code(r).await, "range_not_satisfiable");
+    }
+
+    let whole = export_req(&node, &key, &path, &[]).await;
+    assert_eq!(whole.status().as_u16(), 200);
+    let etag = hdr(&whole, "etag");
+    let total = whole.bytes().await.expect("body").len();
+    let out = format!("bytes={total}-");
+    let r = export_req(&node, &key, &path, &[("range", &out), ("if-range", &etag)]).await;
+    assert_eq!(r.status().as_u16(), 416);
+    assert_eq!(hdr(&r, "content-range"), format!("bytes */{total}"));
+
+    // Another unit is ignored (RFC 9110).
+    let r = export_req(&node, &key, &path, &[("range", "items=0-1")]).await;
+    assert_eq!(r.status().as_u16(), 200);
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// A range past the start must name its snapshot; a tag that is stale or tampered with never reads
+/// a file by name: it gets a whole new snapshot, and no host path appears anywhere.
+async fn ac_api_11_if_range_rules_and_tampered_tags() {
+    let (node, key, path) = export_fixture().await;
+    let r = export_req(&node, &key, &path, &[("range", "bytes=100-199")]).await;
+    assert_eq!(r.status().as_u16(), 428);
+    assert_eq!(err_code(r).await, "if_range_required");
+    let r = export_req(&node, &key, &path, &[("range", "bytes=-5")]).await;
+    assert_eq!(r.status().as_u16(), 428);
+
+    for tag in [
+        "\"nope\"",
+        "\"../../services/x/data.db\"",
+        "\"/etc/passwd\"",
+        "W/\"weak\"",
+        "Wed, 21 Oct 2015 07:28:00 GMT",
+        "unquoted",
+    ] {
+        let r = export_req(&node, &key, &path, &[("range", "bytes=100-199"), ("if-range", tag)]).await;
+        assert_eq!(r.status().as_u16(), 200, "{tag}");
+        assert_ne!(hdr(&r, "etag"), tag);
+        let body = r.bytes().await.expect("body");
+        assert!(body.starts_with(b"SQLite format 3\0"), "{tag}");
+    }
+
+    // A weak form of a real tag is not that tag.
+    let first = export_req(&node, &key, &path, &[("range", "bytes=0-9")]).await;
+    let weak = format!("W/{}", hdr(&first, "etag"));
+    let r = export_req(&node, &key, &path, &[("range", "bytes=10-19"), ("if-range", &weak)]).await;
+    assert_eq!(r.status().as_u16(), 200);
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// A snapshot's tag means nothing on another service, another tenant cannot reach it at all, and the
+/// HEAD hint goes through the same checks.
+async fn ac_api_11_snapshots_stay_within_their_service_and_tenant() {
+    let (node, key, path) = export_fixture().await;
+    let first = export_req(&node, &key, &path, &[("range", "bytes=0-9")]).await;
+    let etag = hdr(&first, "etag");
+
+    let slug = uniq("other");
+    let other = ship(&node, &key, &slug, guests::NOTES).await;
+    let other_path = format!("/v1/services/{other}/data/export");
+    let r = export_req(&node, &key, &other_path, &[("range", "bytes=10-19"), ("if-range", &etag)]).await;
+    assert_eq!(r.status().as_u16(), 200, "not the first service's file");
+
+    let stranger = new_tenant(&node, "pro").await;
+    let r = export_req(&node, &stranger.key, &path, &[("range", "bytes=10-19"), ("if-range", &etag)]).await;
+    assert_eq!(r.status().as_u16(), 404);
+    let r = api(&node, &stranger.key, Method::HEAD, &path).send().await.expect("head");
+    assert_eq!(r.status().as_u16(), 404);
+
+    let weak = new_tenant_scopes(&node, "pro", &["services:read"]).await;
+    let r = api(&node, &weak.key, Method::HEAD, &path).send().await.expect("head");
+    assert!(r.status().as_u16() == 403 || r.status().as_u16() == 404);
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// The hint tells the size before anything is taken, and leaves no snapshot behind.
+async fn ac_api_11_head_gives_a_size_hint_without_a_snapshot() {
+    let (node, key, path) = export_fixture().await;
+    let r = api(&node, &key, Method::HEAD, &path).send().await.expect("head");
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(hdr(&r, "accept-ranges"), "bytes");
+    let hint: u64 = hdr(&r, "x-rt-size-hint").parse().expect("hint");
+    assert!(hint > 0);
+    assert!(hdr(&r, "etag").is_empty(), "no snapshot, no tag");
+
+    let whole = export_req(&node, &key, &path, &[]).await;
+    let size = whole.bytes().await.expect("body").len() as u64;
+    assert!(size.abs_diff(hint) <= hint, "hint {hint}, snapshot {size}");
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// `edge-1gb`'s single blocking thread: exports work on it, and KV and SQL answer around them.
+async fn ac_api_11_export_on_one_blocking_thread() {
+    let node = start_node_with(|c| c.blocking.threads = 1).await;
+    let t = new_tenant(&node, "pro").await;
+    let slug = uniq("edge");
+    let svc = ship(&node, &t.key, &slug, guests::NOTES).await;
+    let path = format!("/v1/services/{svc}/data/export");
+    let (a, b, c) = tokio::join!(
+        export_req(&node, &t.key, &path, &[]),
+        invoke_with(&node, &slug, Method::POST, "/", &[], "during"),
+        invoke_with(&node, &slug, Method::POST, "/", &[], "during too"),
+    );
+    assert!(a.status().as_u16() == 200 || a.status().as_u16() == 429, "{}", a.status());
+    assert_eq!(b.s(), 201, "{}", b.text);
+    assert_eq!(c.s(), 201, "{}", c.text);
+    node.shutdown().await;
+}
+}
+
 // ---------------------------------------------------------------------------------------------
 // API-12
 // ---------------------------------------------------------------------------------------------
@@ -1154,6 +1364,71 @@ async fn one_off_schedules_are_listed_on_their_own_paged_route() {
 
     let missing = get(&node, &t.key, "/v1/services/svc_missing/schedules/once").await;
     assert_envelope(&missing, 404, "not_found");
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// mrt_api_05: the effective view shows `min_run_time_ms` with its source: `service` when the owner
+/// set it, and `default` (the executor's idle TTL applies) when it is unset.
+async fn mrt_api_05_effective_shows_min_run_time_and_its_source() {
+    let node = start_node().await;
+    let t = new_tenant(&node, "pro").await;
+    let created = post(
+        &node,
+        &t.key,
+        "/v1/services",
+        json!({"slug": uniq("mrt05"), "runtime": "deno", "scaling": {"min_run_time_ms": 5000}}),
+    )
+    .await;
+    assert_eq!(created.s(), 201, "{}", created.text);
+    assert_eq!(
+        created.json["effective"]["min_run_time_ms"],
+        json!({"value": 5000, "source": "service"}),
+        "{}",
+        created.text
+    );
+    let svc = created.json["id"].as_str().expect("id").to_string();
+
+    // a PATCH replaces the scaling block: without `min_run_time_ms` the keep-alive is inherited
+    let unset = patch(&node, &t.key, &format!("/v1/services/{svc}"), json!({"scaling": {"max_instances": 3}})).await;
+    assert_eq!(unset.s(), 200, "{}", unset.text);
+    assert_eq!(
+        unset.json["effective"]["min_run_time_ms"],
+        json!({"value": null, "source": "default"}),
+        "{}",
+        unset.text
+    );
+    let view = get(&node, &t.key, &format!("/v1/services/{svc}")).await;
+    assert_eq!(view.json["effective"]["min_run_time_ms"]["source"], json!("default"), "{}", view.text);
+    node.shutdown().await;
+}
+}
+
+node_test! {
+/// fair_api_01: the service stats report the predicted slot time. After a few HTTP tasks,
+/// `admission.pred_ms` is a number near the handler's run time, and `pred_background_ms` is present
+/// (`null` while the service has run no background task).
+async fn fair_api_01_stats_report_the_predicted_run_time() {
+    let node = start_node().await;
+    let t = new_tenant(&node, "pro").await;
+    let slug = uniq("fair01");
+    let created = post(&node, &t.key, "/v1/services", json!({"slug": slug, "runtime": "deno"})).await;
+    assert_eq!(created.s(), 201, "{}", created.text);
+    let svc = created.json["id"].as_str().expect("id").to_string();
+    let up = upload_ts(&node, &t.key, &svc, &guests::slow(1, 200), "activate=1").await;
+    assert_eq!(up.s(), 201, "{}", up.text);
+    for _ in 0..3 {
+        assert_eq!(invoke(&node, &slug, "/").await.s(), 200);
+    }
+
+    let stats = get(&node, &t.key, &format!("/v1/services/{svc}/stats?window=5m")).await;
+    assert_eq!(stats.s(), 200, "{}", stats.text);
+    let adm = &stats.json["admission"];
+    let pred = adm["pred_ms"].as_f64().unwrap_or_else(|| panic!("pred_ms is a number after samples: {}", stats.text));
+    assert!((100.0..5_000.0).contains(&pred), "a 200 ms handler predicts about 200 ms, got {pred}: {}", stats.text);
+    assert!(adm.get("pred_background_ms").is_some(), "the field is always present: {}", stats.text);
+    assert_eq!(adm["pred_background_ms"], Value::Null, "no background task ran: {}", stats.text);
     node.shutdown().await;
 }
 }

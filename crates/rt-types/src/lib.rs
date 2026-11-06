@@ -7,11 +7,14 @@
 pub mod body;
 pub mod control;
 pub mod digest;
+pub mod events;
 pub mod ids;
 pub mod kinds;
 pub mod limits;
+pub mod migrations;
 pub mod model;
 pub mod outcome;
+pub mod path_pattern;
 pub mod plan;
 pub mod project;
 pub mod sched;
@@ -25,20 +28,28 @@ pub use control::{
     BuildReport, ConfigDelta, ConfigEvent, ConfigSnapshot, ConfigStream, ControlPlane, CpError, CONTROL_PLANE_VERSION,
 };
 pub use digest::{Digest, DigestError};
+pub use events::{Namespace, PubsubMessage, StreamBatch, StreamRecord};
 pub use ids::{
-    EventId, IdError, KeyId, MachineId, MsgId, ProcId, ProjectId, ScheduleId, SecretsVersion, ServiceId, TaskId,
-    TenantId, UploadId, VersionNo,
+    EventId, IdError, InvocationId, KeyId, MachineId, MsgId, ProcId, ProjectId, ScheduleId, SecretsVersion, ServiceId,
+    SwitchId, TaskId, TenantId, TopicId, UploadId, VersionNo,
 };
 pub use kinds::{DegradationMode, Listener, Profile, RuntimeKind, TaskKind};
 pub use limits::{CompileMode, Limits, ScalingKnobs, ServiceKnobs, MAX_CALL_DEPTH};
+pub use migrations::{
+    build_migrations, file_of, plan_migrations, AppliedMigration, MigrationEntry, MigrationFailure, MigrationFile,
+    MigrationSetError, MAX_MIGRATION_BYTES, MAX_MIGRATION_FILES,
+};
+pub use model::PENDING_FETCHING;
 pub use model::{
     default_environment, scope_admits, valid_environment, valid_service_slug, Access, ApiKey, BuildState, CallAccess,
     CallTarget, Caller, DenoServiceConfig, EgressRules, EnvBundle, Etag, HostMapping, HostStatus, IngressRules,
-    KeySecret, LimitsConfig, NewKey, NewSchedule, NewService, NewTenant, NewVersion, NodeEvent, RateLimit, RouteEntry,
-    RouteSnapshot, ScalingConfig, Schedule, ScheduleKind, Scope, Scopes, Service, ServiceConfig, ServicePatch, Tenant,
-    TriggerSwitches, UnixMs, UsageBatch, UsageDelta, Version, WasmServiceConfig, WsServiceConfig, DEFAULT_ENVIRONMENT,
-    MAX_ALLOWED_CALLERS, MAX_ENVIRONMENT_LEN,
+    KeySecret, LimitsConfig, NewKey, NewSchedule, NewService, NewSwitch, NewTenant, NewVersion, NodeEvent, RateLimit,
+    RouteEntry, RouteSnapshot, ScalingConfig, Schedule, ScheduleKind, Scope, Scopes, ScratchConfig, ScratchKind,
+    Service, ServiceConfig, ServicePatch, Switch, SwitchKind, SwitchPatch, SwitchState, Tenant, TriggerSwitches,
+    UnixMs, UsageBatch, UsageDelta, Version, VersionOrigin, WasmServiceConfig, WsServiceConfig, DEFAULT_ENVIRONMENT,
+    MAX_ALLOWED_CALLERS, MAX_ENVIRONMENT_LEN, NO_EGRESS_HOST,
 };
+pub use model::{validate_rate_rules, RateBy, RateRule, MAX_RATE_RULES, MAX_RATE_RULE_VALUE};
 pub use outcome::{BuildFailReason, BuildFailure, Diagnostic, KillReason, Outcome, RejectReason, Reply, TaskTimings};
 pub use plan::{EgressDefault, Plan, PlanLimitsMax, TriggerKind};
 pub use project::{
@@ -61,4 +72,6 @@ pub use task::{
     CallerStamp, DelayedEvent, HttpRequest, Payload, PreparedKey, QueueMessage, ScheduledEvent, SdkStamp, ServiceRef,
     TaskSpec, TraceCtx, Trigger,
 };
-pub use upload::{ContractTarget, HandlerForm, RpcContractText, UploadValidator, ValidatedUpload, ValidationError};
+pub use upload::{
+    ArchiveShape, ContractTarget, HandlerForm, RpcContractText, UploadValidator, ValidatedUpload, ValidationError,
+};

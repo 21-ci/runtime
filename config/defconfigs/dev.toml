@@ -30,6 +30,8 @@ lrq_capacity = 64
 max_inflight = 100              # Very small for dev
 max_queued = 0                  # auto: 4 x max_inflight; over it 503 overloaded
 max_queued_mb = 0               # auto: 1/16 of the memory budget
+min_run_time_max_ms = 600000    # largest scaling.min_run_time_ms a service may set (10 min)
+aging_factor = 4                # admission deadline aging k (0 = arrival order within a tenant)
 spin_us = 0
 time_slice = "10ms"
 pin_threads = false
@@ -108,9 +110,39 @@ allowed_hosts = ["esm.sh", "jsr.io", "deno.land", "localhost", "127.0.0.1"]
 max_deps_mb = 100
 compile = "lazy"
 
+[backup]
+enabled = false
+schedule = "0 3 * * *"
+dir = ""
+keep_last = 3
+encrypt_to = []
+allow_plaintext_remote = false
+
+[backup.s3]
+endpoint = ""
+bucket = ""
+prefix = ""
+region = "auto"
+access_key_file = ""
+secret_key_file = ""
+keep_local = 1
+keep_last = 7
+keep_daily = 7
+keep_weekly = 4
+
+[telemetry]
+enabled = false
+url = "auto"
+
 [deploy]
 retain_versions = 3
 auto_rollback = false
+drain_max = "15m"
+dry_run_max_mb = 256
+migration_budget = "60s"
+
+[import]
+max_bundle_mb = 4096
 
 [storage]
 blob_backend = "local"
@@ -141,6 +173,16 @@ executor_restart_backoff = ["100ms", "500ms", "2s"]
 cache_ttl = "0s"                # Always fetch fresh in dev
 max_services_per_min = 1000
 
+[secrets.vault]
+address = ""
+token_file = ""
+role_id_file = ""
+secret_id_file = ""
+mount = "secret"
+path_template = "rt/{tenant}/{project}/{environment}/"
+poll = "60s"
+ca_file = ""
+
 [ingress]
 trusted_proxies = ["127.0.0.1", "::1"]  # Allow localhost
 header_timeout = "30s"
@@ -149,6 +191,7 @@ max_conns_per_ip = 1000
 h2_max_streams = 1000
 sse_streams_per_key = 100
 backlog = 4096
+rate_keys_max = 0
 
 [egress]
 denied_ports = []               # Allow everything in dev

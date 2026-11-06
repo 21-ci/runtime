@@ -98,6 +98,12 @@ impl CallError {
 
 #[async_trait]
 pub trait Calls: Send + Sync {
+    /// `service` is a preview: the host refuses it queues, events, schedules and bindings (R5).
+    fn is_isolated(&self, service: ServiceId) -> bool {
+        let _ = service;
+        false
+    }
+
     /// In-process child task (`trigger = Call{parent, depth+1}`); no HTTP hop. `slug` resolves
     /// within the caller's tenant.
     async fn call(&self, from: &TaskCtx, slug: &str, req: Request) -> Result<Response, CallError>;

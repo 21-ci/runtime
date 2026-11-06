@@ -34,7 +34,7 @@ Needs the Rust toolchain from `rust-toolchain.toml` (1.95). Shell completions (b
 21ci completion fish > ~/.config/fish/completions/21ci.fish
 ```
 
-`21ci version` prints the client version (`21ci 0.1.0`); `21ci version --server` also asks the node (`GET /v1/version`, any valid token; `node/status` on an older node). `21ci doctor` checks the whole setup (below).
+`21ci version` prints the client version (`21ci 0.1.1`); `21ci version --server` also asks the node (`GET /v1/version`, any valid token; `node/status` on an older node). `21ci doctor` checks the whole setup (below).
 
 ## Quickstart
 
@@ -148,9 +148,10 @@ List commands (`tenant list`, `service list`) show one page; `--limit N` sets th
 | operator | [`tenant`](#tenant-operator), [`key`](#key-operator), [`plan`](#plan-operator), [`node`](#node-operator), [`sdk`](#sdk) (publish, grants) |
 | projects and tokens | [`project`](#project), [`token`](#token) |
 | AI assistants | [`mcp`](#mcp) |
-| services | [`service`](#service), [`push`](#push), [`versions`, `rollback`, `rebuild`, `build-logs`, `source`](#versions-rollback-rebuild-build-logs-source), [`types`](#types), [`env`](#env), [`secret`](#secret), [`host`](#host), [`data`](#data), [`sockets`, `objects`](#sockets-objects) |
+| services | [`service`](#service), [`push`](#push), [`versions`, `rollback`, `rebuild`, `build-logs`, `source`](#versions-rollback-rebuild-build-logs-source), [`branch`](#branch), [`switch`](#switch), [`types`](#types), [`env`](#env), [`secret`](#secret), [`host`](#host), [`data`](#data), [`sockets`, `objects`](#sockets-objects) |
 | operator SDKs | [`sdk ls`, `sdk types`](#sdk) (tenant key: what your grants allow) |
-| triggers | [`schedule`](#schedule), [`queue`](#queue), [`invoke`](#invoke) |
+| triggers | [`schedule`](#schedule), [`queue`](#queue), [`invoke`](#invoke) (and [`invoke --async`](#invoke-async)) |
+| events | [`topic`](#topic), [`consumer`](#consumer), [`pubsub`](#pubsub), [`invocation`](#invocation) |
 | observability | [`logs`](#logs), [`stats`](#stats), [`events`](#events) |
 | API docs | [`openapi`, `docs`](#openapi-docs) |
 
@@ -195,7 +196,7 @@ config           ok      context local; /home/me/.config/21ci/config.toml
 credentials      ok      root token (operator)
 control api      ok      http://127.0.0.1:8081 answers in 3 ms (API 1.0.0)
 auth             ok      operator: node routes allowed
-version          ok      client 0.1.0, node 0.1.0
+version          ok      client 0.1.1, node 0.1.1
 node mode        ok      normal
 invoke listener  ok      http://127.0.0.1:8080 answers in 2 ms (HTTP 404)
 ```
@@ -219,10 +220,16 @@ Scopes:        services:read,services:write,deploy,invoke,logs:read
 Projects:      all
 Environments:  all
 Plan:          pro
-Node version:  0.1.0
+Node version:  0.1.1
 ```
 
 ### limits
+
+```bash
+21ci usage
+```
+
+`GET /v1/usage`: every quota of your tenant with its use; `--json` adds the whole effective plan.
 
 ```bash
 21ci limits
@@ -244,6 +251,14 @@ schedules    3          2        1          per_service
 ```
 
 `schedules` counts per service (`plan.max_schedules` is a per-service limit) and `USED` is the busiest service. `unlimited` means the plan sets no limit. `--json` prints the API's body.
+
+### telemetry (operator)
+
+```bash
+21ci telemetry show
+```
+
+Prints whether the node sends its anonymous daily report, where to, and the exact JSON of the next one. It sends nothing. See [SECURITY.md](https://github.com/21-ci/runtime/blob/main/SECURITY.md#telemetry).
 
 ### tenant (operator)
 
@@ -390,12 +405,12 @@ A stdio bridge to the MCP endpoint of the control API ([mcp.md](mcp.md)) for ass
                            [--project P] [--env ENV] [--allowed-caller CALLER]...
                            [--reuse-isolates true|false] [--reuse-instances true|false]
                            [--min-instances N] [--max-instances N] [--durable]
-                           [--set BLOCK.KEY=VALUE]...
+                           [--min-run-time DURATION] [--set BLOCK.KEY=VALUE]...
 21ci service update <svc> [--name N] [--profile P] [--access A] [--env ENV]
                           [--allowed-caller CALLER]... | [--no-allowed-callers]
                           [--reuse-isolates B] [--reuse-instances B]
                           [--min-instances N] [--max-instances N] [--durable B]
-                          [--set BLOCK.KEY=VALUE]... [--unset BLOCK.KEY]...
+                          [--min-run-time DURATION] [--set BLOCK.KEY=VALUE]... [--unset BLOCK.KEY]...
 21ci service list [--project P] [--env ENV] [--limit N] [--cursor C] [--all]
 21ci service get <svc>
 21ci service stats <svc> [--window 5m|1h|24h]                  # same as `21ci stats`
@@ -410,22 +425,28 @@ The slug must match `^[a-z][a-z0-9-]{1,62}$` (checked before anything is sent). 
 
 **Instances.** An instance is one concurrently running copy of the service on the node (a Deno isolate or a WASM instance). `--min-instances N` keeps N instances warm: the service never scales to zero and the autoscaler never takes its concurrency limit below N (default 0). `--max-instances N` caps the instances running at once (N ≥ 1; default: the plan's `max_instances`, else the profile's ceiling); requests beyond the cap wait in the service's queue. Both are at most the plan's `max_instances` (a larger value is clamped and `service get` shows `plan` as its source); `--min-instances` above `--max-instances` is a usage error (exit 2). `service get` prints the effective bounds, for example `Instances: min 2 (service), max 4 (plan)`.
 
+**Keep-alive.** `--min-run-time DURATION` sets `scaling.min_run_time_ms`: how long a reused instance (a Deno isolate with its evaluated module, or a WASM instance) may stay idle after it answered, waiting for the next task of the same version. It takes a duration (`500ms`, `30s`, `2m`; a bare number is seconds) and `0`: after the answer the instance stays only while tasks of the service wait for it, else it is disposed at once. Unset, the instance follows the node's idle TTL (`deno.reuse_idle_ttl`, the WASM `cache.idle_ttl`). It is a maximum the runtime may cut short (memory pressure, reuse caps, a new version) and matters only when reuse is on. Above the plan's (and the node's) maximum it is `422 limit_exceeds_plan`; `--unset scaling.min_run_time_ms` goes back to inherit. `service get` prints it as `Keep-alive: inherit (node idle TTL)`, `0 ms (disposed after the answer unless work waits)` or `30000 ms (service)` (the source is `plan` when the plan's maximum clamps it).
+
 **Durable services.** `--durable` makes a durable service: its default export is a class, one instance per object chosen in code with `durable.get(name)`, each with its own storage and alarm, one event or request at a time per object ([handlers](handlers.md#stddurable)). `update --durable false` turns it off. A WASM durable service must export `std:host/socket-handler` (`422 missing_export` at push).
 
 **Reuse knobs.** `--reuse-isolates` sets `deno.reuse_isolates` (reuse an isolate with its evaluated module for the next request of the same version; default: node config, then the profile, on for `min_latency`). `--reuse-instances` sets `wasm.reuse_instances` (default: the profile).
+
+`--rate-rule JSON` (update, repeatable) replaces `ingress.rate_rules`, e.g. `--rate-rule '{"path":"/api/login","methods":["POST"],"rps":5,"burst":10,"by":"ip"}'`.
 
 **Config blocks.** `--set BLOCK.KEY=VALUE` sets one field of a block; nested fields use more dots (`ingress.rate_limit.rps=50`). The value is JSON when it parses as JSON (`500`, `false`, `["GET","POST"]`, `{"rps":1}`, `"007"`), otherwise a plain string (`egress.allowed_hosts` needs a JSON array, though). `--unset BLOCK.KEY` removes a field so it falls back to its default. The API replaces a whole block on `PATCH`, so `update` reads the service, merges your fields into each block it touches, and sends the result with `If-Match: <etag>`: a concurrent change makes it fail with `412 precondition_failed` instead of being overwritten. Unknown blocks are refused locally; unknown fields come back as `422 validation_failed`.
 
 | Block | Fields ([api.md](api.md#services)) |
 |---|---|
 | `limits` | `wall_ms`, `cpu_ms`, `memory_mb`, `max_body_bytes` (above the plan maximum: `422 limit_exceeds_plan`) |
-| `scaling` | `min_instances` (same as `--min-instances`), `max_instances` (same as `--max-instances`), `max_queued` (queue bound; over it `503 overloaded`), `keep_resident`. `scaling.max_concurrency`, the old name of `max_instances`, is still taken by `--set` / `--unset` |
+| `scaling` | `min_instances` (same as `--min-instances`), `max_instances` (same as `--max-instances`), `max_queued` (queue bound; over it `503 overloaded`), `keep_resident`, `min_run_time_ms` (same as `--min-run-time`). `scaling.max_concurrency`, the old name of `max_instances`, is still taken by `--set` / `--unset` |
 | `triggers` | `http`, `interval`, `cron`, `queue`, `call`, `websocket` (booleans, all on by default) |
 | `ws` | `allowed_origins[]` (origins allowed to open a WebSocket; empty = any), `warm` (keep the isolate of an event for the next one; default true), `max_sockets` (the service's own cap) |
 | `ingress` | `allowed_methods[]`, `allow_paths[]`, `ip_allow[]`, `rate_limit.rps`, `rate_limit.burst` |
 | `egress` | `allowed_hosts[]`, `denied_hosts[]` |
 | `deno` | `reuse_isolates` (same as `--reuse-isolates`) |
 | `wasm` | `reuse_instances` (same as `--reuse-instances`) |
+| `events` | `subscribe[]` (`{subject, group?}`: pub/sub subjects the service receives), `consume[]` (`{topic, group?, start?, batch_size?, max_attempts?, on_exhausted?}`: stream topics it consumes); [handlers](handlers.md) |
+| `async` | `enabled` (accept `invoke --async`; default false), `max_attempts` (1..10, default 3), `max_event_age_s` (60..86400, default 3600) |
 
 ```console
 $ 21ci service create billing --env staging --allowed-caller env:staging --allowed-caller checkout
@@ -434,6 +455,8 @@ $ 21ci service update billing --set scaling.max_queued=100 --set limits.cpu_ms=5
 $ 21ci service update billing --set 'ingress.allowed_methods=["GET","POST"]' --unset scaling.max_instances
 $ 21ci service update billing --min-instances 2 --max-instances 16
 $ 21ci service create edge --runtime wasm --reuse-instances true --set scaling.max_queued=1000
+$ 21ci service update billing --min-run-time 30s
+$ 21ci service update billing --set 'events.subscribe=[{"subject":"orders.>"}]' --set async.enabled=true
 $ 21ci service create chat-rooms --durable --access internal --set 'ws.allowed_origins=["https://chat.example.com"]'
 ```
 
@@ -457,6 +480,7 @@ Reuse isolates:   default (node config, then profile)
 Limits:           cpu_ms=500
 Scaling:          max_instances=16
 Instances:        min 0 (default), max 16 (service)
+Keep-alive:       inherit (node idle TTL)
 Triggers:         off: cron
 Build:            ready
 Tier:             T1
@@ -466,14 +490,16 @@ ETag:             "4"
 Tenant:           ten_01M3XM135SCP9EP41ZZXAQ5CCZ
 ```
 
-`get` shows only the fields that are set in each block (`-` for none); `Ingress` and `Egress` lines appear when they hold something, `Last error` when the service has one. `Concurrency` is the service's queueing state (`status.admission`): the adaptive concurrency limit with its bounds, what runs and what waits; `-` while the service has not run recently. `service stats` shows the rest of it. The resolved values with their sources (profile, plan, node) are in `effective` of `service get --json`.
+`get` shows only the fields that are set in each block (`-` for none); `Ingress`, `Egress`, `Events` and `Async` lines appear when they hold something, `Last error` when the service has one. `Concurrency` is the service's queueing state (`status.admission`): the adaptive concurrency limit with its bounds, what runs and what waits; `-` while the service has not run recently. `service stats` shows the rest of it. The resolved values with their sources (profile, plan, node) are in `effective` of `service get --json`.
 
 ### push
 
 ```bash
-21ci push <path> [--service SLUG] [--create [--project P] [--env ENV]] [--runtime deno|wasm] [--no-activate]
+21ci push <path> [--service SLUG] [--branch NAME | --create [--project P] [--env ENV]] [--runtime deno|wasm] [--no-activate]
                  [--close-sockets] [--compile lazy|eager] [--wait] [--wait-timeout 120s]
 ```
+
+`--branch NAME` uploads to the branch `NAME` of the service, `<slug>-br-<NAME>` ([`branch`](#branch)), and leaves the service's own live version alone. The command refuses a service that is only named like the branch, and does not combine with `--create`.
 
 Uploads one version of a service and makes it live. Same formats as `sample/scripts/deploy.sh` ([formats and limits](api.md#deploy-input)):
 
@@ -513,11 +539,23 @@ Invoke:   http://127.0.0.1:8080/s/hello/
 
 `--json` prints one object: `{"service": {"id", "slug", "runtime", "created"}, "version": {…}, "activated": true, "invoke_url": "…"}`. A bundle or upload the server rejects (`422 validation_failed`) shows its diagnostics (`file`, `line`, `col`, `message`) under the error line. A build that fails shows its `failure`; `21ci build-logs <svc> <n>` shows the whole build log.
 
+### app move
+
+`21ci app move <svc> --to <context> [--slug S] [--project P] [--env E] [--activate]` exports from the current node and imports on the named context's node, using only that context's API and token. The source stays; the temporary bundle is removed.
+
+### from-url
+
+```bash
+21ci from-url hello https://git.example/a.tar.gz --header "PRIVATE-TOKEN: $T" --strip-components 1 --subdir apps/x --after-build
+```
+
+The node fetches a zip or (gzipped) tar and deploys it as a new version: `--header NAME:VALUE` (repeatable; sent to the URL's origin only), `--sha256`, `--strip-components`, `--subdir`, `--entry`, `--meta JSON`, `--compile`, `--after-build`. See the [deploy guide](deploy.md#deploying-from-a-url). `21ci push --meta-git` records the commit checked out at the path, read with `git` on your machine; `21ci push --after-build` goes live once the build is ready.
+
 ### versions, rollback, rebuild, build-logs, source
 
 ```bash
 21ci versions   <svc> [N]
-21ci rollback   <svc> [--to N] [--close-sockets]
+21ci rollback   <svc> [--to N] [--close-sockets] | --switch ID
 21ci rebuild    <svc> <N>
 21ci build-logs <svc> <N>
 21ci source     <svc> <N> [--out FILE]
@@ -544,9 +582,74 @@ Service hello (svc_01M3XM1AMYAKX6EREP6J536ATG) is now live at version 1 (was 2).
 
 - `versions <svc> N` shows one version (`GET …/versions/N`): build state, digests and the build `failure` (`reason` is one of `syntax`, `resolve`, `fetch`, `lock_mismatch`, `timeout`, `oom`, `too_large`, `internal`; the invoke answer of a failed build is `502 build_failed`).
 - `rollback` is `PUT /v1/services/{id}/live {"version": N}` with `If-Match: <etag>` of the service as read a moment before, so it fails with `412 precondition_failed` if somebody changed the service in between. Without `--to` it picks the newest version older than the live one that did not fail to build; `--to` can also roll forward. A failed version answers `409 version_not_ready`. `--close-sockets` closes the service's WebSockets (1012), as with `push`.
+- `rollback --switch ID` is `POST /v1/services/{id}/switches/{ID}/rollback` with `If-Match`: it makes the version that switch replaced live, as a new switch of kind `rollback`, and prints that switch. `409 rollback_target_gone` when there is no such version any more. It does not combine with `--to` or `--close-sockets`. No rollback undoes data written, schema changes or messages processed by the newer version.
 - `rebuild` clears a failed build (the negative cache) and builds again (`202`).
 - `build-logs` streams `GET …/versions/N/build/logs` (Server-Sent Events) and ends when the build is `ready` or `failed`; lines look like `logs` lines, `--json` prints one record per line. It needs `logs:read`.
 - `source` downloads the uploaded bytes as they were sent (a file, an archive, or the JSON bundle). Text goes to stdout; binary data on a terminal is refused, so pass `--out FILE` or redirect.
+
+### app
+
+```text
+21ci app export <svc> --out FILE
+21ci app import FILE --slug SLUG [--project P] [--env E] [--activate]
+21ci app fork <svc> --slug SLUG [--project P] [--env E] [--activate]
+```
+
+Moves a service as a bundle, `app-<slug>-<ts>.tar.zst`: settings, env values, secret names, schedules, data, blobs and version sources. Scope `data:admin`; importing also needs `services:write` and `deploy`. `export` writes the file with mode `0600`, because env values may hold secrets. Secrets are not carried: `import` lists the names to enter again. Versions rebuild from source, and the live one goes live only with `--activate`. `fork` copies a service on this node without a file. An invalid bundle is refused (`bundle_invalid`) and leaves no service.
+
+### service scratch
+
+```
+21ci service scratch --of SVC [--name NAME] [--ttl 2h] [--copy-data] [--allow-host HOST]...
+21ci service scratch --runtime deno|wasm [--project P] [--name NAME] [--ttl 2h] [--allow-host HOST]...
+```
+
+Creates a [preview](api.md#previews): a separate service the runtime isolates (no calls in or out, no queue, streams, pub/sub, schedules or SDKs, no egress unless `--allow-host` lists it), deleted with its data when it expires. `--ttl` defaults to the plan's `scratch_ttl_max`, which is also its maximum. `--copy-data` needs `data:admin`. Deploy to it with `21ci push --service <slug> <path>`; delete it sooner with `21ci service delete`. Needs `services:write`.
+
+### branch
+
+```bash
+21ci branch create <svc> --name NAME [--copy-data] [--schedules] [--environment ENV] [--ttl 7d] [--env-names] [--no-egress]
+21ci branch list   <svc> [--limit N] [--cursor C] [--all]
+21ci branch delete <svc> <NAME>
+```
+
+A branch is a separate service, `<parent-slug>-br-<NAME>`, with the parent's config under a forced policy, its own data and its own secrets. See the [workflow](deploy.md#branches-and-switches).
+
+- `--copy-data` copies the parent's database and blobs. It needs `data:admin`, is audited, and forces `access: key` on a public service. Over `deploy.dry_run_max_mb` it fails with `413 copy_data_too_large`.
+- `--env-names` adds the names of the parent's env and secrets with empty values, never a value.
+- `--ttl` sets `expires_at` from this machine's clock; the node then deletes the branch and its data.
+- `--no-egress` allows no host instead of keeping the parent's egress rules. `--schedules` lets interval and cron triggers run.
+- `branch delete` removes the branch and its data, without a prompt. Nothing is merged into the parent. `409 not_a_branch`: a service only named like one.
+
+### migrations, promote
+
+```sh
+21ci migrations status hello          # applied, and pending for the newest version
+21ci promote hello 7 --dry-run        # run them on a copy of the data
+21ci promote hello 7                  # run them, then make version 7 live
+21ci promote hello 7 --no-migrate     # repair: flip without them (scope data:admin)
+21ci push app.wasm --migrations sql/  # WASM: store them with the version
+```
+
+An upload with `migrations/` and `activate` is refused (`activate_with_migrations_needs_build`). Push such a Deno source with `--after-build` (live once the build is ready, migrations first), or with `--no-activate`, then `21ci promote`.
+
+### switch
+
+```bash
+21ci switch <svc> --from BRANCH [--dry-run] [--wait] [--wait-timeout 20m] [--drain-timeout 10m] [--close-sockets]
+21ci switch status <svc> [ID] [--limit N] [--cursor C] [--all]
+```
+
+`switch` is `POST /v1/services/{id}/switch` with `If-Match`: it makes the branch's live version live on `<svc>`, with `<svc>`'s env, secrets and data. It prints the switch and its warnings.
+
+- `--dry-run` checks and reports `env_missing_on_parent` and `triggers_differ` (names only), and writes nothing.
+- `--wait` polls until the drain ends. `completed` exits 0. `drain_timed_out` also exits 0, because the new version is live: it prints a note, with `drain_unknown` if the tasks could not be counted. `failed` exits 1, and the live version did not change. When `--wait-timeout` passes the command exits 1, while the switch goes on.
+- `--drain-timeout` replaces the computed drain wait, capped at `deploy.drain_max`.
+- `status` lists every flip of the service, newest first, whatever started it; with an id it shows one.
+- A service whose slug is `status` is named by its `svc_…` id here, because `switch status` is the subcommand.
+
+The CLI takes a branch as the source. To switch from another service or to name a version, call the [API](api.md) or the `switch_service` MCP tool; to go to one of the service's own versions, use `rollback --to`.
 
 ### types
 
@@ -700,6 +803,15 @@ Created:  2026-10-07T09:00:00Z
 
 Downloads a consistent SQLite snapshot of the service's database (`GET …/data/export`, scope `data:admin`, audited as `data.exported`). Without `--out` the bytes go to stdout, which must not be a terminal.
 
+```text
+21ci data tables <svc>
+21ci data query <svc> <sql> [--args JSON] [--limit N]
+21ci data kv <svc> [--prefix P] [--cursor C] [--limit N] [--key KEY_B64]
+21ci data blobs <svc> [--prefix P] [--cursor C] [--limit N]
+```
+
+The read-only data browser (scope `data:read`, which a key gets only by naming it). Every read is audited; output is JSON.
+
 ```console
 $ 21ci data export todo --out todo.db
 Wrote the database of todo (svc_01M3XM2…) to todo.db (24576 bytes).
@@ -712,6 +824,7 @@ $ sqlite3 todo.db .tables
 21ci sockets ls    <svc> [--object NAME] [--tag TAG]
 21ci sockets close <svc> <ws_…> [--object NAME] [--code N] [--reason TEXT]
 21ci sockets close <svc> --tag TAG [--object NAME] [--code N] [--reason TEXT]
+21ci sockets close <svc> --all [--code N] [--reason TEXT]   # every socket of the service
 21ci objects ls    <svc> [--prefix P]
 21ci objects rm    <svc> <name>
 ```
@@ -804,7 +917,7 @@ Columns: time, level, `v<version>`, task id (`-` for build and system records), 
 ### stats
 
 ```bash
-21ci stats <svc> [--window 5m|1h|24h]            # also: 21ci service stats <svc>
+21ci stats <svc> [--window 5m|1h|24h] [--series 1m|5m|1h]   # also: 21ci service stats <svc>
 ```
 
 ```console
@@ -814,7 +927,7 @@ Requests:     7
 Errors:       0 (0.00%)
 Outcomes:     ok=7
 Concurrency:  limit 8 (1..64), running 0, queued 0 (max 256)
-Queue wait:   0.0 ms (timeouts 0)
+Queue wait:   0.0 ms (timeouts 0), predicted run 7.6 ms
 Autoscaler:   demand 1.4, latency baseline 7.2 ms, warm 1/proc, idle 12s
 
 PHASE  P50_MS  P95_MS  P99_MS
@@ -826,7 +939,7 @@ total  8.3     39.9    39.9
 
 `queue` is the time a request waited for a slot: per-service capacity limits queue requests instead of refusing them, so a growing `queue` latency (and `503 queue_timeout` outcomes) is the sign of a service at its adaptive concurrency limit.
 
-The admission rows are the service's admission state (`admission` of `GET …/stats`, the same object as `status.admission` of the service): `Concurrency` is the adaptive limit with its bounds (`scaling.min` raised to `min_instances`, up to the ceiling and the plan's tenant cap), the tasks running and waiting, and the queue bound (`scaling.max_queued`); `Instances` is `3 running, min 2, max 64, warm target 4`: instances running now, their bounds and the warm instances the autoscaler wants kept; `Last change` is the latest move of the limit and its reason (`queue`, `trend`, `latency`, `memory`, `cpu`, `idle`, `bounds`) or `none`; `Queue wait` is the smoothed wait of requests that had to queue (it fades to 0 while requests start right away) and the number of `503 queue_timeout` since the state was created; `Autoscaler` shows the decaying peak of running tasks (`demand`), the latency baseline the limit is held against, the warm instances kept per processor (`0` = scaled to zero), the smoothed arrival rate (`12.5 req/s`) and the time since the last task. A service that has not run recently has no admission state (`Concurrency: -`).
+The admission rows are the service's admission state (`admission` of `GET …/stats`, the same object as `status.admission` of the service): `Concurrency` is the adaptive limit with its bounds (`scaling.min` raised to `min_instances`, up to the ceiling and the plan's tenant cap), the tasks running and waiting, and the queue bound (`scaling.max_queued`); `Instances` is `3 running, min 2, max 64, warm target 4`: instances running now, their bounds and the warm instances the autoscaler wants kept; `Last change` is the latest move of the limit and its reason (`queue`, `trend`, `latency`, `memory`, `cpu`, `idle`, `bounds`) or `none`; `Queue wait` is the smoothed wait of requests that had to queue (it fades to 0 while requests start right away) and the number of `503 queue_timeout` since the state was created, then the predicted run time of the service version (`predicted run 4.3 ms`, the smoothed run time admission orders waiting work by, shorter first) and, when there is one, the estimate for background work (queue, stream and schedule tasks: `(background 2.1 s)`); `Autoscaler` shows the decaying peak of running tasks (`demand`), the latency baseline the limit is held against, the warm instances kept per processor (`0` = scaled to zero), the smoothed arrival rate (`12.5 req/s`) and the time since the last task. A service that has not run recently has no admission state (`Concurrency: -`).
 
 ### events
 
@@ -848,6 +961,7 @@ TIME                  KIND         ACTOR                           DATA
 
 ```bash
 21ci invoke <svc> [path] [-X METHOD] [-d DATA|@file] [-H "Name: value"]… [--key rtk_…] [--fail] [--body-only]
+21ci invoke <svc> [path] [-X METHOD] [-d DATA|@file] [-H "Name: value"]… --async [--idempotency-key K]
 ```
 
 Calls `ANY /s/{slug}/{path}` on the invoke listener (`RT_INVOKE`). `path` defaults to `/` and may carry a query string (`'/x?name=Ada'`, `'?name=Ada'`). `-d` makes the request a `POST` unless `-X` says otherwise; inline data is sent as `application/json` when it starts with `{`, `[` or `"`, otherwise `text/plain`; `@file` is sent as is as `application/octet-stream`; `-H 'Content-Type: …'` overrides. `<svc>` may also be a `svc_…` id (one control API lookup) or a base URL (`http://host:8080/s/hello`).
@@ -877,12 +991,108 @@ $ 21ci invoke hello '/x?name=Ada'
 
 Invoke failures carry their reason in `x-rt-reason` (and as the `text/plain` body): `guest_error`, `cpu_limit`, `oom`, `timeout`, `forbidden`, `trigger_not_allowed`, … ([api.md](api.md)). Capacity is queued, not refused : a request waits for a slot up to the profile's bound and then gets `503 queue_timeout` with `Retry-After`; `overloaded` (`scaling.max_queued` reached), `shed` and `route_stale` are `503`s with `Retry-After` too, `draining` and `restarting` are `503`s without it (go to another node). `429` remains only for the plan's quotas (`rate_limited`, `quota_exceeded`).
 
+#### invoke --async
+
+`--async` sends `Prefer: respond-async`: a service with `async.enabled = true` accepts the request (`202`), queues it and runs it later with retries; the command prints the `inv_…` id and exits 0 (`--json`: `{"id", "state", "replay"}`). `--idempotency-key K` sends `Idempotency-Key: K`: the same key with the same request returns the same id (stderr says `idempotent replay`); with a different request it is `409 idempotency_mismatch`. A refusal prints its code and exits 1: `403 async_not_allowed`, `413 too_large` (body over 1 MiB), `409 idempotency_mismatch`, `400 bad_request`; `429 async_backlog_full` (with `Retry-After`) exits 4. When the service does not accept async requests the preference is ignored and the request runs synchronously: the answer is printed as without `--async`. Follow the invocation with [`invocation`](#invocation).
+
+```console
+$ 21ci invoke hook /run -d '{"order":1}' --async --idempotency-key order-1
+inv_01M3XM4ZQ8JX2T4V3K9D7R5E1A
+```
+
+### topic
+
+```bash
+21ci topic create <name> [--project P] [--env E] [--partitions N] [--retention DURATION] [--max-mb M]
+21ci topic list   [--project P] [--env E]
+21ci topic get    <name|tpc_id> [--project P] [--env E]
+21ci topic update <name|tpc_id> [--retention DURATION] [--max-mb M] [--project P] [--env E]
+21ci topic delete <name|tpc_id> [--project P] [--env E] [--yes]
+21ci topic append <name|tpc_id> --body JSON [--key K] [--header NAME=VALUE]... [--dedup ID] [--project P] [--env E]
+21ci topic read   <name|tpc_id> [--partition N] [--from OFFSET|earliest|latest] [--from-time RFC3339] [--limit N] [--project P] [--env E]
+```
+
+A topic is a persistent, replayable log of records in one project environment (`std:stream` in [handlers](handlers.md)); services consume it through their `events.consume` block. A name (`[a-z0-9][a-z0-9._-]{0,62}`, not starting with `tpc_`) resolves in `--project` (slug or `prj_…`, default `default`) and `--env` (default `production`); a `tpc_…` id needs neither. `--partitions` is fixed at create (default 1); `--retention` is in whole hours (`24h`, `7d`; else exit 2 "retention must be a whole number of hours"; default 24h); `--max-mb` caps the topic's size, oldest records first (0 = only the plan's cap). Plan limits: more topics than `max_topics` is `403 quota_exceeded`; partitions, retention or size over the plan is `422 limit_exceeds_plan`; a taken name is `409 topic_exists`. `delete` removes the records, cursors and dead letters; it asks on a terminal and needs `--yes` otherwise.
+
+`append` writes one record (`--body` is JSON inline, `@file` or `-`); records with the same `--key` go to the same partition, in order; `--dedup` stores a record once per id: an id appended again within 2 minutes returns the first record's position (printed with `duplicate`) and stores nothing new. A full topic is `429 stream_full`. `read` lists records of one partition from `--from` (an offset, `earliest`, `latest`) or `--from-time`; `--partition` is required when the topic has more than one (`422 validation_failed`) and is sent only when given. A page that does not reach the end prints `(more records: --from N)`.
+
+```console
+$ 21ci topic create orders --partitions 4 --retention 48h
+$ 21ci topic append orders --body '{"id":1}' --key cust-1
+Appended to orders: partition 2, offset 0.
+$ 21ci topic read orders --partition 2 --from earliest
+PARTITION  OFFSET  KEY     TIMESTAMP                 BODY
+2          0       cust-1  2026-10-02T06:15:53.026Z  {"id":1}
+```
+
+### consumer
+
+```bash
+21ci consumer list  <svc>
+21ci consumer reset <svc> <topic> <group> --to earliest|latest|<offset>|<RFC3339> [--partition N]
+21ci consumer dlq list  <svc> <topic> <group> [--limit N]
+21ci consumer dlq purge <svc> <topic> <group>
+```
+
+The stream consumers of a service (its `events.consume` entries): one row per partition with the committed offset, the next offset, the lag, the state (`active`, or `blocked` for `on_exhausted: "block"`) and the dead-letter count. `reset` moves the cursor (all partitions, or `--partition`) and unblocks a blocked partition; an offset is sent as a number. `dlq list` shows the records that ran out of attempts, `dlq purge` deletes them.
+
+```console
+$ 21ci consumer list billing
+TOPIC   GROUP    PARTITION  COMMITTED  NEXT  LAG  STATE    DEAD
+orders  default  0          10         12    2    active   0
+$ 21ci consumer reset billing orders default --to earliest
+```
+
+### pubsub
+
+```bash
+21ci pubsub publish <subject> --body JSON [--header NAME=VALUE]... [--project P] [--env E]
+```
+
+Publishes one message to the subscribers of a subject in a project environment (`std:pubsub`; services subscribe with `events.subscribe`). Delivery is at most once and ephemeral: nothing is stored. Prints `receivers N, dropped M` (dropped: over the fan-out cap, the subscriber's backlog, quota or a refused task). A publish over the tenant's rate or quota is `429 rate_limited` / `403 quota_exceeded`.
+
+### invocation
+
+```bash
+21ci invocation list    <svc> [--state pending|succeeded|failed] [--limit N] [--cursor C] [--all]
+21ci invocation get     <svc> <inv_id>
+21ci invocation redrive <svc>
+21ci invocation purge   <svc>
+```
+
+The async invocations of a service (from `invoke --async` or any `Prefer: respond-async` / `X-Rt-Invocation-Type: Event` request). `list` prints `pending N, failed M` (the service's totals) above the page; the request column shows the method and path, with `?…` when there was a query (the query, headers and body are never shown). `redrive` moves every failed invocation back to pending with fresh attempts; `purge` deletes the failed ones.
+
+```console
+$ 21ci invocation list hook --state failed
+pending 0, failed 1
+ID                              STATE   REQUEST     ATTEMPTS  STATUS  ERROR       CREATED
+inv_01M3XM4ZQ8JX2T4V3K9D7R5E1A  failed  POST /run   3         500     status_5xx  2026-10-02T06:15:53Z
+$ 21ci invocation redrive hook
+Redrove 1 failed invocation of hook (svc_01M3XM1AMYAKX6EREP6J536ATG).
+```
+
+### backup (operator)
+
+```
+21ci backup create [--wait]
+21ci backup list [--limit N]
+21ci backup status
+21ci backup get <id>
+21ci backup download <id> --out FILE
+21ci backup delete <id>
+```
+
+`create` starts a backup and returns; `--wait` follows it and exits 1 if it failed. `download` streams to `FILE.part` and renames it when whole, mode `0600`. Node configuration, retention and restore are in the [deploy guide](deploy.md#backup-and-restore). Verifying and restoring an archive are offline commands of the `rt` binary, not of `21ci`: `rt backup verify <archive>`, `rt backup restore <archive> --data-dir <empty>`. Both take `--age-identity FILE` for an encrypted archive; without it they stop with `age_identity_required`, and with it on a plain archive with `not_encrypted`.
+
 ### node (operator)
 
 ```bash
 21ci node status
 21ci node scheduler
 21ci node cache
+21ci node series [--range 1h|6h|24h]
+21ci node stats [--from MS] [--to MS] [--counts] [--cursor C] [--limit N]   # --as-tenant narrows it
+21ci node events [--after ID] [--kinds A,B] [--limit N]
 21ci node drain
 21ci node config get [SECTION | KEY]
 21ci node config set KEY=VALUE [KEY=VALUE …]
@@ -890,7 +1100,7 @@ Invoke failures carry their reason in `x-rt-reason` (and as the `text/plain` bod
 
 ```console
 $ 21ci node status
-Version:          0.1.0
+Version:          0.1.1
 Mode:             normal
 Default profile:  balanced
 V8 sandbox:       false
@@ -964,16 +1174,20 @@ A tenant key needs these scopes ([SECURITY.md](https://github.com/21-ci/runtime/
 | `limits` | any tenant key |
 | `tenant usage` of the key's own tenant | `logs:read` |
 | `whoami`, `version --server` | any valid token |
-| `service list`, `service get`, `versions`, `source`, `env get`, `secret list`, `host list`, `host get`, `schedule list`, `queue stats`, `queue dlq` (list), `events`; the slug lookup of every command | `services:read` |
-| `service create`, `service update`, `service delete`, `host attach`, `host detach`, `schedule add`, `schedule update`, `schedule rm` | `services:write` (`service update --env` also needs a key with no project or environment restriction) |
+| `branch list`, `switch status` | `services:read` |
+| `branch create`, `branch delete` | `services:write` (+ `services:read` for the lookup; `branch create --copy-data` also `data:admin`) |
+| `switch` | `deploy` + `services:read` |
+| `service list`, `service get`, `versions`, `source`, `env get`, `secret list`, `host list`, `host get`, `schedule list`, `queue stats`, `queue dlq` (list), `events`, `topic list`, `topic get`, `topic read`, `consumer list`, `consumer dlq list`, `invocation list`, `invocation get`; the slug lookup of every command | `services:read` |
+| `service create`, `service update`, `service delete`, `host attach`, `host detach`, `schedule add`, `schedule update`, `schedule rm`, `topic create`, `topic update`, `topic delete` | `services:write` (`service update --env` also needs a key with no project or environment restriction) |
 | `push`, `rollback`, `rebuild` | `deploy` (+ `services:read` for the lookup; `services:write` for `--create`) |
 | `env set`, `env unset` | `env:write` (+ `services:read`) |
 | `secret set`, `secret delete` | `secrets:write` |
-| `queue send`, `queue dlq --redrive`, `queue dlq --purge` | `queue:write` |
+| `queue send`, `queue dlq --redrive`, `queue dlq --purge`, `topic append`, `pubsub publish`, `consumer reset`, `consumer dlq purge`, `invocation redrive`, `invocation purge` | `queue:write` |
 | `logs`, `build-logs`, `stats`, `service stats` | `logs:read` |
 | `data export`, `objects rm` | `data:admin` |
 | `sockets ls`, `objects ls` | `services:read` |
 | `sockets close` | `sockets:write` |
+| `data tables`, `data query`, `data kv`, `data blobs` | `data:read` |
 | `invoke` | none for `access=public` services; a key with `invoke` for `access=key` |
 | `doctor`, `openapi`, `docs` | none (`doctor` reports what the token can do; its version check uses `GET /v1/version`, any valid token) |
 
@@ -1057,11 +1271,24 @@ Every operation of `openapi/openapi.json` and the command that calls it.
 | `GET /v1/node/status` | `node status`, `doctor`, `version --server` (older nodes) |
 | `GET`, `PUT /v1/node/config` | `node config get`, `node config set` |
 | `POST /v1/node/drain` | `node drain` |
+| `POST /v1/node/backups` | `backup create` |
+| `GET /v1/node/backups` | `backup list` |
+| `GET /v1/node/backups/status` | `backup status` |
+| `GET /v1/node/backups/{id}` | `backup get` |
+| `GET /v1/node/backups/{id}/archive` | `backup download` |
+| `DELETE /v1/node/backups/{id}` | `backup delete` |
+| `DELETE /v1/services/{s}/sockets` | `sockets close --all` |
+| `GET /v1/telemetry/preview` | `telemetry show` |
+| `PUT /v1/telemetry/console` | none: the web console calls it |
 | `GET /v1/node/scheduler` | `node scheduler` |
 | `GET /v1/node/cache` | `node cache` |
+| `GET /v1/node/series` | `node series` |
+| `GET /v1/node/stats` | `node stats` |
+| `GET /v1/node/events` | `node events` |
 | `GET /v1/version` | `version --server`, `doctor` (version check of a tenant key) |
 | `GET /v1/me` | `whoami`, `tenant usage` without an id |
 | `GET /v1/limits` | `limits` |
+| `GET /v1/usage` | `usage` |
 | `GET /v1/plans` | `plan list`, `plan get` |
 | `POST /v1/tenants`, `GET /v1/tenants` | `tenant create`, `tenant list` |
 | `GET`, `PATCH`, `DELETE /v1/tenants/{t}` | `tenant get`, `tenant update`, `tenant delete` |
@@ -1072,11 +1299,22 @@ Every operation of `openapi/openapi.json` and the command that calls it.
 | `GET /v1/projects/{p}/environments` | `project update --add-env` / `--remove-env` (reads the current list) |
 | `POST /v1/services`, `GET /v1/services` | `service create` (`push --create`), `service list` (`?slug=` is every slug lookup; `--project`, `--env` filter) |
 | `GET`, `PATCH`, `DELETE /v1/services/{s}` | `service get`, `service update`, `service delete` |
-| `PUT /v1/services/{s}/live` | `rollback` |
+| `PUT /v1/services/{s}/live` | `rollback`, `promote`, `push --migrations` |
+| `POST`, `GET /v1/services/{s}/branches` | `branch create`, `branch list` |
+| `POST /v1/scratch` | `service scratch` |
+| `DELETE /v1/services/{s}/branches/{name}` | `branch delete` |
+| `POST /v1/services/{s}/bundle`, `GET /v1/services/{s}/bundle/{id}` | `app export` |
+| `POST /v1/services/import` | `app import`, `app fork` (`?from=`) |
+| `POST /v1/services/{s}/switch` | `switch` |
+| `GET /v1/services/{s}/switches`, `GET …/switches/{id}` | `switch status`, `switch --wait` |
+| `POST …/switches/{id}/rollback` | `rollback --switch` |
 | `POST`, `GET /v1/services/{s}/versions` | `push`, `versions` |
+| `POST …/versions/from-url` | `from-url` |
 | `GET …/versions/{v}` | `versions <svc> N`, `push --wait` |
 | `GET …/versions/{v}/source` | `source` |
 | `POST …/versions/{v}/rebuild` | `rebuild` |
+| `GET …/migrations` | `migrations status` |
+| `POST …/versions/{v}/migrations` | `push --migrations` |
 | `GET …/versions/{v}/build/logs` | `build-logs` |
 | `GET …/types` | `types` |
 | `POST`, `GET /v1/sdks`, `GET /v1/sdks/{name}/releases`, `DELETE /v1/sdks/{name}` | `sdk publish`, `sdk ls` (operator), `sdk releases`, `sdk rm` |
@@ -1086,17 +1324,30 @@ Every operation of `openapi/openapi.json` and the command that calls it.
 | `GET`, `PUT …/env` | `env get`, `env set`, `env unset` |
 | `GET …/secrets`, `PUT`, `DELETE …/secrets/{name}` | `secret list`, `secret set`, `secret delete` |
 | `GET …/hosts`, `GET`, `PUT`, `DELETE …/hosts/{host}` | `host list`; `host get`; `host attach`; `host detach` |
-| `GET`, `POST …/schedules`, `PATCH`, `DELETE …/schedules/{id}` | `schedule list`, `schedule add`, `schedule update`, `schedule rm` |
+| `GET`, `POST …/schedules`, `GET …/schedules/once`, `PATCH`, `DELETE …/schedules/{id}` | `schedule list` (also the one-off schedules), `schedule add`, `schedule update`, `schedule rm` |
 | `POST`, `GET …/queue` | `queue send`, `queue stats` |
 | `GET`, `DELETE …/dlq`, `POST …/dlq/redrive` | `queue dlq`, `queue dlq --purge`, `queue dlq --redrive` |
+| `POST`, `GET /v1/topics`, `GET`, `PATCH`, `DELETE /v1/topics/{t}` | `topic create`, `topic list`, `topic get`, `topic update`, `topic delete` |
+| `POST`, `GET /v1/topics/{t}/messages` | `topic append`, `topic read` |
+| `POST /v1/pubsub/publish` | `pubsub publish` |
+| `GET`, `PUT`, `DELETE …/data-events` | `data events`, `data events --set FILE`, `data events --off` |
+| `PUT`, `DELETE …/secrets/{name}/ref`, `POST …/secrets/sync` | `secret ref`, `secret unref`, `secret sync` |
+| `GET …/consumers`, `POST …/consumers/{topic}/{group}/reset` | `consumer list`, `consumer reset` |
+| `GET`, `DELETE …/consumers/{topic}/{group}/dlq` | `consumer dlq list`, `consumer dlq purge` |
+| `GET`, `DELETE …/invocations`, `GET …/invocations/{id}`, `POST …/invocations/redrive` | `invocation list`, `invocation purge`, `invocation get`, `invocation redrive` |
 | `GET …/logs` (JSON and SSE) | `logs`, `logs -f` |
 | `GET …/stats` | `stats`, `service stats` |
 | `GET …/events` | `events` |
 | `GET …/data/export` | `data export` |
+| `GET …/data/tables` | `data tables` |
+| `POST …/data/query` | `data query` |
+| `GET …/data/kv` | `data kv` |
+| `GET …/data/kv/{key}` | `data kv --key` |
+| `GET …/data/blobs` | `data blobs` |
 | `GET …/objects`, `DELETE …/objects/{name}` | `objects ls`, `objects rm` |
 | `GET`, `DELETE …/objects/{name}/sockets`, `DELETE …/sockets/{ws}` | `sockets ls`, `sockets close --tag`, `sockets close <ws>` |
 | `GET /v1/openapi.json`, `GET /docs` | `openapi`, `docs`, `doctor` |
-| `ANY /s/{slug}/…` (public listener) | `invoke` |
+| `ANY /s/{slug}/…` (public listener) | `invoke`, `invoke --async` |
 
 `POST /mcp` is the endpoint `mcp` bridges to stdio ([mcp.md](mcp.md)).
 

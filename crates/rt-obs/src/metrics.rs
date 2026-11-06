@@ -33,6 +33,9 @@ pub mod names {
     pub const SCHED_SPINNING_SECONDS_TOTAL: &str = "rt_sched_spinning_seconds_total";
     pub const SYSMON_TICK_SECONDS: &str = "rt_sysmon_tick_seconds";
 
+    pub const BACKUP_DURATION_SECONDS: &str = "rt_backup_duration_seconds";
+    pub const BACKUP_LAST_SUCCESS_TIMESTAMP: &str = "rt_backup_last_success_timestamp";
+    pub const BACKUP_PEAK_WAL_BYTES: &str = "rt_backup_peak_wal_bytes";
     pub const MEM_BUDGET_BYTES: &str = "rt_mem_budget_bytes";
     pub const MEM_COMMITTED_BYTES: &str = "rt_mem_committed_bytes";
     pub const MEM_RSS_BYTES: &str = "rt_mem_rss_bytes";
@@ -56,7 +59,9 @@ pub mod names {
 
     pub const HTTP_REQUESTS_TOTAL: &str = "rt_http_requests_total";
     pub const INGRESS_CONN_REJECTED_TOTAL: &str = "rt_ingress_conn_rejected_total";
+    pub const INGRESS_RATE_LIMITED_TOTAL: &str = "rt_ingress_rate_limited_total";
     pub const EGRESS_REQUESTS_TOTAL: &str = "rt_egress_requests_total";
+    pub const TELEMETRY_SENDS_TOTAL: &str = "rt_telemetry_sends_total";
     pub const EGRESS_BYTES_TOTAL: &str = "rt_egress_bytes_total";
 
     pub const SCHEDULE_FIRES_TOTAL: &str = "rt_schedule_fires_total";
@@ -73,6 +78,23 @@ pub mod names {
     pub const WS_MESSAGES_TOTAL: &str = "rt_ws_messages_total";
     pub const WS_EVENT_TASKS_TOTAL: &str = "rt_ws_event_tasks_total";
     pub const WS_CLOSED_TOTAL: &str = "rt_ws_closed_total";
+
+    // Event queues, pub/sub, streams, async invocation and keep-alive. Labels are bounded enums only
+    // (no tenant, service, topic or subject values).
+    pub const QUEUE_THROTTLED_TOTAL: &str = "rt_queue_throttled_total";
+    pub const PUBSUB_PUBLISHED_TOTAL: &str = "rt_pubsub_published_total";
+    pub const PUBSUB_DELIVERED_TOTAL: &str = "rt_pubsub_delivered_total";
+    pub const PUBSUB_DROPPED_TOTAL: &str = "rt_pubsub_dropped_total";
+    pub const STREAM_APPENDED_TOTAL: &str = "rt_stream_appended_total";
+    pub const STREAM_DELIVERED_TOTAL: &str = "rt_stream_delivered_total";
+    pub const STREAM_DLQ_TOTAL: &str = "rt_stream_dlq_total";
+    pub const STREAM_TRIMMED_TOTAL: &str = "rt_stream_trimmed_total";
+    pub const STREAM_SKIPPED_TOTAL: &str = "rt_stream_skipped_total";
+    pub const ASYNC_ACCEPTED_TOTAL: &str = "rt_async_accepted_total";
+    pub const ASYNC_THROTTLED_TOTAL: &str = "rt_async_throttled_total";
+    pub const ASYNC_FINISHED_TOTAL: &str = "rt_async_finished_total";
+    pub const ASYNC_FAILED_EVICTED_TOTAL: &str = "rt_async_failed_evicted_total";
+    pub const INSTANCE_KEEPALIVE_TOTAL: &str = "rt_instance_keepalive_total";
 
     // Opt-in (`metrics.per_service`).
     pub const SERVICE_REQUESTS_TOTAL: &str = "rt_service_requests_total";
@@ -94,6 +116,9 @@ pub const NODE_METRIC_NAMES: &[&str] = &[
     names::SCHED_HOG_HANDOFFS_TOTAL,
     names::SCHED_SPINNING_SECONDS_TOTAL,
     names::SYSMON_TICK_SECONDS,
+    names::BACKUP_DURATION_SECONDS,
+    names::BACKUP_LAST_SUCCESS_TIMESTAMP,
+    names::BACKUP_PEAK_WAL_BYTES,
     names::MEM_BUDGET_BYTES,
     names::MEM_COMMITTED_BYTES,
     names::MEM_RSS_BYTES,
@@ -113,6 +138,7 @@ pub const NODE_METRIC_NAMES: &[&str] = &[
     names::BUILD_SECONDS,
     names::HTTP_REQUESTS_TOTAL,
     names::INGRESS_CONN_REJECTED_TOTAL,
+    names::INGRESS_RATE_LIMITED_TOTAL,
     names::EGRESS_REQUESTS_TOTAL,
     names::EGRESS_BYTES_TOTAL,
     names::SCHEDULE_FIRES_TOTAL,
@@ -127,6 +153,21 @@ pub const NODE_METRIC_NAMES: &[&str] = &[
     names::WS_MESSAGES_TOTAL,
     names::WS_EVENT_TASKS_TOTAL,
     names::WS_CLOSED_TOTAL,
+    // Event queues, pub/sub, streams, async invocations and instance keep-alive.
+    names::QUEUE_THROTTLED_TOTAL,
+    names::PUBSUB_PUBLISHED_TOTAL,
+    names::PUBSUB_DELIVERED_TOTAL,
+    names::PUBSUB_DROPPED_TOTAL,
+    names::STREAM_APPENDED_TOTAL,
+    names::STREAM_DELIVERED_TOTAL,
+    names::STREAM_DLQ_TOTAL,
+    names::STREAM_TRIMMED_TOTAL,
+    names::STREAM_SKIPPED_TOTAL,
+    names::ASYNC_ACCEPTED_TOTAL,
+    names::ASYNC_THROTTLED_TOTAL,
+    names::ASYNC_FINISHED_TOTAL,
+    names::ASYNC_FAILED_EVICTED_TOTAL,
+    names::INSTANCE_KEEPALIVE_TOTAL,
 ];
 
 /// Registration options.
@@ -166,6 +207,9 @@ pub struct Metrics {
     pub sched_spinning_seconds_total: Gauge,
     pub sysmon_tick_seconds: Histogram,
     // Memory
+    pub backup_duration_seconds: IntGauge,
+    pub backup_last_success_timestamp: IntGauge,
+    pub backup_peak_wal_bytes: IntGauge,
     pub mem_budget_bytes: IntGauge,
     pub mem_committed_bytes: IntGaugeVec, // category
     pub mem_rss_bytes: IntGauge,
@@ -191,8 +235,10 @@ pub struct Metrics {
     pub http_requests_total: IntCounterVec, // listener, status_class
     /// Connections closed at accept by `ingress.max_conns_per_ip`.
     pub ingress_conn_rejected_total: IntCounter,
-    pub egress_requests_total: IntCounterVec, // result
+    pub ingress_rate_limited_total: IntCounterVec, // rule (its index on the service, never an IP)
+    pub egress_requests_total: IntCounterVec,      // result
     pub egress_bytes_total: IntCounter,
+    pub telemetry_sends_total: IntCounterVec, // result
     // Triggers
     pub schedule_fires_total: IntCounter,
     pub schedule_skipped_total: IntCounter,
@@ -209,6 +255,21 @@ pub struct Metrics {
     pub ws_messages_total: IntCounterVec,    // dir = in | out
     pub ws_event_tasks_total: IntCounterVec, // outcome = ok | failed | given_up
     pub ws_closed_total: IntCounterVec,      // code
+    // Event queues, pub/sub, streams, async invocation, keep-alive
+    pub queue_throttled_total: IntCounter,
+    pub pubsub_published_total: IntCounter,
+    pub pubsub_delivered_total: IntCounter,
+    pub pubsub_dropped_total: IntCounterVec, // reason = fanout|rejected|no_task|quota|backlog
+    pub stream_appended_total: IntCounter,
+    pub stream_delivered_total: IntCounter,
+    pub stream_dlq_total: IntCounter,
+    pub stream_trimmed_total: IntCounter,
+    pub stream_skipped_total: IntCounterVec, // reason = exhausted|out_of_range
+    pub async_accepted_total: IntCounter,
+    pub async_throttled_total: IntCounter,
+    pub async_finished_total: IntCounterVec, // condition = success|retries_exhausted|event_age_exceeded|unreadable
+    pub async_failed_evicted_total: IntCounter,
+    pub instance_keepalive_total: IntCounterVec, // kind = deno|wasm, outcome = kept|handoff|disposed|reused|expired|shed
     // Opt-in per-service
     pub service_requests_total: Option<IntCounterVec>, // service, status_class
     pub service_duration_seconds: Option<HistogramVec>, // service
@@ -318,6 +379,14 @@ impl Metrics {
         r.register(Box::new(sched_spinning_seconds_total.clone()))?;
         let sysmon_tick_seconds = hist(&r, SYSMON_TICK_SECONDS, "Sysmon tick duration")?;
 
+        let backup_duration_seconds = int_gauge(&r, BACKUP_DURATION_SECONDS, "Duration of the last good backup")?;
+        let backup_last_success_timestamp =
+            int_gauge(&r, BACKUP_LAST_SUCCESS_TIMESTAMP, "Unix time of the last good backup")?;
+        let backup_peak_wal_bytes = int_gauge(
+            &r,
+            BACKUP_PEAK_WAL_BYTES,
+            "Largest WAL after a snapshot in the last backup",
+        )?;
         let mem_budget_bytes = int_gauge(&r, MEM_BUDGET_BYTES, "Memory budget")?;
         let mem_committed_bytes = gauge_vec_int(&r, MEM_COMMITTED_BYTES, "Committed bytes by category", &["category"])?;
         let mem_rss_bytes = int_gauge(&r, MEM_RSS_BYTES, "Process RSS")?;
@@ -350,9 +419,16 @@ impl Metrics {
             INGRESS_CONN_REJECTED_TOTAL,
             "Connections closed at accept by the per-IP connection cap",
         )?;
+        let ingress_rate_limited_total = counter_vec(
+            &r,
+            INGRESS_RATE_LIMITED_TOTAL,
+            "Requests refused by an ingress rate rule",
+            &["rule"],
+        )?;
         let egress_requests_total = counter_vec(&r, EGRESS_REQUESTS_TOTAL, "Guest egress requests", &["result"])?;
         let egress_bytes_total = int_counter(&r, EGRESS_BYTES_TOTAL, "Guest egress bytes")?;
 
+        let telemetry_sends_total = counter_vec(&r, TELEMETRY_SENDS_TOTAL, "Telemetry reports", &["result"])?;
         let schedule_fires_total = int_counter(&r, SCHEDULE_FIRES_TOTAL, "Schedule fires")?;
         let schedule_skipped_total = int_counter(&r, SCHEDULE_SKIPPED_TOTAL, "Skipped schedule fires")?;
         let schedule_denied_total = int_counter(
@@ -376,6 +452,45 @@ impl Metrics {
             &["outcome"],
         )?;
         let ws_closed_total = counter_vec(&r, WS_CLOSED_TOTAL, "Closed WebSockets by close code", &["code"])?;
+
+        let queue_throttled_total = int_counter(&r, QUEUE_THROTTLED_TOTAL, "Queue sends refused by rate or quota")?;
+        let pubsub_published_total = int_counter(&r, PUBSUB_PUBLISHED_TOTAL, "Pub/sub publishes accepted")?;
+        let pubsub_delivered_total = int_counter(&r, PUBSUB_DELIVERED_TOTAL, "Pub/sub deliveries started")?;
+        let pubsub_dropped_total = counter_vec(
+            &r,
+            PUBSUB_DROPPED_TOTAL,
+            "Pub/sub deliveries dropped, by reason",
+            &["reason"],
+        )?;
+        let stream_appended_total = int_counter(&r, STREAM_APPENDED_TOTAL, "Stream records appended")?;
+        let stream_delivered_total = int_counter(&r, STREAM_DELIVERED_TOTAL, "Stream records delivered to consumers")?;
+        let stream_dlq_total = int_counter(&r, STREAM_DLQ_TOTAL, "Stream records moved to a dead-letter store")?;
+        let stream_trimmed_total = int_counter(&r, STREAM_TRIMMED_TOTAL, "Stream records removed by retention")?;
+        let stream_skipped_total =
+            counter_vec(&r, STREAM_SKIPPED_TOTAL, "Stream cursor skips, by reason", &["reason"])?;
+        let async_accepted_total = int_counter(&r, ASYNC_ACCEPTED_TOTAL, "Async invocations accepted (202)")?;
+        let async_throttled_total = int_counter(
+            &r,
+            ASYNC_THROTTLED_TOTAL,
+            "Async invocation leases deferred by throttling",
+        )?;
+        let async_finished_total = counter_vec(
+            &r,
+            ASYNC_FINISHED_TOTAL,
+            "Async invocations finished, by condition",
+            &["condition"],
+        )?;
+        let async_failed_evicted_total = int_counter(
+            &r,
+            ASYNC_FAILED_EVICTED_TOTAL,
+            "Failed async invocation records evicted by the per-service cap",
+        )?;
+        let instance_keepalive_total = counter_vec(
+            &r,
+            INSTANCE_KEEPALIVE_TOTAL,
+            "Instance keep-alive decisions after an answer, by executor kind and outcome",
+            &["kind", "outcome"],
+        )?;
 
         let (service_requests_total, service_duration_seconds) = if opts.per_service {
             (
@@ -437,6 +552,7 @@ impl Metrics {
             build_seconds.with_label_values(&[kind]);
         }
         http_requests_total.with_label_values(&["public", "2xx"]).inc_by(0);
+        ingress_rate_limited_total.with_label_values(&["0"]).inc_by(0);
         for result in ["ok", "denied"] {
             egress_requests_total.with_label_values(&[result]).inc_by(0);
         }
@@ -453,6 +569,20 @@ impl Metrics {
             ws_event_tasks_total.with_label_values(&[outcome]).inc_by(0);
         }
         ws_closed_total.with_label_values(&["1000"]).inc_by(0);
+        for reason in ["fanout", "rejected", "no_task", "quota", "backlog"] {
+            pubsub_dropped_total.with_label_values(&[reason]).inc_by(0);
+        }
+        for reason in ["exhausted", "out_of_range"] {
+            stream_skipped_total.with_label_values(&[reason]).inc_by(0);
+        }
+        for condition in ["success", "retries_exhausted", "event_age_exceeded", "unreadable"] {
+            async_finished_total.with_label_values(&[condition]).inc_by(0);
+        }
+        for kind in ["deno", "wasm"] {
+            for outcome in ["kept", "handoff", "disposed", "reused", "expired", "shed"] {
+                instance_keepalive_total.with_label_values(&[kind, outcome]).inc_by(0);
+            }
+        }
 
         Ok(Arc::new(Metrics {
             registry: r,
@@ -469,6 +599,9 @@ impl Metrics {
             sched_hog_handoffs_total,
             sched_spinning_seconds_total,
             sysmon_tick_seconds,
+            backup_duration_seconds,
+            backup_last_success_timestamp,
+            backup_peak_wal_bytes,
             mem_budget_bytes,
             mem_committed_bytes,
             mem_rss_bytes,
@@ -488,7 +621,9 @@ impl Metrics {
             build_seconds,
             http_requests_total,
             ingress_conn_rejected_total,
+            ingress_rate_limited_total,
             egress_requests_total,
+            telemetry_sends_total,
             egress_bytes_total,
             schedule_fires_total,
             schedule_skipped_total,
@@ -502,6 +637,20 @@ impl Metrics {
             ws_messages_total,
             ws_event_tasks_total,
             ws_closed_total,
+            queue_throttled_total,
+            pubsub_published_total,
+            pubsub_delivered_total,
+            pubsub_dropped_total,
+            stream_appended_total,
+            stream_delivered_total,
+            stream_dlq_total,
+            stream_trimmed_total,
+            stream_skipped_total,
+            async_accepted_total,
+            async_throttled_total,
+            async_finished_total,
+            async_failed_evicted_total,
+            instance_keepalive_total,
             service_requests_total,
             service_duration_seconds,
             _gauge_vec: None,

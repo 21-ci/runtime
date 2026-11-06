@@ -136,7 +136,7 @@ fn curated_body(method: &str, path: &str) -> Option<(&'static str, Vec<u8>)> {
 /// control errors in the documented envelope.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ac_api_01_every_response_validates_against_the_openapi_schemas() {
-    let node = start_node().await;
+    let node = start_node_with(|c| c.backup.enabled = true).await;
     let doc = fetch_doc(&node).await;
 
     // Fixtures so that path parameters point at real resources.

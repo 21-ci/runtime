@@ -90,4 +90,4 @@ pub use rt_types::SchedSnapshot;
 pub use scheduler::{SchedError, Scheduler, SchedulerBuilder};
 pub use sim::{SimScheduler, SimStats, StepResult};
 pub use task::{TaskCanceller, TaskHandle, TaskState};
-pub use warm::{set_machine_rank, WarmKey, WarmSpread, WarmTarget, WarmTargets};
+pub use warm::{after_answer, set_machine_rank, AfterAnswer, Backlog, WarmKey, WarmSpread, WarmTarget, WarmTargets};

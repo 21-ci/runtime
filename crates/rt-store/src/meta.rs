@@ -13,10 +13,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rt_types::{
-    ApiKey, BuildFailure, BuildState, CompileMode, Digest, Etag, EventId, HostMapping, HostStatus, KeyId, NewKey,
-    NewProject, NewSchedule, NewService, NewTenant, NewVersion, NodeEvent, Profile, Project, ProjectId, ProjectPatch,
-    RouteEntry, RouteSnapshot, Schedule, ScheduleId, ScheduleKind, SecretsVersion, Service, ServiceConfig, ServiceId,
-    ServicePatch, Tenant, TenantId, UnixMs, UsageBatch, Version, VersionNo,
+    ApiKey, BuildFailure, BuildState, CompileMode, Digest, Etag, EventId, HostMapping, HostStatus, KeyId,
+    MigrationEntry, MigrationFile, NewKey, NewProject, NewSchedule, NewService, NewSwitch, NewTenant, NewVersion,
+    NodeEvent, Profile, Project, ProjectId, ProjectPatch, RouteEntry, RouteSnapshot, Schedule, ScheduleId,
+    ScheduleKind, SecretsVersion, Service, ServiceConfig, ServiceId, ServicePatch, Switch, SwitchId, SwitchKind,
+    SwitchPatch, SwitchState, Tenant, TenantId, UnixMs, UsageBatch, Version, VersionNo, VersionOrigin,
 };
 use rt_types::{
     GrantEffect, GrantScope, NewSdkRelease, Sdk, SdkChannel, SdkGrant, SdkRelease, SdkSnapshot, SdkState, SdkTarget,
@@ -30,7 +31,34 @@ use crate::sqlutil::{
 };
 
 /// Forward-only migrations: `(version, sql)`. The newest version is the schema version.
-pub const MIGRATIONS: &[(u32, &str)] = &[(1, include_str!("../migrations/meta_0001_init.sql"))];
+pub const MIGRATIONS: &[(u32, &str)] = &[
+    (1, include_str!("../migrations/meta_0001_init.sql")),
+    (2, include_str!("../migrations/meta_0002_switches.sql")),
+    (3, include_str!("../migrations/meta_0003_backups.sql")),
+    (4, include_str!("../migrations/meta_0004_version_migrations.sql")),
+    (5, include_str!("../migrations/meta_0005_version_deploy.sql")),
+    (6, include_str!("../migrations/meta_0006_pending_imports.sql")),
+    (7, include_str!("../migrations/meta_0007_secret_refs.sql")),
+    (8, include_str!("../migrations/meta_0008_telemetry.sql")),
+];
+
+/// The persisted part of the anonymous daily report.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TelemetryState {
+    pub install_id: Option<String>,
+    pub first_start_ms: Option<i64>,
+    pub last_sent_ms: Option<i64>,
+    pub console_users: Option<u64>,
+    pub console_users_at: Option<i64>,
+}
+
+/// Counts of the daily report, without the system tenant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TelemetryCounts {
+    pub projects: u64,
+    pub services: u64,
+    pub organizations: u64,
+}
 
 /// Whose view a call has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +112,10 @@ pub struct ServiceFilter {
     pub project_ids: Option<Vec<ProjectId>>,
     /// A key's scope: only services in these environments (`None` = any environment).
     pub environments: Option<Vec<String>>,
+    /// Leave out branches and previews. An exact `slug` always finds its service.
+    pub hide_scratch: bool,
+    /// Only the scratch services of this parent.
+    pub scratch_of: Option<ServiceId>,
 }
 
 /// A tenant-wide bound on warm floors: `scaling.min_instances` summed over the tenant's services,
@@ -158,6 +190,27 @@ pub struct HostRelease {
     pub released_at_ms: UnixMs,
 }
 
+/// A secret whose value is synced from an external source (R15).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecretRef {
+    pub service: ServiceId,
+    pub name: String,
+    pub path: String,
+    pub field: String,
+    pub kv_version: Option<i64>,
+    pub last_synced_at_ms: Option<UnixMs>,
+    pub last_error: Option<String>,
+}
+
+/// A [`SecretRef`] with the service facts its full path is built from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecretRefTarget {
+    pub secret: SecretRef,
+    pub tenant: TenantId,
+    pub project: ProjectId,
+    pub environment: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecretMeta {
     pub name: String,
@@ -175,6 +228,17 @@ pub struct UsageRow {
     pub cpu_ms: u64,
     pub egress_bytes: u64,
     pub storage_bytes: i64,
+}
+
+/// What a tenant holds right now ([`MetaStore::tenant_counts`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TenantCounts {
+    pub projects: u64,
+    pub custom_hosts: u64,
+    pub branches: u64,
+    pub previews: u64,
+    /// Most secrets any one service of the tenant has.
+    pub busiest_service_secrets: u64,
 }
 
 #[async_trait]
@@ -283,6 +347,21 @@ pub trait MetaStore: Send + Sync {
         self.create_service_capped(scope, tenant, s, cap).await
     }
     // LCOV_EXCL_STOP
+    /// [`Self::create_service_limited`] for a preview, also under `max_scratch` previews
+    /// (`Conflict("scratch_limit")`; 0 = no limit), in the same transaction.
+    // LCOV_EXCL_START: trait default body; the SQLite store overrides it, so only other implementors reach it
+    async fn create_preview_limited(
+        &self,
+        scope: TenantScope,
+        tenant: TenantId,
+        s: NewService,
+        cap: WarmFloorCap,
+        max_services: u32,
+        _max_scratch: u32,
+    ) -> Result<Service> {
+        self.create_service_limited(scope, tenant, s, cap, max_services).await
+    }
+    // LCOV_EXCL_STOP
     async fn get_service(&self, scope: TenantScope, id: ServiceId) -> Result<Option<Service>>;
     /// `filter.slug` supports `GET /v1/services?slug=<slug>` (contracts C-9).
     async fn list_services(&self, scope: TenantScope, filter: ServiceFilter, page: PageReq) -> Result<Page<Service>>;
@@ -308,8 +387,63 @@ pub trait MetaStore: Send + Sync {
         cap: WarmFloorCap,
     ) -> Result<Service>;
     async fn delete_service(&self, scope: TenantScope, id: ServiceId, keep_data: bool) -> Result<()>;
+    /// Scratch services whose `expires_at` has passed, at most `limit`, of any tenant.
+    async fn expired_scratch(&self, now: UnixMs, limit: u32) -> Result<Vec<Service>>;
+    /// Add `environment` to the project (one transaction, so concurrent adds keep each other's).
+    /// `true` when it was added here; a project past its environment cap is `Invalid`.
+    async fn add_project_environment(&self, tenant: TenantId, project: &str, environment: &str) -> Result<bool>;
+    /// Remove `environment` from the project unless a service is still in it.
+    async fn drop_project_environment(&self, tenant: TenantId, project: &str, environment: &str) -> Result<()>;
 
     async fn add_version(&self, id: ServiceId, v: NewVersion) -> Result<Version>;
+    /// [`MetaStore::add_version`] with the validator's list of migrations, in one transaction.
+    async fn add_version_with_migrations(
+        &self,
+        id: ServiceId,
+        v: NewVersion,
+        files: Vec<MigrationFile>,
+    ) -> Result<Version>;
+    /// Give a version with no list one (WASM, which has no source tree). Write-once:
+    /// `Conflict("migrations_already_set")`, also for an adopted version; `Conflict("version_is_live")`.
+    async fn set_version_migrations(&self, id: ServiceId, v: VersionNo, files: Vec<MigrationFile>) -> Result<()>;
+    /// The SQL of a version's migrations; empty without any.
+    async fn version_migration_files(&self, id: ServiceId, v: VersionNo) -> Result<Vec<MigrationFile>>;
+    /// Record what a deploy says about a new version: its claimed `meta` and, for
+    /// `activate: "after_build"`, who asked to make it live.
+    async fn set_version_deploy(
+        &self,
+        id: ServiceId,
+        v: VersionNo,
+        meta: Option<serde_json::Value>,
+        activate_by: Option<String>,
+    ) -> Result<()>;
+    /// Take the next number for a version whose archive is about to be fetched (`from-url`): no
+    /// source yet, shown as `fetching`, refused by flips and left alone by version GC.
+    async fn reserve_fetching_version(&self, id: ServiceId) -> Result<Version>;
+    /// Give a `fetching` version its source; it goes on as an upload would. `NotFound` unless it is
+    /// still `fetching` (the service was deleted).
+    async fn fill_fetching_version(
+        &self,
+        id: ServiceId,
+        n: VersionNo,
+        v: NewVersion,
+        files: Vec<MigrationFile>,
+    ) -> Result<Version>;
+    /// At startup: the tasks of `fetching` versions died with the process. They become `failed`
+    /// (`fetch_failed`) and any `after_build` activation is dropped. Returns how many.
+    async fn fail_interrupted_fetches(&self) -> Result<u64>;
+    /// Before an import creates its service: a durable note, so that a crash leaves no half service.
+    async fn import_begin(&self, tenant: TenantId, slug: String) -> Result<String>;
+    /// The import's service exists.
+    async fn import_bind(&self, import: String, service: ServiceId) -> Result<()>;
+    /// The import ended, either way.
+    async fn import_end(&self, import: String) -> Result<()>;
+    /// Imports left open, with the service each made. A note without a bound service names one only
+    /// if it matches the slug, is at least as new as the note and has no versions: a service that
+    /// was there before the import never qualifies.
+    async fn open_imports(&self) -> Result<Vec<(String, Option<ServiceId>)>>;
+    /// Clear and return the pending `after_build` activation: exactly one caller gets it.
+    async fn take_version_activation(&self, id: ServiceId, v: VersionNo) -> Result<Option<String>>;
     async fn get_version(&self, id: ServiceId, v: VersionNo) -> Result<Option<Version>>;
     async fn list_versions(&self, id: ServiceId) -> Result<Vec<Version>>;
     async fn set_build_state(
@@ -327,7 +461,39 @@ pub trait MetaStore: Send + Sync {
     /// Delete old versions beyond `keep` (never `live`); returns the artifact digests nothing
     /// references any more: sources, their `rt.lock`s, and the vendored modules of those locks
     /// that no remaining lock lists ([`MetaStore::record_lock_modules`]).
+    /// The `from_version` of the service's last 3 switches is kept too (rollback targets).
     async fn gc_versions(&self, id: ServiceId, keep: u32) -> Result<Vec<Digest>>;
+    /// Add to `parent` a version with the digests of `source`'s version, read here and never
+    /// taken from a caller. Reuses the row when that origin was already adopted. `NotFound` when
+    /// `source` is missing or in another tenant or project, `Conflict("version_not_ready")` unless
+    /// the source is `ready`, `Conflict("runtime_mismatch")` across runtimes.
+    async fn adopt_version(&self, parent: ServiceId, source: ServiceId, source_version: VersionNo) -> Result<Version>;
+    /// Start a tracked flip in `preparing`. `NotFound` without the service or `to_version`,
+    /// `Conflict("switch_in_progress")` while another is `preparing` or `migrating`.
+    async fn create_switch(&self, id: ServiceId, s: NewSwitch) -> Result<Switch>;
+    /// The commit point of a flip, one writer transaction: the row's `to_version` becomes live and
+    /// the row records what was live before. With another version to wait for the row is
+    /// `draining` until `drain_deadline_ms`; otherwise (nothing live before, or the same version)
+    /// it is `completed`. Refusals change nothing: the errors of [`MetaStore::set_live`],
+    /// `NotFound` unless the switch belongs to `id`, `Conflict("switch_not_open")` unless the row
+    /// is `preparing` or `migrating`.
+    async fn flip_switch(
+        &self,
+        id: ServiceId,
+        switch: SwitchId,
+        if_match: Option<Etag>,
+        drain_deadline_ms: UnixMs,
+    ) -> Result<(Service, Switch)>;
+    /// `NotFound` unless the switch belongs to `id`.
+    async fn update_switch(&self, id: ServiceId, switch: SwitchId, patch: SwitchPatch) -> Result<Switch>;
+    /// `None` unless the switch belongs to `id`.
+    async fn get_switch(&self, id: ServiceId, switch: SwitchId) -> Result<Option<Switch>>;
+    /// Newest first; the cursor is the last id returned.
+    async fn list_switches(&self, id: ServiceId, page: PageReq) -> Result<Page<Switch>>;
+    /// At startup, close what a crash left open: `preparing|migrating` become `failed` with
+    /// `error = interrupted`, `draining` becomes `completed`, both flagged `interrupted`. The live
+    /// version is not touched. Returns how many rows changed.
+    async fn recover_switches(&self) -> Result<u64>;
     /// True while any version (source or lock) or any recorded lock (module) still references
     /// `digest` (artifact refcount is computed live).
     async fn digest_referenced(&self, digest: &Digest) -> Result<bool>;
@@ -369,6 +535,22 @@ pub trait MetaStore: Send + Sync {
     async fn delete_secret(&self, id: ServiceId, name: &str) -> Result<SecretsVersion>;
     async fn get_sealed_secrets(&self, id: ServiceId) -> Result<Vec<(String, Vec<u8>)>>;
     async fn secrets_version(&self, id: ServiceId) -> Result<SecretsVersion>;
+    /// Make secret `name` follow `path` and `field`.
+    async fn put_secret_ref(&self, id: ServiceId, name: &str, path: &str, field: &str) -> Result<()>;
+    /// `false` when it was no ref. The sealed value stays.
+    async fn delete_secret_ref(&self, id: ServiceId, name: &str) -> Result<bool>;
+    async fn list_secret_refs(&self, id: ServiceId) -> Result<Vec<SecretRef>>;
+    /// Record a sync's outcome. `synced` also clears the error; an error leaves the last sync time.
+    async fn set_secret_ref_status(
+        &self,
+        id: ServiceId,
+        name: &str,
+        kv_version: Option<i64>,
+        synced_at_ms: Option<UnixMs>,
+        error: Option<&str>,
+    ) -> Result<()>;
+    /// Refs after `after`, in (service, name) order, for the sync's round robin.
+    async fn scan_secret_refs(&self, after: Option<(ServiceId, String)>, limit: u32) -> Result<Vec<SecretRefTarget>>;
 
     // ---- hosts -------------------------------------------------------------------------------
     async fn put_host(&self, h: HostMapping) -> Result<()>;
@@ -391,6 +573,8 @@ pub trait MetaStore: Send + Sync {
     async fn prune_host_releases(&self, released_before_ms: UnixMs) -> Result<u64>;
     /// Pending claims held by `tenant`'s services (`hosts.max_pending_per_tenant`).
     async fn count_pending_hosts(&self, tenant: TenantId) -> Result<u64>;
+    /// What a tenant holds, for control-time plan caps and `GET /v1/usage`.
+    async fn tenant_counts(&self, tenant: TenantId) -> Result<TenantCounts>;
 
     // ---- schedules ---------------------------------------------------------------------------
     async fn create_schedule(&self, id: ServiceId, s: NewSchedule) -> Result<Schedule>;
@@ -430,8 +614,33 @@ pub trait MetaStore: Send + Sync {
     async fn append_event(&self, ev: NodeEvent) -> Result<()>;
     async fn list_events(&self, service: ServiceId, page: PageReq) -> Result<Page<NodeEvent>>;
     async fn event_by_id(&self, id: EventId) -> Result<Option<NodeEvent>>;
+    /// Events of the whole node after the id `after`, oldest first, optionally of these `kinds`
+    /// only. One read over the primary key; `next_cursor` is the last id returned.
+    // LCOV_EXCL_START: trait default body; the SQLite store overrides it, so only other implementors reach it
+    async fn list_events_after(
+        &self,
+        after: Option<String>,
+        kinds: Vec<String>,
+        limit: u32,
+    ) -> Result<Page<NodeEvent>> {
+        let _ = (after, kinds, limit);
+        Ok(Page {
+            items: Vec::new(),
+            next_cursor: None,
+        })
+    }
+    // LCOV_EXCL_STOP
     async fn save_cache_freq(&self, snapshot: Vec<u8>) -> Result<()>;
     async fn load_cache_freq(&self) -> Result<Option<Vec<u8>>>;
+
+    async fn telemetry_state(&self) -> Result<TelemetryState>;
+    /// Record the first start once and return the state.
+    async fn telemetry_note_start(&self, now_ms: i64) -> Result<TelemetryState>;
+    /// Store `candidate` unless an id exists; the id in force either way.
+    async fn telemetry_install_id(&self, candidate: String) -> Result<String>;
+    async fn telemetry_mark_sent(&self, now_ms: i64) -> Result<()>;
+    async fn telemetry_set_console_users(&self, users: u64, now_ms: i64) -> Result<()>;
+    async fn telemetry_counts(&self) -> Result<TelemetryCounts>;
 }
 
 /// Read-only connections of a file-backed `meta.db` ([`SqliteMetaStore::open`]).
@@ -441,12 +650,94 @@ pub const META_READERS: usize = 4;
 /// connection); reads run on [`META_READERS`] read-only connections, each on its own thread, so
 /// the control API, route snapshots and usage flushes do not serialize behind each other (WAL).
 pub struct SqliteMetaStore {
-    db: Arc<Db>,
+    pub(crate) db: Arc<Db>,
     /// Bumped by every write; reported as `RouteSnapshot::generation`.
     generation: Arc<AtomicU64>,
 }
 
 impl SqliteMetaStore {
+    /// The count and the insert are one transaction, so concurrent creates cannot overshoot.
+    async fn insert_service(
+        &self,
+        scope: TenantScope,
+        tenant: TenantId,
+        s: NewService,
+        cap: WarmFloorCap,
+        max_services: u32,
+        max_scratch: u32,
+    ) -> Result<Service> {
+        if let TenantScope::Tenant(t) = scope {
+            if t != tenant {
+                return Err(StoreError::NotFound);
+            }
+        }
+        if s.slug.is_empty() {
+            return Err(StoreError::Invalid("slug is empty".into()));
+        }
+        if !rt_types::valid_environment(&s.environment) {
+            return Err(StoreError::Invalid(
+                "environment must match ^[a-z][a-z0-9-]{0,31}$".into(),
+            ));
+        }
+        self.write(move |c| {
+            require_tenant(c, tenant)?;
+            if max_services > 0 {
+                let n: i64 = c.query_row("SELECT count(*) FROM services WHERE tenant_id = ?1", [tenant.to_string()], |r| r.get(0))?;
+                if u64::try_from(n).unwrap_or(u64::MAX) >= u64::from(max_services) {
+                    return Err(StoreError::Conflict("quota_exceeded"));
+                }
+            }
+            if max_scratch > 0 {
+                let n: i64 = c.query_row(
+                    "SELECT count(*) FROM services WHERE tenant_id = ?1 AND json_extract(config, '$.scratch.kind') = 'preview'",
+                    [tenant.to_string()],
+                    |r| r.get(0),
+                )?;
+                if u64::try_from(n).unwrap_or(u64::MAX) >= u64::from(max_scratch) {
+                    return Err(StoreError::Conflict("scratch_limit"));
+                }
+            }
+            check_warm_floor_total(c, tenant, None, s.config.scaling.min_instances.unwrap_or(0), cap)?;
+            let now = now_ms();
+            let project = project_for_service(c, tenant, &s.project, &s.environment)?;
+            let svc = Service {
+                id: ServiceId::new(),
+                tenant_id: tenant,
+                slug: s.slug,
+                runtime: s.runtime,
+                name: s.name,
+                profile: s.profile,
+                environment: s.environment,
+                project_id: project.id,
+                project: project.slug.clone(),
+                config: s.config,
+                live_version: None,
+                etag: Etag(1),
+                created_at_ms: now,
+                updated_at_ms: now,
+            };
+            c.execute(
+                "INSERT INTO services (id, tenant_id, slug, runtime, name, profile, config, etag, created_at, updated_at, environment, project_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8, ?9, ?10)",
+                params![
+                    svc.id.to_string(),
+                    tenant.to_string(),
+                    svc.slug,
+                    svc.runtime.as_str(),
+                    svc.name,
+                    svc.profile.map(Profile::as_str),
+                    to_json(&svc.config)?,
+                    now,
+                    svc.environment,
+                    svc.project_id.to_string()
+                ],
+            )
+            .map_err(|e| if is_unique_violation(&e) { StoreError::Conflict("slug_taken") } else { e.into() })?;
+            Ok(svc)
+        })
+        .await
+    }
+
     /// Make the next operations of this store fail as `faults` plans (tests, TK-002).
     pub fn inject_faults(&self, faults: Arc<crate::faults::Faults>) {
         self.db.inject_faults(faults);
@@ -629,7 +920,124 @@ fn project_row(r: &Row<'_>) -> rusqlite::Result<Project> {
 }
 
 const VERSION_COLS: &str =
-    "service_id, number, source_digest, lock_digest, build_state, pending_reason, failure, created_at, bundle_digest";
+    "service_id, number, source_digest, lock_digest, build_state, pending_reason, failure, created_at, bundle_digest, origin, migrations, meta";
+
+const SWITCH_COLS: &str = "id, service_id, kind, state, source_service, source_version, from_version, to_version, \
+     error, interrupted, drain_deadline, created_by, created_at, updated_at";
+
+fn switch_kind_str(k: SwitchKind) -> &'static str {
+    match k {
+        SwitchKind::Promote => "promote",
+        SwitchKind::Switch => "switch",
+        SwitchKind::Rollback => "rollback",
+    }
+}
+
+/// The live flag and the service's etag, inside the caller's transaction.
+fn set_live_tx(c: &Connection, id: ServiceId, v: VersionNo, if_match: Option<Etag>) -> Result<Service> {
+    let cur = require_service(c, id)?;
+    if if_match.is_some_and(|e| e != cur.etag) {
+        return Err(StoreError::PreconditionFailed);
+    }
+    let state: Option<(String, Option<String>)> = c
+        .query_row(
+            "SELECT build_state, pending_reason FROM versions WHERE service_id = ?1 AND number = ?2",
+            params![id.to_string(), v.0],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match state {
+        None => return Err(StoreError::NotFound),
+        Some((state, reason)) => {
+            if state == "failed" || reason.as_deref() == Some(rt_types::PENDING_FETCHING) {
+                return Err(StoreError::Conflict("version_not_ready"));
+            }
+        }
+    }
+    let now = now_ms();
+    // One live version per service (`versions_one_live`): clear the old flag first.
+    c.execute(
+        "UPDATE versions SET is_live = 0 WHERE service_id = ?1 AND is_live = 1",
+        [id.to_string()],
+    )?;
+    c.execute(
+        "UPDATE versions SET is_live = 1 WHERE service_id = ?1 AND number = ?2",
+        params![id.to_string(), v.0],
+    )?;
+    c.execute(
+        "UPDATE services SET etag = etag + 1, updated_at = ?2 WHERE id = ?1",
+        params![id.to_string(), now],
+    )?;
+    Ok(Service {
+        live_version: Some(v),
+        etag: Etag(cur.etag.0 + 1),
+        updated_at_ms: now,
+        ..cur
+    })
+}
+
+fn switch_state_str(s: SwitchState) -> &'static str {
+    match s {
+        SwitchState::Preparing => "preparing",
+        SwitchState::Migrating => "migrating",
+        SwitchState::Draining => "draining",
+        SwitchState::Completed => "completed",
+        SwitchState::DrainTimedOut => "drain_timed_out",
+        SwitchState::Failed => "failed",
+    }
+}
+
+fn switch_row(r: &Row<'_>) -> rusqlite::Result<Switch> {
+    let kind = match r.get::<_, String>(2)?.as_str() {
+        "promote" => SwitchKind::Promote,
+        "switch" => SwitchKind::Switch,
+        "rollback" => SwitchKind::Rollback,
+        // LCOV_EXCL_START: the column's CHECK admits only the names above
+        other => return Err(bad_col(2, format!("unknown switch kind `{other}`"))),
+        // LCOV_EXCL_STOP
+    };
+    let state = match r.get::<_, String>(3)?.as_str() {
+        "preparing" => SwitchState::Preparing,
+        "migrating" => SwitchState::Migrating,
+        "draining" => SwitchState::Draining,
+        "completed" => SwitchState::Completed,
+        "drain_timed_out" => SwitchState::DrainTimedOut,
+        "failed" => SwitchState::Failed,
+        // LCOV_EXCL_START: the column's CHECK admits only the names above
+        other => return Err(bad_col(3, format!("unknown switch state `{other}`"))),
+        // LCOV_EXCL_STOP
+    };
+    let source = match (r.get::<_, Option<String>>(4)?, r.get::<_, Option<i64>>(5)?) {
+        (Some(service), Some(version)) => Some(VersionOrigin {
+            service: parse_col(&service, 4)?,
+            version: VersionNo(version as u32),
+        }),
+        _ => None,
+    };
+    Ok(Switch {
+        id: parse_col(&r.get::<_, String>(0)?, 0)?,
+        service_id: parse_col(&r.get::<_, String>(1)?, 1)?,
+        kind,
+        state,
+        source,
+        from_version: r.get::<_, Option<i64>>(6)?.map(|v| VersionNo(v as u32)),
+        to_version: VersionNo(r.get::<_, i64>(7)? as u32),
+        error: r.get(8)?,
+        interrupted: r.get::<_, i64>(9)? != 0,
+        drain_deadline_ms: r.get(10)?,
+        created_by: r.get(11)?,
+        created_at_ms: r.get(12)?,
+        updated_at_ms: r.get(13)?,
+    })
+}
+
+fn active_switch_conflict(e: rusqlite::Error) -> StoreError {
+    if is_unique_violation(&e) {
+        StoreError::Conflict("switch_in_progress")
+    } else {
+        e.into() // LCOV_EXCL_LINE: a constraint other than the active index cannot fail on these rows
+    }
+}
 
 fn state_str(s: BuildState) -> &'static str {
     match s {
@@ -648,6 +1056,15 @@ fn state_from(s: &str, col: usize) -> rusqlite::Result<BuildState> {
         "failed" => Ok(BuildState::Failed),
         other => Err(bad_col(col, format!("unknown build state `{other}`"))),
     }
+}
+
+/// The two columns of a list of migrations: `NULL` for none.
+fn migration_cols(files: &[MigrationFile]) -> Result<(Option<String>, Option<String>)> {
+    if files.is_empty() {
+        return Ok((None, None));
+    }
+    let list: Vec<MigrationEntry> = files.iter().map(MigrationFile::entry).collect();
+    Ok((Some(to_json(&list)?), Some(to_json(&files)?)))
 }
 
 fn version_row(r: &Row<'_>) -> rusqlite::Result<Version> {
@@ -669,6 +1086,19 @@ fn version_row(r: &Row<'_>) -> rusqlite::Result<Version> {
         bundle_digest: r
             .get::<_, Option<String>>(8)?
             .map(|d| parse_col::<Digest>(&d, 8))
+            .transpose()?,
+        origin: r
+            .get::<_, Option<String>>(9)?
+            .map(|o| json_col::<VersionOrigin>(&o, 9))
+            .transpose()?,
+        migrations: r
+            .get::<_, Option<String>>(10)?
+            .map(|m| json_col::<Vec<MigrationEntry>>(&m, 10))
+            .transpose()?
+            .unwrap_or_default(),
+        meta: r
+            .get::<_, Option<String>>(11)?
+            .map(|m| json_col::<serde_json::Value>(&m, 11))
             .transpose()?,
     })
 }
@@ -1097,6 +1527,21 @@ fn project_by_ref(c: &Connection, tenant: TenantId, project: &str) -> Result<Opt
     }
 }
 
+fn secret_ref_row(r: &Row<'_>) -> rusqlite::Result<SecretRef> {
+    let id: String = r.get(0)?;
+    Ok(SecretRef {
+        service: id
+            .parse()
+            .map_err(|_| rusqlite::Error::InvalidColumnType(0, "id".into(), rusqlite::types::Type::Text))?,
+        name: r.get(1)?,
+        path: r.get(2)?,
+        field: r.get(3)?,
+        kv_version: r.get(4)?,
+        last_synced_at_ms: r.get(5)?,
+        last_error: r.get(6)?,
+    })
+}
+
 /// Adds one to the generation of the service's env and secrets.
 fn bump_secrets_version(c: &Connection, id: ServiceId) -> Result<SecretsVersion> {
     c.execute(
@@ -1513,66 +1958,20 @@ impl MetaStore for SqliteMetaStore {
         cap: WarmFloorCap,
         max_services: u32,
     ) -> Result<Service> {
-        if let TenantScope::Tenant(t) = scope {
-            if t != tenant {
-                return Err(StoreError::NotFound);
-            }
-        }
-        if s.slug.is_empty() {
-            return Err(StoreError::Invalid("slug is empty".into()));
-        }
-        if !rt_types::valid_environment(&s.environment) {
-            return Err(StoreError::Invalid(
-                "environment must match ^[a-z][a-z0-9-]{0,31}$".into(),
-            ));
-        }
-        self.write(move |c| {
-            require_tenant(c, tenant)?;
-            if max_services > 0 {
-                let n: i64 = c.query_row("SELECT count(*) FROM services WHERE tenant_id = ?1", [tenant.to_string()], |r| r.get(0))?;
-                if u64::try_from(n).unwrap_or(u64::MAX) >= u64::from(max_services) {
-                    return Err(StoreError::Conflict("quota_exceeded"));
-                }
-            }
-            check_warm_floor_total(c, tenant, None, s.config.scaling.min_instances.unwrap_or(0), cap)?;
-            let now = now_ms();
-            let project = project_for_service(c, tenant, &s.project, &s.environment)?;
-            let svc = Service {
-                id: ServiceId::new(),
-                tenant_id: tenant,
-                slug: s.slug,
-                runtime: s.runtime,
-                name: s.name,
-                profile: s.profile,
-                environment: s.environment,
-                project_id: project.id,
-                project: project.slug.clone(),
-                config: s.config,
-                live_version: None,
-                etag: Etag(1),
-                created_at_ms: now,
-                updated_at_ms: now,
-            };
-            c.execute(
-                "INSERT INTO services (id, tenant_id, slug, runtime, name, profile, config, etag, created_at, updated_at, environment, project_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8, ?9, ?10)",
-                params![
-                    svc.id.to_string(),
-                    tenant.to_string(),
-                    svc.slug,
-                    svc.runtime.as_str(),
-                    svc.name,
-                    svc.profile.map(Profile::as_str),
-                    to_json(&svc.config)?,
-                    now,
-                    svc.environment,
-                    svc.project_id.to_string()
-                ],
-            )
-            .map_err(|e| if is_unique_violation(&e) { StoreError::Conflict("slug_taken") } else { e.into() })?;
-            Ok(svc)
-        })
-        .await
+        self.insert_service(scope, tenant, s, cap, max_services, 0).await
+    }
+
+    async fn create_preview_limited(
+        &self,
+        scope: TenantScope,
+        tenant: TenantId,
+        s: NewService,
+        cap: WarmFloorCap,
+        max_services: u32,
+        max_scratch: u32,
+    ) -> Result<Service> {
+        self.insert_service(scope, tenant, s, cap, max_services, max_scratch)
+            .await
     }
 
     async fn get_service(&self, scope: TenantScope, id: ServiceId) -> Result<Option<Service>> {
@@ -1589,6 +1988,7 @@ impl MetaStore for SqliteMetaStore {
                     sql.push_str(" AND tenant_id = ?");
                     args.push(Box::new(t.to_string()));
                 }
+                let has_slug = filter.slug.is_some();
                 if let Some(slug) = filter.slug {
                     sql.push_str(" AND slug = ?");
                     args.push(Box::new(slug));
@@ -1611,6 +2011,13 @@ impl MetaStore for SqliteMetaStore {
                 if let Some(envs) = &filter.environments {
                     sql.push_str(" AND environment IN (SELECT value FROM json_each(?))");
                     args.push(Box::new(to_json(envs)?));
+                }
+                if filter.hide_scratch && !has_slug {
+                    sql.push_str(" AND json_extract(config, '$.scratch') IS NULL");
+                }
+                if let Some(of) = filter.scratch_of {
+                    sql.push_str(" AND json_extract(config, '$.scratch.of') = ?");
+                    args.push(Box::new(of.to_string()));
                 }
                 sql.push_str(" ORDER BY id LIMIT ?");
                 args.push(Box::new(limit as i64 + 1));
@@ -1707,6 +2114,13 @@ impl MetaStore for SqliteMetaStore {
             if let Some(v) = patch.ws {
                 config.ws = v;
             }
+            if let Some(v) = patch.events {
+                config.events = v;
+            }
+            if let Some(v) = patch.async_invoke {
+                config.async_invoke = v;
+            }
+            config.enforce_scratch_policy();
             if patch.environment.as_deref().is_some_and(|e| !rt_types::valid_environment(e)) {
                 return Err(StoreError::Invalid("environment must match ^[a-z][a-z0-9-]{0,31}$".into()));
             }
@@ -1740,6 +2154,66 @@ impl MetaStore for SqliteMetaStore {
         .await
     }
 
+    async fn expired_scratch(&self, now: UnixMs, limit: u32) -> Result<Vec<Service>> {
+        self.db
+            .read(move |c| {
+                let sql = format!(
+                    "SELECT {SERVICE_COLS} FROM services WHERE json_extract(config, '$.scratch.expires_at') <= ?1 \
+                     ORDER BY id LIMIT ?2"
+                );
+                let rows = c
+                    .prepare_cached(&sql)?
+                    .query_map(params![now, i64::from(limit)], service_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    async fn add_project_environment(&self, tenant: TenantId, project: &str, environment: &str) -> Result<bool> {
+        let (project, environment) = (project.to_string(), environment.to_string());
+        self.write(move |c| {
+            let cur = match project_by_slug(c, tenant, &project)? {
+                Some(p) => p,
+                None if project == rt_types::DEFAULT_PROJECT => {
+                    let p = default_project_row(tenant, now_ms());
+                    insert_project(c, &p)?;
+                    p
+                }
+                None => return Err(StoreError::NotFound),
+            };
+            if cur.environments.contains(&environment) {
+                return Ok(false);
+            }
+            let mut envs = cur.environments;
+            envs.push(environment);
+            rt_types::check_project_environments(&envs).map_err(StoreError::Invalid)?;
+            set_project_environments(c, cur.id, &envs)?;
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn drop_project_environment(&self, tenant: TenantId, project: &str, environment: &str) -> Result<()> {
+        let (project, environment) = (project.to_string(), environment.to_string());
+        self.write(move |c| {
+            let Some(cur) = project_by_slug(c, tenant, &project)? else {
+                return Ok(());
+            };
+            let used: i64 = c.query_row(
+                "SELECT count(*) FROM services WHERE project_id = ?1 AND environment = ?2",
+                params![cur.id.to_string(), environment],
+                |r| r.get(0),
+            )?;
+            if used > 0 || !cur.environments.contains(&environment) {
+                return Ok(());
+            }
+            let envs: Vec<String> = cur.environments.into_iter().filter(|e| *e != environment).collect();
+            set_project_environments(c, cur.id, &envs)
+        })
+        .await
+    }
+
     async fn delete_service(&self, scope: TenantScope, id: ServiceId, _keep_data: bool) -> Result<()> {
         // `keep_data` concerns files owned by the data store / queue; metadata always goes.
         self.write(move |c| {
@@ -1752,6 +2226,60 @@ impl MetaStore for SqliteMetaStore {
     }
 
     async fn add_version(&self, id: ServiceId, v: NewVersion) -> Result<Version> {
+        self.add_version_with_migrations(id, v, Vec::new()).await
+    }
+
+    async fn set_version_migrations(&self, id: ServiceId, v: VersionNo, files: Vec<MigrationFile>) -> Result<()> {
+        self.write(move |c| {
+            require_service(c, id)?;
+            let key = id.to_string();
+            let (list, live, origin): (Option<String>, bool, Option<String>) = c
+                .query_row(
+                    "SELECT migrations, is_live, origin FROM versions WHERE service_id = ?1 AND number = ?2",
+                    params![key, v.0],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?
+                .ok_or(StoreError::NotFound)?;
+            if list.is_some() || origin.is_some() {
+                return Err(StoreError::Conflict("migrations_already_set"));
+            }
+            if live {
+                return Err(StoreError::Conflict("version_is_live"));
+            }
+            let (list, sql) = migration_cols(&files)?;
+            c.execute(
+                "UPDATE versions SET migrations = ?3, migrations_sql = ?4 WHERE service_id = ?1 AND number = ?2",
+                params![key, v.0, list, sql],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn version_migration_files(&self, id: ServiceId, v: VersionNo) -> Result<Vec<MigrationFile>> {
+        self.write(move |c| {
+            let sql: Option<Option<String>> = c
+                .query_row(
+                    "SELECT migrations_sql FROM versions WHERE service_id = ?1 AND number = ?2",
+                    params![id.to_string(), v.0],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match sql.ok_or(StoreError::NotFound)? {
+                Some(text) => serde_json::from_str(&text).map_err(|e| StoreError::Corrupt(e.to_string())),
+                None => Ok(Vec::new()),
+            }
+        })
+        .await
+    }
+
+    async fn add_version_with_migrations(
+        &self,
+        id: ServiceId,
+        v: NewVersion,
+        files: Vec<MigrationFile>,
+    ) -> Result<Version> {
         self.write(move |c| {
             require_service(c, id)?;
             let key = id.to_string();
@@ -1761,14 +2289,15 @@ impl MetaStore for SqliteMetaStore {
                 |r| r.get(0),
             )?; // LCOV_EXCL_LINE: require_service reads the live version of the same table, so a damaged versions table fails there first
             let now = now_ms();
+            let (list, sql) = migration_cols(&files)?;
             let (state, started) = match v.compile {
                 CompileMode::Eager => (BuildState::Building, Some(now)),
                 CompileMode::Lazy => (BuildState::Pending, None),
             };
             c.execute(
-                "INSERT INTO versions (service_id, number, source_digest, lock_digest, build_state, pending_reason, failure, created_at, build_started_at) \
-                 VALUES (?1, ?2, ?3, NULL, ?4, NULL, NULL, ?5, ?6)",
-                params![key, number, v.source_digest.to_string(), state_str(state), now, started],
+                "INSERT INTO versions (service_id, number, source_digest, lock_digest, build_state, pending_reason, failure, created_at, build_started_at, migrations, migrations_sql) \
+                 VALUES (?1, ?2, ?3, NULL, ?4, NULL, NULL, ?5, ?6, ?7, ?8)",
+                params![key, number, v.source_digest.to_string(), state_str(state), now, started, list, sql],
             )?;
             Ok(Version {
                 service_id: id,
@@ -1780,7 +2309,470 @@ impl MetaStore for SqliteMetaStore {
                 failure: None,
                 created_at_ms: now,
                 bundle_digest: None,
+                origin: None,
+                migrations: files.iter().map(MigrationFile::entry).collect(),
+                meta: None,
             })
+        })
+        .await
+    }
+
+    async fn reserve_fetching_version(&self, id: ServiceId) -> Result<Version> {
+        self.write(move |c| {
+            require_service(c, id)?;
+            let key = id.to_string();
+            let number: i64 = c.query_row(
+                "SELECT COALESCE(MAX(number), 0) + 1 FROM versions WHERE service_id = ?1",
+                [&key],
+                |r| r.get(0),
+            )?; // LCOV_EXCL_LINE: require_service reads the live version of the same table, so a damaged versions table fails there first
+            let now = now_ms();
+            c.execute(
+                "INSERT INTO versions (service_id, number, source_digest, build_state, pending_reason, created_at) \
+                 VALUES (?1, ?2, ?3, 'pending', ?4, ?5)",
+                params![key, number, Digest::NONE.to_string(), rt_types::PENDING_FETCHING, now],
+            )?;
+            Ok(Version {
+                service_id: id,
+                number: VersionNo(number as u32),
+                source_digest: Digest::NONE,
+                lock_digest: None,
+                build_state: BuildState::Pending,
+                pending_reason: Some(rt_types::PENDING_FETCHING.to_string()),
+                failure: None,
+                created_at_ms: now,
+                bundle_digest: None,
+                origin: None,
+                migrations: Vec::new(),
+                meta: None,
+            })
+        })
+        .await
+    }
+
+    async fn fill_fetching_version(
+        &self,
+        id: ServiceId,
+        n: VersionNo,
+        v: NewVersion,
+        files: Vec<MigrationFile>,
+    ) -> Result<Version> {
+        self.write(move |c| {
+            let (list, sql) = migration_cols(&files)?;
+            let (state, started) = match v.compile {
+                CompileMode::Eager => (BuildState::Building, Some(now_ms())),
+                CompileMode::Lazy => (BuildState::Pending, None),
+            };
+            let changed = c.execute(
+                "UPDATE versions SET source_digest = ?3, build_state = ?4, pending_reason = NULL, \
+                 build_started_at = ?5, migrations = ?6, migrations_sql = ?7 \
+                 WHERE service_id = ?1 AND number = ?2 AND build_state = 'pending' AND pending_reason = ?8",
+                params![
+                    id.to_string(),
+                    n.0,
+                    v.source_digest.to_string(),
+                    state_str(state),
+                    started,
+                    list,
+                    sql,
+                    rt_types::PENDING_FETCHING
+                ],
+            )?;
+            if changed == 0 {
+                return Err(StoreError::NotFound);
+            }
+            Ok(c.query_row(
+                &format!("SELECT {VERSION_COLS} FROM versions WHERE service_id = ?1 AND number = ?2"),
+                params![id.to_string(), n.0],
+                version_row,
+            )?)
+        })
+        .await
+    }
+
+    async fn fail_interrupted_fetches(&self) -> Result<u64> {
+        self.write(move |c| {
+            let failure = to_json(&BuildFailure::new(
+                rt_types::BuildFailReason::FetchFailed,
+                "the node restarted during the fetch",
+            ))?;
+            let n = c.execute(
+                "UPDATE versions SET build_state = 'failed', pending_reason = NULL, failure = ?1, \
+                 activate_after_build = NULL WHERE build_state = 'pending' AND pending_reason = ?2",
+                params![failure, rt_types::PENDING_FETCHING],
+            )?;
+            Ok(n as u64)
+        })
+        .await
+    }
+
+    async fn import_begin(&self, tenant: TenantId, slug: String) -> Result<String> {
+        self.write(move |c| {
+            // One import per tenant at a time, so this repeats for no two notes.
+            let now = now_ms();
+            let id = format!("{tenant}/{slug}/{now}");
+            c.execute(
+                "INSERT INTO pending_imports (id, tenant_id, slug, started_at) VALUES (?1, ?2, ?3, ?4)",
+                params![id, tenant.to_string(), slug, now],
+            )?;
+            Ok(id)
+        })
+        .await
+    }
+
+    async fn import_bind(&self, import: String, service: ServiceId) -> Result<()> {
+        self.write(move |c| {
+            c.execute(
+                "UPDATE pending_imports SET service_id = ?2 WHERE id = ?1",
+                params![import, service.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn import_end(&self, import: String) -> Result<()> {
+        self.write(move |c| {
+            c.execute("DELETE FROM pending_imports WHERE id = ?1", [import])?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn open_imports(&self) -> Result<Vec<(String, Option<ServiceId>)>> {
+        self.db
+            .read(move |c| {
+                let rows: Vec<(String, Option<String>)> = c
+                    .prepare(
+                        "SELECT p.id, COALESCE(p.service_id, ( \
+                            SELECT s.id FROM services s WHERE s.tenant_id = p.tenant_id AND s.slug = p.slug \
+                            AND s.created_at >= p.started_at \
+                            AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.service_id = s.id))) \
+                         FROM pending_imports p ORDER BY p.id",
+                    )?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok(rows
+                    .into_iter()
+                    .map(|(id, svc)| (id, svc.and_then(|s| s.parse().ok())))
+                    .collect())
+            })
+            .await
+    }
+
+    async fn set_version_deploy(
+        &self,
+        id: ServiceId,
+        v: VersionNo,
+        meta: Option<serde_json::Value>,
+        activate_by: Option<String>,
+    ) -> Result<()> {
+        self.write(move |c| {
+            let meta = meta.as_ref().map(to_json).transpose()?;
+            let n = c.execute(
+                "UPDATE versions SET meta = ?3, activate_after_build = ?4 WHERE service_id = ?1 AND number = ?2",
+                params![id.to_string(), v.0, meta, activate_by],
+            )?;
+            if n == 0 {
+                return Err(StoreError::NotFound);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn take_version_activation(&self, id: ServiceId, v: VersionNo) -> Result<Option<String>> {
+        self.write(move |c| {
+            let key = id.to_string();
+            let actor: Option<String> = c
+                .query_row(
+                    "SELECT activate_after_build FROM versions WHERE service_id = ?1 AND number = ?2",
+                    params![key, v.0],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            if actor.is_some() {
+                c.execute(
+                    "UPDATE versions SET activate_after_build = NULL WHERE service_id = ?1 AND number = ?2",
+                    params![key, v.0],
+                )?;
+            }
+            Ok(actor)
+        })
+        .await
+    }
+
+    async fn adopt_version(&self, parent: ServiceId, source: ServiceId, source_version: VersionNo) -> Result<Version> {
+        self.write(move |c| {
+            if parent == source {
+                return Err(StoreError::Invalid("a service cannot adopt its own version".into()));
+            }
+            let to = require_service(c, parent)?;
+            let from = require_service(c, source)?;
+            // Callers load both through their key's scope; this holds even if one forgets.
+            if to.tenant_id != from.tenant_id || to.project_id != from.project_id {
+                return Err(StoreError::NotFound);
+            }
+            if to.runtime != from.runtime {
+                return Err(StoreError::Conflict("runtime_mismatch"));
+            }
+            let src = c
+                .prepare_cached(&format!(
+                    "SELECT {VERSION_COLS} FROM versions WHERE service_id = ?1 AND number = ?2"
+                ))?
+                .query_row(params![source.to_string(), source_version.0], version_row)
+                .optional()?
+                .ok_or(StoreError::NotFound)?;
+            if src.build_state != BuildState::Ready {
+                return Err(StoreError::Conflict("version_not_ready"));
+            }
+            let key = parent.to_string();
+            let existing = c
+                .prepare_cached(&format!(
+                    "SELECT {VERSION_COLS} FROM versions WHERE service_id = ?1 \
+                     AND json_extract(origin, '$.service') = ?2 AND json_extract(origin, '$.version') = ?3 \
+                     ORDER BY number DESC LIMIT 1"
+                ))?
+                .query_row(params![key, source.to_string(), source_version.0], version_row)
+                .optional()?;
+            if let Some(mut v) = existing {
+                // The WASM route can give the source its list after the first adoption.
+                if v.migrations.is_empty() && !src.migrations.is_empty() {
+                    c.execute(
+                        "UPDATE versions SET (migrations, migrations_sql) = \
+                         (SELECT migrations, migrations_sql FROM versions WHERE service_id = ?3 AND number = ?4) \
+                         WHERE service_id = ?1 AND number = ?2",
+                        params![key, v.number.0, source.to_string(), source_version.0],
+                    )?;
+                    v.migrations = src.migrations;
+                }
+                return Ok(v);
+            }
+            let number: i64 = c.query_row(
+                "SELECT COALESCE(MAX(number), 0) + 1 FROM versions WHERE service_id = ?1",
+                [&key],
+                |r| r.get(0),
+            )?;
+            let now = now_ms();
+            let origin = VersionOrigin {
+                service: source,
+                version: source_version,
+            };
+            c.execute(
+                "INSERT INTO versions (service_id, number, source_digest, lock_digest, bundle_digest, build_state, created_at, origin, migrations, migrations_sql, meta) \
+                 SELECT ?1, ?2, ?3, ?4, ?5, 'ready', ?6, ?7, migrations, migrations_sql, meta \
+                 FROM versions WHERE service_id = ?8 AND number = ?9",
+                params![
+                    key,
+                    number,
+                    src.source_digest.to_string(),
+                    src.lock_digest.map(|d| d.to_string()),
+                    src.bundle_digest.map(|d| d.to_string()),
+                    now,
+                    to_json(&origin)?,
+                    source.to_string(),
+                    source_version.0,
+                ],
+            )?;
+            Ok(Version {
+                service_id: parent,
+                number: VersionNo(number as u32),
+                pending_reason: None,
+                failure: None,
+                created_at_ms: now,
+                origin: Some(origin),
+                ..src
+            })
+        })
+        .await
+    }
+
+    async fn create_switch(&self, id: ServiceId, s: NewSwitch) -> Result<Switch> {
+        self.write(move |c| {
+            require_service(c, id)?;
+            let key = id.to_string();
+            let target: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM versions WHERE service_id = ?1 AND number = ?2)",
+                params![key, s.to_version.0],
+                |r| r.get(0),
+            )?;
+            if !target {
+                return Err(StoreError::NotFound);
+            }
+            // Strictly increasing per service: "the last 3" and paging order by id, and two ULIDs
+            // of one millisecond are in random order.
+            let last: Option<String> = c.query_row(
+                "SELECT MAX(id) FROM version_switches WHERE service_id = ?1",
+                [&key],
+                |r| r.get(0),
+            )?;
+            let mut switch = SwitchId::new();
+            if let Some(last) = last {
+                let last: SwitchId = parse_col(&last, 0)?;
+                if last >= switch {
+                    // LCOV_EXCL_START: overflow needs the largest possible ULID
+                    let next = last
+                        .ulid()
+                        .increment()
+                        .ok_or(StoreError::Conflict("switch_in_progress"))?;
+                    // LCOV_EXCL_STOP
+                    switch = SwitchId::from_ulid(next);
+                }
+            }
+            let now = now_ms();
+            c.execute(
+                "INSERT INTO version_switches (id, service_id, kind, state, source_service, source_version, \
+                 from_version, to_version, created_by, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, 'preparing', ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                params![
+                    switch.to_string(),
+                    key,
+                    switch_kind_str(s.kind),
+                    s.source.map(|o| o.service.to_string()),
+                    s.source.map(|o| o.version.0),
+                    s.from_version.map(|v| v.0),
+                    s.to_version.0,
+                    s.created_by,
+                    now,
+                ],
+            )
+            .map_err(active_switch_conflict)?;
+            Ok(Switch {
+                id: switch,
+                service_id: id,
+                kind: s.kind,
+                state: SwitchState::Preparing,
+                source: s.source,
+                from_version: s.from_version,
+                to_version: s.to_version,
+                error: None,
+                interrupted: false,
+                drain_deadline_ms: None,
+                created_by: s.created_by,
+                created_at_ms: now,
+                updated_at_ms: now,
+            })
+        })
+        .await
+    }
+
+    async fn flip_switch(
+        &self,
+        id: ServiceId,
+        switch: SwitchId,
+        if_match: Option<Etag>,
+        drain_deadline_ms: UnixMs,
+    ) -> Result<(Service, Switch)> {
+        self.write(move |c| {
+            let key = id.to_string();
+            let read_row = |c: &Connection| {
+                c.query_row(
+                    &format!("SELECT {SWITCH_COLS} FROM version_switches WHERE id = ?1 AND service_id = ?2"),
+                    params![switch.to_string(), key],
+                    switch_row,
+                )
+                .optional()
+            };
+            let row = read_row(c)?.ok_or(StoreError::NotFound)?;
+            if !matches!(row.state, SwitchState::Preparing | SwitchState::Migrating) {
+                return Err(StoreError::Conflict("switch_not_open"));
+            }
+            let from = require_service(c, id)?.live_version;
+            let service = set_live_tx(c, id, row.to_version, if_match)?;
+            let state = match from {
+                Some(v) if v != row.to_version => SwitchState::Draining,
+                _ => SwitchState::Completed,
+            };
+            c.execute(
+                "UPDATE version_switches SET state = ?2, from_version = ?3, drain_deadline = ?4, updated_at = ?5 \
+                 WHERE id = ?1",
+                params![
+                    switch.to_string(),
+                    switch_state_str(state),
+                    from.map(|v| v.0),
+                    (state == SwitchState::Draining).then_some(drain_deadline_ms),
+                    now_ms(),
+                ],
+            )?;
+            let row = read_row(c)?.ok_or(StoreError::NotFound)?;
+            Ok((service, row))
+        })
+        .await
+    }
+
+    async fn update_switch(&self, id: ServiceId, switch: SwitchId, patch: SwitchPatch) -> Result<Switch> {
+        self.write(move |c| {
+            let changed = c
+                .execute(
+                    "UPDATE version_switches SET state = COALESCE(?3, state), from_version = COALESCE(?4, from_version), \
+                     drain_deadline = COALESCE(?5, drain_deadline), error = COALESCE(?6, error), updated_at = ?7 \
+                     WHERE id = ?1 AND service_id = ?2",
+                    params![
+                        switch.to_string(),
+                        id.to_string(),
+                        patch.state.map(switch_state_str),
+                        patch.from_version.map(|v| v.0),
+                        patch.drain_deadline_ms,
+                        patch.error,
+                        now_ms(),
+                    ],
+                )
+                .map_err(active_switch_conflict)?;
+            if changed == 0 {
+                return Err(StoreError::NotFound);
+            }
+            Ok(c.query_row(
+                &format!("SELECT {SWITCH_COLS} FROM version_switches WHERE id = ?1"),
+                [switch.to_string()],
+                switch_row,
+            )?)
+        })
+        .await
+    }
+
+    async fn get_switch(&self, id: ServiceId, switch: SwitchId) -> Result<Option<Switch>> {
+        self.db
+            .read(move |c| {
+                Ok(c.prepare_cached(&format!(
+                    "SELECT {SWITCH_COLS} FROM version_switches WHERE id = ?1 AND service_id = ?2"
+                ))?
+                .query_row(params![switch.to_string(), id.to_string()], switch_row)
+                .optional()?)
+            })
+            .await
+    }
+
+    async fn list_switches(&self, id: ServiceId, page: PageReq) -> Result<Page<Switch>> {
+        self.db
+            .read(move |c| {
+                let limit = page_limit(page.limit);
+                let rows = c
+                    .prepare_cached(&format!(
+                        "SELECT {SWITCH_COLS} FROM version_switches WHERE service_id = ?1 \
+                         AND (?2 IS NULL OR id < ?2) ORDER BY id DESC LIMIT ?3"
+                    ))?
+                    .query_map(params![id.to_string(), page.cursor, limit as i64 + 1], switch_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(paginate(rows, limit, |s| s.id.to_string()))
+            })
+            .await
+    }
+
+    async fn recover_switches(&self) -> Result<u64> {
+        self.write(move |c| {
+            let now = now_ms();
+            let failed = c.execute(
+                "UPDATE version_switches SET state = 'failed', error = 'interrupted', interrupted = 1, updated_at = ?1 \
+                 WHERE state IN ('preparing', 'migrating')",
+                [now],
+            )?;
+            let drained = c.execute(
+                "UPDATE version_switches SET state = 'completed', interrupted = 1, updated_at = ?1 \
+                 WHERE state = 'draining'",
+                [now],
+            )?;
+            Ok((failed + drained) as u64)
         })
         .await
     }
@@ -1842,45 +2834,7 @@ impl MetaStore for SqliteMetaStore {
     }
 
     async fn set_live(&self, id: ServiceId, v: VersionNo, if_match: Option<Etag>) -> Result<Service> {
-        self.write(move |c| {
-            let cur = require_service(c, id)?;
-            if if_match.is_some_and(|e| e != cur.etag) {
-                return Err(StoreError::PreconditionFailed);
-            }
-            let state: Option<String> = c
-                .query_row(
-                    "SELECT build_state FROM versions WHERE service_id = ?1 AND number = ?2",
-                    params![id.to_string(), v.0],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            match state.as_deref() {
-                None => return Err(StoreError::NotFound),
-                Some("failed") => return Err(StoreError::Conflict("version_not_ready")),
-                Some(_) => {}
-            }
-            let now = now_ms();
-            // One live version per service (`versions_one_live`): clear the old flag first.
-            c.execute(
-                "UPDATE versions SET is_live = 0 WHERE service_id = ?1 AND is_live = 1",
-                [id.to_string()],
-            )?;
-            c.execute(
-                "UPDATE versions SET is_live = 1 WHERE service_id = ?1 AND number = ?2",
-                params![id.to_string(), v.0],
-            )?;
-            c.execute(
-                "UPDATE services SET etag = etag + 1, updated_at = ?2 WHERE id = ?1",
-                params![id.to_string(), now],
-            )?;
-            Ok(Service {
-                live_version: Some(v),
-                etag: Etag(cur.etag.0 + 1),
-                updated_at_ms: now,
-                ..cur
-            })
-        })
-        .await
+        self.write(move |c| set_live_tx(c, id, v, if_match)).await
     }
 
     async fn count_builds_since(&self, tenant: TenantId, since_ms: UnixMs) -> Result<u64> {
@@ -1903,11 +2857,19 @@ impl MetaStore for SqliteMetaStore {
             let live: Option<i64> = c
                 .query_row("SELECT number FROM versions WHERE service_id = ?1 AND is_live = 1", [&key], |r| r.get(0))
                 .optional()?;
-            // Everything except the live version and the newest `keep` versions goes.
+            // Everything except the live version, the newest `keep` versions, the rollback targets
+            // of the last 3 switches and what is on its way to live goes: the target of an open
+            // switch (its migrations may have run) and a version going live after its build.
             let doomed: Vec<(i64, String, Option<String>)> = c
                 .prepare(
                     "SELECT number, source_digest, lock_digest FROM versions WHERE service_id = ?1 \
                      AND number NOT IN (SELECT number FROM versions WHERE service_id = ?1 ORDER BY number DESC LIMIT ?2) \
+                     AND number NOT IN (SELECT from_version FROM version_switches \
+                                        WHERE service_id = ?1 AND from_version IS NOT NULL ORDER BY id DESC LIMIT 3) \
+                     AND number NOT IN (SELECT to_version FROM version_switches WHERE service_id = ?1 \
+                                        AND state IN ('preparing', 'migrating', 'draining')) \
+                     AND activate_after_build IS NULL \
+                     AND pending_reason IS NOT 'fetching' \
                      AND (?3 IS NULL OR number != ?3)",
                 )?
                 .query_map(params![key, i64::from(keep), live], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -1919,7 +2881,9 @@ impl MetaStore for SqliteMetaStore {
             // modules those locks listed (their module lists go with them).
             let mut candidates: Vec<String> = Vec::new();
             for (_, src, lock) in &doomed {
-                candidates.push(src.clone());
+                if *src != Digest::NONE.to_string() {
+                    candidates.push(src.clone());
+                }
                 let Some(lock) = lock else { continue };
                 let in_use: bool = c
                     .prepare_cached("SELECT EXISTS(SELECT 1 FROM versions WHERE lock_digest = ?1)")?
@@ -2032,6 +2996,7 @@ impl MetaStore for SqliteMetaStore {
                 let rows = stmt.query_map([], |r| {
                     let id: String = r.get(0)?;
                     let config: ServiceConfig = json_col(&r.get::<_, String>(4)?, 4)?;
+                    let isolated = config.is_preview();
                     Ok(RouteEntry {
                         tenant: parse_col(&r.get::<_, String>(1)?, 1)?,
                         service: parse_col(&id, 0)?,
@@ -2047,6 +3012,7 @@ impl MetaStore for SqliteMetaStore {
                         project: parse_col(&r.get::<_, String>(9)?, 9)?,
                         environment: r.get(8)?,
                         call: config.call,
+                        isolated,
                     })
                 })?;
                 let entries = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2329,6 +3295,91 @@ impl MetaStore for SqliteMetaStore {
         .await
     }
 
+    async fn put_secret_ref(&self, id: ServiceId, name: &str, path: &str, field: &str) -> Result<()> {
+        let (name, path, field) = (name.to_string(), path.to_string(), field.to_string());
+        self.write(move |c| {
+            c.execute(
+                "INSERT INTO secret_refs (service_id, name, path, field) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(service_id, name) DO UPDATE SET path = excluded.path, field = excluded.field, \
+                 last_error = NULL",
+                params![id.to_string(), name, path, field],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_secret_ref(&self, id: ServiceId, name: &str) -> Result<bool> {
+        let name = name.to_string();
+        self.write(move |c| {
+            Ok(c.execute(
+                "DELETE FROM secret_refs WHERE service_id = ?1 AND name = ?2",
+                params![id.to_string(), name],
+            )? > 0)
+        })
+        .await
+    }
+
+    async fn list_secret_refs(&self, id: ServiceId) -> Result<Vec<SecretRef>> {
+        self.db
+            .read(move |c| {
+                Ok(c.prepare_cached(
+                    "SELECT service_id, name, path, field, kv_version, last_synced_at, last_error \
+                     FROM secret_refs WHERE service_id = ?1 ORDER BY name",
+                )?
+                .query_map([id.to_string()], secret_ref_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .await
+    }
+
+    async fn set_secret_ref_status(
+        &self,
+        id: ServiceId,
+        name: &str,
+        kv_version: Option<i64>,
+        synced_at_ms: Option<UnixMs>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let (name, error) = (name.to_string(), error.map(str::to_string));
+        self.write(move |c| {
+            c.execute(
+                "UPDATE secret_refs SET kv_version = COALESCE(?3, kv_version), \
+                 last_synced_at = COALESCE(?4, last_synced_at), last_error = ?5 \
+                 WHERE service_id = ?1 AND name = ?2",
+                params![id.to_string(), name, kv_version, synced_at_ms, error],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn scan_secret_refs(&self, after: Option<(ServiceId, String)>, limit: u32) -> Result<Vec<SecretRefTarget>> {
+        let (svc, name) = after.map_or((String::new(), String::new()), |(s, n)| (s.to_string(), n));
+        self.db
+            .read(move |c| {
+                let mut st = c.prepare_cached(
+                    "SELECT r.service_id, r.name, r.path, r.field, r.kv_version, r.last_synced_at, r.last_error, \
+                     s.tenant_id, s.project_id, s.environment \
+                     FROM secret_refs r JOIN services s ON s.id = r.service_id \
+                     WHERE (r.service_id, r.name) > (?1, ?2) ORDER BY r.service_id, r.name LIMIT ?3",
+                )?;
+                let rows = st.query_map(params![svc, name, limit], |r| {
+                    let text = |i: usize, r: &Row<'_>| -> rusqlite::Result<String> { r.get(i) };
+                    let bad =
+                        |i: usize| rusqlite::Error::InvalidColumnType(i, "id".into(), rusqlite::types::Type::Text);
+                    Ok(SecretRefTarget {
+                        secret: secret_ref_row(r)?,
+                        tenant: text(7, r)?.parse().map_err(|_| bad(7))?,
+                        project: text(8, r)?.parse().map_err(|_| bad(8))?,
+                        environment: r.get(9)?,
+                    })
+                })?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .await
+    }
+
     async fn delete_secret(&self, id: ServiceId, name: &str) -> Result<SecretsVersion> {
         let name = name.to_string();
         self.write(move |c| {
@@ -2534,6 +3585,32 @@ impl MetaStore for SqliteMetaStore {
         .await
     }
 
+    async fn tenant_counts(&self, tenant: TenantId) -> Result<TenantCounts> {
+        self.db
+            .read(move |c| {
+                let n = |r: &rusqlite::Row<'_>, i: usize| r.get::<_, i64>(i).map(|v| v.max(0) as u64);
+                c.prepare_cached(
+                    "SELECT (SELECT count(*) FROM projects WHERE tenant_id = ?1), \
+                     (SELECT count(*) FROM hosts h JOIN services s ON s.id = h.service_id WHERE s.tenant_id = ?1), \
+                     (SELECT count(*) FROM services WHERE tenant_id = ?1 AND json_extract(config, '$.scratch.kind') = 'branch'), \
+                     (SELECT count(*) FROM services WHERE tenant_id = ?1 AND json_extract(config, '$.scratch.kind') = 'preview'), \
+                     (SELECT COALESCE(MAX(k), 0) FROM (SELECT count(*) AS k FROM secrets x JOIN services s ON s.id = x.service_id \
+                        WHERE s.tenant_id = ?1 GROUP BY x.service_id))",
+                )?
+                .query_row([tenant.to_string()], |r| {
+                    Ok(TenantCounts {
+                        projects: n(r, 0)?,
+                        custom_hosts: n(r, 1)?,
+                        branches: n(r, 2)?,
+                        previews: n(r, 3)?,
+                        busiest_service_secrets: n(r, 4)?,
+                    })
+                })
+                .map_err(Into::into)
+            })
+            .await
+    }
+
     async fn count_pending_hosts(&self, tenant: TenantId) -> Result<u64> {
         self.db
             .read(move |c| {
@@ -2734,6 +3811,30 @@ impl MetaStore for SqliteMetaStore {
             .await
     }
 
+    async fn list_events_after(
+        &self,
+        after: Option<String>,
+        kinds: Vec<String>,
+        limit: u32,
+    ) -> Result<Page<NodeEvent>> {
+        self.db
+            .read(move |c| {
+                let limit = page_limit(limit);
+                let rows = c
+                    .prepare_cached(&format!(
+                        "SELECT {EVENT_COLS} FROM events WHERE id > ?1 \
+                         AND (?2 = '[]' OR kind IN (SELECT value FROM json_each(?2))) ORDER BY id LIMIT ?3"
+                    ))?
+                    .query_map(
+                        params![after.unwrap_or_default(), to_json(&kinds)?, limit as i64 + 1],
+                        event_row,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(paginate(rows, limit, |e| e.id.to_string()))
+            })
+            .await
+    }
+
     async fn event_by_id(&self, id: EventId) -> Result<Option<NodeEvent>> {
         self.db
             .read(move |c| {
@@ -2765,6 +3866,104 @@ impl MetaStore for SqliteMetaStore {
                     c.query_row("SELECT snapshot FROM cache_freq WHERE id = 1", [], |r| r.get(0))
                         .optional()?,
                 )
+            })
+            .await
+    }
+
+    async fn telemetry_state(&self) -> Result<TelemetryState> {
+        self.db
+            .read(move |c| {
+                let row = c
+                    .query_row(
+                        "SELECT install_id, first_start_ms, last_sent_ms, console_users, console_users_at
+                         FROM telemetry_state WHERE id = 1",
+                        [],
+                        |r| {
+                            Ok(TelemetryState {
+                                install_id: r.get(0)?,
+                                first_start_ms: r.get(1)?,
+                                last_sent_ms: r.get(2)?,
+                                console_users: r.get::<_, Option<i64>>(3)?.map(|n| n as u64),
+                                console_users_at: r.get(4)?,
+                            })
+                        },
+                    )
+                    .optional()?;
+                Ok(row.unwrap_or_default())
+            })
+            .await
+    }
+
+    async fn telemetry_note_start(&self, now_ms: i64) -> Result<TelemetryState> {
+        self.db
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO telemetry_state (id, first_start_ms) VALUES (1, ?1)
+                     ON CONFLICT (id) DO UPDATE SET first_start_ms = COALESCE(first_start_ms, ?1)",
+                    [now_ms],
+                )?;
+                Ok(())
+            })
+            .await?;
+        self.telemetry_state().await
+    }
+
+    async fn telemetry_install_id(&self, candidate: String) -> Result<String> {
+        self.db
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO telemetry_state (id, install_id) VALUES (1, ?1)
+                     ON CONFLICT (id) DO UPDATE SET install_id = COALESCE(install_id, ?1)",
+                    [&candidate],
+                )?;
+                Ok(c.query_row("SELECT install_id FROM telemetry_state WHERE id = 1", [], |r| r.get(0))?)
+            })
+            .await
+    }
+
+    async fn telemetry_mark_sent(&self, now_ms: i64) -> Result<()> {
+        self.db
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO telemetry_state (id, last_sent_ms) VALUES (1, ?1)
+                     ON CONFLICT (id) DO UPDATE SET last_sent_ms = ?1",
+                    [now_ms],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn telemetry_set_console_users(&self, users: u64, now_ms: i64) -> Result<()> {
+        self.db
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO telemetry_state (id, console_users, console_users_at) VALUES (1, ?1, ?2)
+                     ON CONFLICT (id) DO UPDATE SET console_users = ?1, console_users_at = ?2",
+                    [users as i64, now_ms],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn telemetry_counts(&self) -> Result<TelemetryCounts> {
+        let system = rt_types::system_tenant().to_string();
+        self.db
+            .read(move |c| {
+                let count = |table: &str, column: &str| -> rusqlite::Result<u64> {
+                    c.query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE {column} != ?1"),
+                        [&system],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map(|n| n as u64)
+                };
+                Ok(TelemetryCounts {
+                    projects: count("projects", "tenant_id")?,
+                    services: count("services", "tenant_id")?,
+                    organizations: count("tenants", "id")?,
+                })
             })
             .await
     }

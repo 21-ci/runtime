@@ -92,6 +92,18 @@ pub fn run(app: &App, cmd: &SocketsCmd) -> Result<()> {
             if let Some(r) = &a.reason {
                 q.push(("reason", r.clone()));
             }
+            if a.all {
+                let r = c
+                    .send_json(c.req(reqwest::Method::DELETE, &svc.path("/sockets")).query(&q))?
+                    .body;
+                if app.json {
+                    fmt::print_json(&r);
+                } else {
+                    let n = r.get("closed").and_then(Value::as_u64).unwrap_or(0);
+                    fmt::emitln(&format!("Closed {n} sockets of {}.", a.svc));
+                }
+                return Ok(());
+            }
             let base = svc.path(&format!("/objects/{}/sockets", fmt::enc(&a.object)));
             match (&a.socket, &a.tag) {
                 (Some(ws), _) => {

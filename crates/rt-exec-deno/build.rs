@@ -138,6 +138,11 @@ stub_ops! {
     asynchronous op_rt_ws_client_send(_a, _b, _c, _d);
     asynchronous op_rt_ws_client_recv(_a);
     asynchronous op_rt_ws_client_close(_a, _b, _c);
+    asynchronous op_rt_pubsub_publish(_a, _b);
+    asynchronous op_rt_pubsub_request(_a, _b);
+    asynchronous op_rt_stream_append(_a, _b);
+    asynchronous op_rt_stream_read(_a);
+    asynchronous op_rt_stream_info(_a);
 }
 
 // Same order as `rt_ext` in `src/exts.rs`.
@@ -226,6 +231,11 @@ deno_core::extension!(
         op_rt_ws_client_send,
         op_rt_ws_client_recv,
         op_rt_ws_client_close,
+        op_rt_pubsub_publish,
+        op_rt_pubsub_request,
+        op_rt_stream_append,
+        op_rt_stream_read,
+        op_rt_stream_info,
     ],
 );
 

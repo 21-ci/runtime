@@ -1033,3 +1033,23 @@ fn injected_control_characters_stay_inside_one_jsonl_record_each() {
     let queried: Vec<String> = msgs(&query_all(&store, svc));
     assert_eq!(queried, hostile.iter().map(|m| m.to_string()).collect::<Vec<_>>());
 }
+
+#[test]
+fn sweep_retention_for_only_ever_lowers_the_node_retention_per_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = unlimited(dir.path());
+    cfg.retention_days = 7;
+    let store = open(cfg);
+    let (capped, other) = (ServiceId::from_u128(1), ServiceId::from_u128(2));
+    let at = NOW - 3 * DAY_MS;
+    store.append(rec(capped, at, LogLevel::Info, "old"));
+    store.append(rec(other, at, LogLevel::Info, "old"));
+    store.flush().unwrap();
+    let report = store.sweep_retention_for(NOW, &|id| (id == capped).then_some(1));
+    assert_eq!(
+        report.segments_deleted, 1,
+        "only the capped service loses its 3-day-old logs"
+    );
+    assert!(query_all(&store, capped).is_empty());
+    assert_eq!(query_all(&store, other).len(), 1);
+}

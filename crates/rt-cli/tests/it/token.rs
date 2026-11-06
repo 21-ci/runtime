@@ -285,3 +285,20 @@ fn limits_shows_what_is_left_of_the_plan() {
     let json = ctx.run(&["--json", "limits"]).ok().json();
     assert_eq!(json["plan"], json!("pro"));
 }
+
+#[test]
+fn usage_prints_the_quotas_of_the_usage_route() {
+    let ctx = Ctx::new();
+    ctx.server.mock(|when, then| {
+        when.method(GET).path("/v1/usage").header("authorization", auth());
+        then.status(200).json_body(json!({
+            "plan": "free", "day": "2026-11-05", "resets_at": 1,
+            "quotas": {"cpu_ms": {"limit": null, "used": 12, "remaining": null, "period": "day"}},
+            "limits": {"max_projects": 20},
+        }));
+    });
+    let out = ctx.run(&["usage"]).ok();
+    let text = out.lines().join("\n");
+    assert!(text.contains("Plan: free"), "{text}");
+    assert!(text.contains("cpu_ms") && text.contains("unlimited"), "{text}");
+}

@@ -477,6 +477,10 @@ pub struct Req {
     pub idle_ttl: Option<Duration>,
     /// `limits.max_response_stream_bytes` (`None`: the default).
     pub max_stream_bytes: Option<u64>,
+    /// `scaling.min_run_time_ms` of the service (`None`: inherit).
+    pub min_run_time_ms: Option<u64>,
+    /// `scaling.min_instances` of the service.
+    pub min_instances: u32,
     /// The service version (default 1).
     pub version: u32,
     /// Request headers (as ingress would pass them on).
@@ -489,6 +493,15 @@ pub struct Req {
     pub object: Option<String>,
     /// A socket event or alarm instead of a request.
     pub event: Option<rt_types::SocketEvent>,
+    /// A delivery payload (pub/sub, stream batch) instead of the HTTP request.
+    pub payload: Option<Delivery>,
+}
+
+/// A delivery payload of [`Req::delivery`] (`Payload` itself is not `Clone`).
+#[derive(Clone, Debug)]
+pub enum Delivery {
+    Pubsub(rt_types::events::PubsubMessage),
+    Stream(rt_types::events::StreamBatch),
 }
 
 impl Req {
@@ -506,12 +519,25 @@ impl Req {
             proc: 0,
             idle_ttl: None,
             max_stream_bytes: None,
+            min_run_time_ms: None,
+            min_instances: 0,
             version: 1,
             headers: Vec::new(),
             trigger: None,
             caller: None,
             object: None,
             event: None,
+            payload: None,
+        }
+    }
+
+    /// A delivery task (`trigger` + `payload`, e.g. a pub/sub message or a stream batch), as
+    /// the event dispatcher hands it to the scheduler.
+    pub fn delivery(trigger: Trigger, payload: Delivery) -> Self {
+        Self {
+            trigger: Some(trigger),
+            payload: Some(payload),
+            ..Self::get("/")
         }
     }
 
@@ -605,6 +631,18 @@ impl Req {
 
     pub fn idle_ttl(mut self, ttl: Duration) -> Self {
         self.idle_ttl = Some(ttl);
+        self
+    }
+
+    /// `scaling.min_run_time_ms` (keep-alive after the answer; `0`: only while work waits).
+    pub fn min_run_time_ms(mut self, ms: u64) -> Self {
+        self.min_run_time_ms = Some(ms);
+        self
+    }
+
+    /// `scaling.min_instances` (the warm floor).
+    pub fn min_instances(mut self, n: u32) -> Self {
+        self.min_instances = n;
         self
     }
 
@@ -720,6 +758,8 @@ pub struct Rig {
     pub calls: Arc<MockCalls>,
     pub control: Arc<StubControl>,
     deps: HostDeps,
+    pubsub: Option<Arc<dyn rt_host::PubsubBus>>,
+    streams: Option<Arc<dyn rt_host::StreamBus>>,
     _data_dir: TempDir,
 }
 
@@ -766,28 +806,56 @@ impl Rig {
             calls,
             control,
             deps,
+            pubsub: None,
+            streams: None,
             _data_dir: data_dir,
         }
+    }
+
+    /// Rebuild the executor over the current deps and event buses.
+    fn rebuild(&mut self) {
+        let mut services = HostServices::new(self.deps.clone());
+        if let Some(b) = &self.pubsub {
+            services = services.with_pubsub(b.clone());
+        }
+        if let Some(b) = &self.streams {
+            services = services.with_streams(b.clone());
+        }
+        self.exec = WasmExecutor::new(self.exec.engine().clone(), services);
+    }
+
+    /// The node's pub/sub router (`std:host/pubsub`; none by default): rebuilds the executor.
+    pub fn pubsub(mut self, bus: Arc<dyn rt_host::PubsubBus>) -> Self {
+        self.pubsub = Some(bus);
+        self.rebuild();
+        self
+    }
+
+    /// The node's stream log (`std:host/streams`; none by default): rebuilds the executor.
+    pub fn streams(mut self, bus: Arc<dyn rt_host::StreamBus>) -> Self {
+        self.streams = Some(bus);
+        self.rebuild();
+        self
     }
 
     /// Operator bindings (`std:host/platform`): rebuilds the executor with `platform`.
     pub fn platform(mut self, platform: Arc<dyn PlatformBindings>) -> Self {
         self.deps.platform = platform;
-        self.exec = WasmExecutor::new(self.exec.engine().clone(), HostServices::new(self.deps.clone()));
+        self.rebuild();
         self
     }
 
     /// The node's socket hub (`NoSockets` by default): rebuilds the executor.
     pub fn sockets(mut self, sockets: Arc<dyn rt_host::SocketHost>) -> Self {
         self.deps.sockets = sockets;
-        self.exec = WasmExecutor::new(self.exec.engine().clone(), HostServices::new(self.deps.clone()));
+        self.rebuild();
         self
     }
 
     /// A different egress guard (outbound WebSockets need a real one): rebuilds the executor.
     pub fn egress(mut self, egress: Arc<dyn rt_host::EgressGuard>) -> Self {
         self.deps.egress = egress;
-        self.exec = WasmExecutor::new(self.exec.engine().clone(), HostServices::new(self.deps.clone()));
+        self.rebuild();
         self
     }
 
@@ -852,6 +920,8 @@ impl Rig {
         if let Some(ttl) = req.idle_ttl {
             knobs.idle_ttl = ttl;
         }
+        knobs.min_run_time = req.min_run_time_ms.map(Duration::from_millis);
+        knobs.min_instances = req.min_instances;
         let mut spec = SpecBuilder::wasm()
             .tenant(req.tenant)
             .service(req.service)
@@ -874,6 +944,12 @@ impl Rig {
         }
         if let Some(ev) = &req.event {
             spec.payload = Payload::Socket(ev.clone());
+        }
+        if let Some(p) = &req.payload {
+            spec.payload = match p.clone() {
+                Delivery::Pubsub(m) => Payload::Pubsub(m),
+                Delivery::Stream(b) => Payload::Stream(b),
+            };
         }
         let reservation = self
             .governor

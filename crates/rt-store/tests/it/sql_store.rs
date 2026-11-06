@@ -574,7 +574,8 @@ async fn ac_sql_02_export_is_a_consistent_sqlite_snapshot() {
     .await
     .expect("seed");
 
-    let bytes = sql.export().await.expect("export");
+    let file = sql.export().await.expect("export");
+    let bytes = std::fs::read(file.path()).expect("read export");
     assert!(
         bytes.starts_with(b"SQLite format 3\0"),
         "export must be a SQLite database file"
@@ -1065,6 +1066,42 @@ async fn ac_sto_16_reference_disk_sustains_five_thousand_inserts_per_second() {
     let n = total.load(Ordering::Relaxed);
     assert!(n >= 50_000, "only {n} inserts in 10 s");
     assert_eq!(count(&sql, "ins").await, n as i64);
+}
+
+/// A guest's own view or trigger does not launder a denied function, directly or through another
+/// view: refused when used, as `sql_not_authorized`, and the firing statement's row stays out.
+#[tokio::test]
+async fn views_and_triggers_cannot_reach_a_denied_function_at_use() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = data(dir.path());
+    let sql = store.sql(svc(1));
+    for ddl in [
+        "CREATE VIEW v AS SELECT load_extension('/tmp/evil') AS y",
+        "CREATE VIEW v2 AS SELECT * FROM v",
+        "CREATE VIEW f AS SELECT fts3_tokenizer('simple') AS y",
+        "CREATE TABLE t (a)",
+        "CREATE TABLE t2 (a)",
+        "CREATE TRIGGER r AFTER INSERT ON t BEGIN SELECT load_extension('/tmp/evil'); END",
+        "CREATE TRIGGER r2 AFTER INSERT ON t2 BEGIN SELECT y FROM v; END",
+    ] {
+        sql.execute(st(ddl)).await.expect(ddl);
+    }
+    for used in [
+        "SELECT * FROM v",
+        "SELECT * FROM v2",
+        "SELECT * FROM f",
+        "INSERT INTO t VALUES (1)",
+        "INSERT INTO t2 VALUES (1)",
+    ] {
+        let err = sql.execute(st(used)).await.expect_err(used);
+        assert_eq!(err.code(), "sql_not_authorized", "{used}: {err:?}");
+    }
+    sql.execute(st("DROP TRIGGER r")).await.expect("drop");
+    sql.execute(st("INSERT INTO t VALUES (2)"))
+        .await
+        .expect("without the trigger");
+    let left = sql.execute(st("SELECT a FROM t")).await.expect("rows");
+    assert_eq!(left.rows.len(), 1, "the refused insert left no row");
 }
 
 /// SQL-002 / SQL-004: guest SQL cannot get native pointers (`fts3_tokenizer` returns the address

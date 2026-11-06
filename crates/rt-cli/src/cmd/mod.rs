@@ -12,6 +12,9 @@ use crate::config::Settings;
 use crate::error::{CliError, Result};
 use crate::fmt;
 
+pub mod app;
+pub mod backup;
+pub mod branch;
 pub mod config;
 pub mod data;
 pub mod doctor;
@@ -19,11 +22,13 @@ pub mod env;
 pub mod events;
 pub mod host;
 pub mod init;
+pub mod invocation;
 pub mod invoke;
 pub mod key;
 pub mod limits;
 pub mod logs;
 pub mod mcp;
+pub mod migrations;
 pub mod misc;
 pub mod node;
 pub mod plan;
@@ -36,8 +41,11 @@ pub mod secret;
 pub mod service;
 pub mod sockets;
 pub mod stats;
+pub mod switch;
+pub mod telemetry;
 pub mod tenant;
 pub mod token;
+pub mod topic;
 pub mod versions;
 
 /// What every networked command needs.
@@ -211,7 +219,10 @@ pub fn fetch_page_with(c: &Client, path: &str, p: &ListArgs, filter: &[(&str, St
         match next {
             Some(n) => cursor = Some(n),
             None => {
-                let raw = json!({"items": all_items.clone(), "next_cursor": null});
+                // the last page's other fields (e.g. `counts`) stay
+                let mut raw = if body.is_object() { body } else { json!({}) };
+                raw["items"] = json!(all_items.clone());
+                raw["next_cursor"] = Value::Null;
                 return Ok(Page {
                     items: all_items,
                     next_cursor: None,

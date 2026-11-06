@@ -7,7 +7,7 @@ use reqwest::Method;
 use serde_json::{json, Value};
 
 use super::{cell, resolve, save_download, App};
-use crate::cli::{RebuildArgs, RollbackArgs, SourceArgs, VersionsArgs};
+use crate::cli::{FromUrlArgs, RebuildArgs, RollbackArgs, SourceArgs, VersionsArgs};
 use crate::error::{CliError, Result};
 use crate::fmt;
 use crate::sse::{self, ReadError};
@@ -34,6 +34,57 @@ fn versions_of(body: &Value) -> Vec<Value> {
     v
 }
 
+/// `21ci from-url`: the node fetches the archive. Header values go in the request body only.
+pub fn from_url(app: &App, a: &FromUrlArgs) -> Result<()> {
+    let mut headers = serde_json::Map::new();
+    for raw in &a.headers {
+        let Some((name, value)) = raw.split_once(':') else {
+            return Err(CliError::usage("--header takes NAME:VALUE"));
+        };
+        headers.insert(name.trim().to_string(), json!(value.trim()));
+    }
+    let mut body = json!({"url": a.url, "headers": headers});
+    if let Some(v) = &a.sha256 {
+        body["sha256"] = json!(v);
+    }
+    if let Some(v) = a.strip_components {
+        body["strip_components"] = json!(v);
+    }
+    if let Some(v) = &a.subdir {
+        body["subdir"] = json!(v);
+    }
+    if let Some(v) = &a.entry {
+        body["entry"] = json!(v);
+    }
+    if let Some(v) = &a.meta {
+        let meta: Value = serde_json::from_str(v).map_err(|e| CliError::usage(format!("--meta: {e}")))?;
+        body["meta"] = meta;
+    }
+    if let Some(v) = a.compile {
+        body["compile"] = json!(v.as_str());
+    }
+    if a.after_build {
+        body["activate"] = json!("after_build");
+    }
+    let c = app.client()?;
+    let svc = resolve(&c, &a.svc)?;
+    let v = c.post(&svc.path("/versions/from-url"), &body)?;
+    if app.json {
+        fmt::print_json(&v);
+        return Ok(());
+    }
+    fmt::emit(&fmt::kv(&[
+        ("Version", number(&v).to_string()),
+        ("Build", cell(&v, "build_state")),
+        ("Source digest", cell(&v, "source_digest")),
+        (
+            "Goes live",
+            if a.after_build { "after the build" } else { "no" }.to_string(),
+        ),
+    ]));
+    Ok(())
+}
+
 pub fn list(app: &App, a: &VersionsArgs) -> Result<()> {
     let c = app.client()?;
     let mut svc = resolve(&c, &a.svc)?;
@@ -52,6 +103,9 @@ pub fn list(app: &App, a: &VersionsArgs) -> Result<()> {
             ("Lock digest", cell(&v, "lock_digest")),
             ("Created", fmt::ts_field(&v, "created_at")),
         ];
+        if let Some(sha) = v.pointer("/meta/git/sha").and_then(Value::as_str) {
+            rows.push(("Git SHA (claimed)", sha.to_string()));
+        }
         if let Some(f) = v.get("failure").filter(|f| !f.is_null()) {
             rows.push(("Failure", fmt::compact(f)));
         }
@@ -89,8 +143,16 @@ pub fn list(app: &App, a: &VersionsArgs) -> Result<()> {
 }
 
 pub fn rollback(app: &App, a: &RollbackArgs) -> Result<()> {
+    if let Some(id) = &a.switch {
+        super::switch::check_id(id)?;
+    }
     let c = app.client()?;
     let mut svc = resolve(&c, &a.svc)?;
+    if let Some(id) = &a.switch {
+        let back = super::switch::post_guarded(&c, &mut svc, &format!("/switches/{id}/rollback"), &json!({}))?;
+        super::switch::print_view(app, &back);
+        return Ok(());
+    }
     let live = live_version(svc.view(&c)?);
     let target = match a.to {
         Some(n) => u64::from(n),

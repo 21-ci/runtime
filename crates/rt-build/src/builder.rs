@@ -229,6 +229,14 @@ impl UploadValidator for DefaultBuilder {
         }
     }
 
+    fn reshape_archive(&self, body: &Bytes, shape: &rt_types::ArchiveShape) -> Result<Bytes, ValidationError> {
+        crate::extract::reshape(body, shape, &self.limits).map_err(|e| match e {
+            VErr::Invalid(d) => ValidationError::Invalid(d),
+            VErr::InvalidArtifact(r) => ValidationError::InvalidArtifact(r),
+            VErr::TooLarge(r) => ValidationError::TooLarge(r),
+        })
+    }
+
     fn rpc_contract(
         &self,
         content_type: &str,

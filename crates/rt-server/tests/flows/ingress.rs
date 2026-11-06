@@ -395,6 +395,7 @@ async fn ac_sec_19_ingress_rules_methods_paths_ips_and_rate_limit() {
     svc_with(&node, &t.key, &slug, json!({"ingress": {"rate_limit": {"rps": 5, "burst": 5}}}), guests::HELLO).await;
     let mut statuses = Vec::new();
     let mut limited = None;
+    let started = Instant::now();
     for _ in 0..12 {
         let r = invoke(&node, &slug, "/").await;
         statuses.push(r.s());
@@ -403,7 +404,9 @@ async fn ac_sec_19_ingress_rules_methods_paths_ips_and_rate_limit() {
         }
     }
     let ok = statuses.iter().filter(|s| **s == 200).count();
-    assert!((5..=7).contains(&ok), "burst 5 (+ a little refill) then limited: {statuses:?}");
+    // The bucket refills while the requests run: 5 per second of however long they took here.
+    let refill = (started.elapsed().as_secs_f64() * 5.0).ceil() as usize;
+    assert!((5..=5 + refill).contains(&ok), "burst 5 + {refill} refilled, then limited: {statuses:?}");
     let limited = limited.unwrap_or_else(|| panic!("no 429 in {statuses:?}"));
     assert!(limited.header("retry-after").and_then(|v| v.parse::<u64>().ok()).is_some_and(|s| s >= 1), "{:?}", limited.headers);
     tokio::time::sleep(Duration::from_millis(1_300)).await;

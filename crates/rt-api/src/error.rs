@@ -15,31 +15,79 @@ pub fn status_for_code(code: &str) -> StatusCode {
         | "trigger_not_allowed"
         | "binding_not_allowed"
         | "host_not_allowed"
-        | "reserved" => StatusCode::FORBIDDEN,
+        | "reserved"
+        | "scratch_source_reserved"
+        | "async_not_allowed" => StatusCode::FORBIDDEN,
         "not_found" => StatusCode::NOT_FOUND,
-        "slug_taken" | "host_taken" | "host_cooldown" | "version_not_ready" | "tenant_not_empty"
-        | "project_slug_taken" | "project_not_empty" | "environment_in_use" | "sdk_release_exists" => {
-            StatusCode::CONFLICT
-        }
+        "archive_gone" => StatusCode::GONE,
+        "backup_disabled" => StatusCode::SERVICE_UNAVAILABLE,
+        "backup_running"
+        | "slug_taken"
+        | "host_taken"
+        | "host_cooldown"
+        | "version_not_ready"
+        | "tenant_not_empty"
+        | "project_slug_taken"
+        | "project_not_empty"
+        | "environment_in_use"
+        | "sdk_release_exists"
+        | "topic_exists"
+        | "switch_in_progress"
+        | "switch_not_open"
+        | "branch_exists"
+        | "not_a_branch"
+        | "rollback_target_gone"
+        | "migration_failed"
+        | "migration_drift"
+        | "migration_out_of_order"
+        | "migration_timeout"
+        | "transaction_control_forbidden"
+        | "activate_with_migrations_needs_build"
+        | "migrations_already_set"
+        | "migrations_from_source"
+        | "version_is_live" => StatusCode::CONFLICT,
+        "egress_denied" => StatusCode::FORBIDDEN,
+        "fetch_failed" => StatusCode::BAD_GATEWAY,
         "precondition_failed" => StatusCode::PRECONDITION_FAILED,
-        "too_large" | "storage_quota" | "egress_quota" => StatusCode::PAYLOAD_TOO_LARGE,
+        "too_large"
+        | "storage_quota"
+        | "egress_quota"
+        | "copy_data_too_large"
+        | "dry_run_too_large"
+        | "result_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
         // Guest-data errors a control route can meet (data export, KV/SQL inspection): the
         // request was understood but the data refuses it (QUOTA-013).
-        "sql_error" | "sql_not_authorized" | "sql_result_too_large" | "kv_not_integer" | "kv_overflow" => {
-            StatusCode::UNPROCESSABLE_ENTITY
-        }
+        "sql_error"
+        | "sql_not_authorized"
+        | "sql_not_readonly"
+        | "sql_result_too_large"
+        | "kv_not_integer"
+        | "kv_overflow" => StatusCode::UNPROCESSABLE_ENTITY,
         "sql_busy" | "sql_timeout" => StatusCode::SERVICE_UNAVAILABLE,
-        "validation_failed"
+        "secret_source_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        "secret_source_not_found" => StatusCode::NOT_FOUND,
+        "secret_is_ref" => StatusCode::CONFLICT,
+        "ref_outside_prefix"
+        | "validation_failed"
+        | "bundle_invalid"
         | "invalid_artifact"
         | "missing_export"
         | "limit_exceeds_plan"
         | "schedule_too_frequent"
         | "idempotency_mismatch"
+        | "runtime_mismatch"
+        | "branch_name_invalid"
+        | "preview_policy"
+        | "scratch_ttl_too_long"
         | "no_rpc_surface"
         | "sdk_contract_missing"
         | "sdk_unchecked_caller" => StatusCode::UNPROCESSABLE_ENTITY,
-        "rate_limited" | "build_quota" | "queue_full" => StatusCode::TOO_MANY_REQUESTS,
-        "control_disabled" => StatusCode::SERVICE_UNAVAILABLE,
+        "range_not_satisfiable" => StatusCode::RANGE_NOT_SATISFIABLE,
+        "if_range_required" => StatusCode::PRECONDITION_REQUIRED,
+        "insufficient_storage" => StatusCode::INSUFFICIENT_STORAGE,
+        "rate_limited" | "cpu_quota" | "build_quota" | "queue_full" | "stream_full" | "async_backlog_full"
+        | "heavy_job_busy" => StatusCode::TOO_MANY_REQUESTS,
+        "control_disabled" | "unavailable" => StatusCode::SERVICE_UNAVAILABLE,
         "not_implemented" => StatusCode::NOT_IMPLEMENTED,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -120,6 +168,25 @@ impl From<rt_store::StoreError> for ApiError {
             return ApiError::new(e.code(), e.to_string())
                 .with_details(serde_json::json!({"field": "min_instances", "total": total, "plan_max": cap}));
         }
+        if let rt_store::StoreError::Migration(f) = &e {
+            return ApiError::new(f.code, f.message.clone())
+                .with_details(serde_json::to_value(f).unwrap_or(serde_json::Value::Null));
+        }
+        if let rt_store::StoreError::SqlFailed { code, offset, message } = &e {
+            return ApiError::new("sql_error", message.clone())
+                .with_details(serde_json::json!({"code": code, "offset": offset}));
+        }
+        if matches!(e, rt_store::StoreError::Conflict("topic_limit")) {
+            return ApiError::new("quota_exceeded", "the plan's topic limit (`max_topics`) is reached");
+        }
+        if matches!(e, rt_store::StoreError::Conflict("heavy_job_busy")) {
+            let mut busy = ApiError::new(
+                "heavy_job_busy",
+                "another export or data copy is running; try again shortly",
+            );
+            busy.retry_after = Some(5);
+            return busy;
+        }
         // Sanitized: only the stable code, never driver text or paths.
         ApiError::new(e.code(), e.code().replace('_', " "))
     }
@@ -138,8 +205,9 @@ impl From<rt_sec::AuthError> for ApiError {
 impl From<rt_sec::QuotaError> for ApiError {
     fn from(e: rt_sec::QuotaError) -> Self {
         let mut a = ApiError::new(e.code(), e.to_string());
-        if let rt_sec::QuotaError::RateLimited { retry_after } | rt_sec::QuotaError::InvocationsPerDay { retry_after } =
-            &e
+        if let rt_sec::QuotaError::RateLimited { retry_after }
+        | rt_sec::QuotaError::InvocationsPerDay { retry_after }
+        | rt_sec::QuotaError::CpuPerDay { retry_after } = &e
         {
             a.retry_after = Some(retry_after.as_secs().max(1));
         }
@@ -173,6 +241,10 @@ mod edge_tests {
         let store = [
             S::NotFound,
             S::Conflict("slug_taken"),
+            S::Conflict("topic_exists"),
+            S::Conflict("topic_limit"),
+            S::Conflict("stream_full"),
+            S::Conflict("idempotency_mismatch"),
             S::PreconditionFailed,
             S::Invalid("x".into()),
             S::StorageQuota,
@@ -181,6 +253,12 @@ mod edge_tests {
             S::SqlNotAuthorized,
             S::SqlBusy,
             S::SqlResultTooLarge,
+            S::SqlNotReadonly,
+            S::SqlFailed {
+                code: 1,
+                offset: None,
+                message: "x".into(),
+            },
             S::KvNotInteger,
             S::KvOverflow,
         ];
@@ -200,6 +278,21 @@ mod edge_tests {
             assert_eq!(ApiError::from(e).status().as_u16(), want);
         }
         assert_eq!(status_for_code("internal"), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Event and async codes answer their documented statuses; the store's topic limit is the
+    /// plan's `quota_exceeded`.
+    #[test]
+    fn event_and_async_codes_have_their_statuses() {
+        assert_eq!(status_for_code("topic_exists"), StatusCode::CONFLICT);
+        assert_eq!(status_for_code("stream_full"), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(status_for_code("async_not_allowed"), StatusCode::FORBIDDEN);
+        assert_eq!(status_for_code("async_backlog_full"), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(status_for_code("unavailable"), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status_for_code("trigger_not_allowed"), StatusCode::FORBIDDEN);
+        let e = ApiError::from(rt_store::StoreError::Conflict("topic_limit"));
+        assert_eq!(e.code, "quota_exceeded");
+        assert_eq!(e.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

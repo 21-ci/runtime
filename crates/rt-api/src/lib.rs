@@ -14,29 +14,44 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 #![warn(clippy::await_holding_lock, clippy::mem_forget, clippy::undocumented_unsafe_blocks)]
 
+pub mod app_bundle;
 pub mod auth;
+pub mod backups;
+pub mod branches;
+pub mod consumers;
 pub mod control;
+pub mod data_browse;
+pub mod data_events;
 pub mod dto;
 pub mod error;
 pub mod extract;
+pub mod file_response;
+pub mod from_url;
 pub mod health;
 pub mod hosts;
+pub mod invocations;
 pub mod invoke;
 pub mod limits;
 pub mod mcp;
+pub mod migrations;
 pub mod projects;
+pub mod promote;
+pub mod scratch;
 pub mod sdks;
+pub mod secret_refs;
 pub mod serve;
 pub mod sockets;
 pub mod state;
+pub mod telemetry;
 pub mod tokens;
+pub mod topics;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 
 pub use auth::Auth;
 pub use control::{
-    control_router, openapi_json_string, refresh_routes, ApiDoc, MAX_CONCURRENT_UPLOADS, MAX_UPLOAD_BODY,
+    api_doc, control_router, openapi_json_string, refresh_routes, ApiDoc, MAX_CONCURRENT_UPLOADS, MAX_UPLOAD_BODY,
 };
 pub use error::{status_for_code, ApiError, ErrorBody, ErrorEnvelope};
 pub use health::health_router;
@@ -44,5 +59,6 @@ pub use hosts::{run_host_claims, sweep_host_claims, HickoryTxtResolver, HostSwee
 pub use invoke::{invoke_router, outcome_response, plain_error};
 pub use serve::{bind_tcp_listener, serve_tcp, serve_tcp_with, serve_unix, ConnHold, ListenAddr, ServeLimits};
 pub use state::{
-    ApiState, ControlEvent, IdemStore, IngressBuckets, IngressCache, NodeConfigUpdate, NodeInfo, SseLimiter,
+    ApiState, ArchiveFetchError, ArchiveFetchFailure, ArchiveFetcher, ArchiveRequest, ControlEvent, FetchedArchive,
+    IdemStore, IngressBuckets, IngressCache, NodeConfigUpdate, NodeInfo, SseLimiter,
 };

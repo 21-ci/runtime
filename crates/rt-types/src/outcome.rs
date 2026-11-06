@@ -133,6 +133,17 @@ pub enum BuildFailReason {
     Oom,
     TooLarge,
     Internal,
+    /// `from-url`: unreachable, too many redirects, timed out, a non-2xx answer, or the node
+    /// restarted during the fetch.
+    FetchFailed,
+    /// `from-url`: the egress rules refuse the URL or a redirect hop.
+    EgressDenied,
+    /// `from-url`: the daily egress quota ran out.
+    EgressQuota,
+    /// `from-url`: the fetched archive failed validation, or does not match `sha256`.
+    ValidationFailed,
+    /// `from-url`: the fetched archive is not a deployable artifact.
+    InvalidArtifact,
 }
 
 impl BuildFailReason {
@@ -146,6 +157,11 @@ impl BuildFailReason {
             BuildFailReason::Oom => "oom",
             BuildFailReason::TooLarge => "too_large",
             BuildFailReason::Internal => "internal",
+            BuildFailReason::FetchFailed => "fetch_failed",
+            BuildFailReason::EgressDenied => "egress_denied",
+            BuildFailReason::EgressQuota => "egress_quota",
+            BuildFailReason::ValidationFailed => "validation_failed",
+            BuildFailReason::InvalidArtifact => "invalid_artifact",
         }
     }
 }

@@ -1,0 +1,235 @@
+/*
+ * 21 Cloud docs design language on top of Material for MkDocs. Rules: DESIGN.md in 21-ci/runtime-web.
+ * This file is byte-identical in 21-ci/runtime and 21-ci/runtime-web: change both together. Values mirror the console
+ * tokens in runtime-web's web/src/index.css. Site-specific rules belong in extra.css.
+ */
+
+/* ---- Tokens ------------------------------------------------------------------------------- */
+
+:root {
+  --rt-r-sm: 4px;
+  --rt-r-md: 6px;
+  --rt-r-lg: 10px;
+  --rt-r-2xl: 16px;
+}
+
+[data-md-color-scheme="default"] {
+  --rt-bg: #ffffff;
+  --rt-panel: #f7f7f5;
+  --rt-panel-2: #efefec;
+  --rt-line: rgba(0, 0, 0, 0.08);
+  --rt-line-strong: rgba(0, 0, 0, 0.16);
+  --rt-hover: rgba(0, 0, 0, 0.045);
+  --rt-text: #1f1f1f;
+  --rt-muted: #6b6b6b;
+  --rt-accent: #2563eb;
+  --rt-accent-hover: #1d4ed8;
+  --rt-on-primary: #ffffff;
+  --rt-accent-soft: #dbe7fe;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-hue: 0;
+  --rt-bg: #191919;
+  --rt-panel: #202020;
+  --rt-panel-2: #2a2a2a;
+  --rt-line: rgba(255, 255, 255, 0.09);
+  --rt-line-strong: rgba(255, 255, 255, 0.16);
+  --rt-hover: rgba(255, 255, 255, 0.055);
+  --rt-text: #e6e6e6;
+  --rt-muted: #a3a3a3;
+  --rt-accent: #5b9bff;
+  --rt-accent-hover: #78adff;
+  --rt-on-primary: #0b1a33;
+  --rt-accent-soft: #1e3a6b;
+}
+
+/* ---- Material palette (primary: custom / accent: custom) -------------------------------- */
+
+[data-md-color-scheme] {
+  --md-default-bg-color: var(--rt-bg);
+  --md-default-fg-color: var(--rt-text);
+  --md-default-fg-color--light: var(--rt-muted);
+  --md-default-fg-color--lighter: var(--rt-line-strong);
+  --md-default-fg-color--lightest: var(--rt-line);
+  --md-typeset-color: var(--rt-text);
+  --md-typeset-a-color: var(--rt-accent);
+  --md-primary-fg-color: var(--rt-accent);
+  --md-primary-fg-color--light: var(--rt-accent-hover);
+  --md-primary-fg-color--dark: var(--rt-accent-hover);
+  --md-primary-bg-color: var(--rt-on-primary);
+  --md-primary-bg-color--light: var(--rt-on-primary);
+  --md-accent-fg-color: var(--rt-accent-hover);
+  --md-accent-fg-color--transparent: var(--rt-hover);
+  --md-accent-bg-color: var(--rt-on-primary);
+  --md-accent-bg-color--light: var(--rt-on-primary);
+  --md-code-bg-color: var(--rt-panel);
+  --md-code-fg-color: var(--rt-text);
+  --md-footer-bg-color: var(--rt-panel);
+  --md-footer-bg-color--dark: var(--rt-panel);
+  --md-footer-fg-color: var(--rt-text);
+  --md-footer-fg-color--light: var(--rt-muted);
+  --md-footer-fg-color--lighter: var(--rt-muted);
+}
+
+::selection {
+  background: var(--rt-accent-soft);
+}
+
+/* ---- Chrome: flat neutral bars with hairlines, no gradients ------------------------------ */
+
+.md-header,
+.md-tabs {
+  --md-primary-bg-color: var(--rt-text);
+  --md-primary-bg-color--light: var(--rt-muted);
+  color: var(--rt-text);
+  background: var(--rt-panel);
+}
+
+.md-header {
+  box-shadow: none;
+  border-bottom: 1px solid var(--rt-line);
+}
+
+.md-header--shadow {
+  box-shadow: none;
+}
+
+.md-header__title {
+  font-weight: 600;
+}
+
+.md-tabs {
+  border-bottom: 1px solid var(--rt-line);
+}
+
+@media screen and (min-width: 60em) {
+  .md-search__form,
+  .md-search__form:hover {
+    background-color: var(--rt-hover);
+  }
+  .md-search__input::placeholder {
+    color: var(--rt-muted);
+  }
+}
+
+.md-footer,
+.md-footer-meta,
+.md-banner {
+  border-top: 1px solid var(--rt-line);
+}
+
+.md-banner {
+  border-top: 0;
+  border-bottom: 1px solid var(--rt-line);
+}
+
+.md-banner a,
+.md-banner a:focus {
+  color: var(--rt-accent);
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+.md-banner a:hover {
+  color: var(--rt-accent-hover);
+}
+
+/* ---- Type ---------------------------------------------------------------------------------- */
+
+.md-typeset {
+  font-feature-settings: "cv11", "ss01";
+}
+
+.md-typeset h1 {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--rt-text);
+}
+
+.md-typeset h2 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+/* ---- Components: radius scale, hairlines -------------------------------------------------- */
+
+.md-typeset .md-button {
+  border-radius: var(--rt-r-md);
+  font-weight: 500;
+}
+
+.md-typeset pre > code,
+.md-typeset .highlight,
+.md-typeset .admonition,
+.md-typeset details {
+  border-radius: var(--rt-r-md);
+}
+
+.md-typeset code {
+  border-radius: var(--rt-r-sm);
+}
+
+.md-typeset .grid.cards > ul > li,
+.md-typeset .grid > .card {
+  border: 1px solid var(--rt-line);
+  border-radius: var(--rt-r-lg);
+  box-shadow: none;
+}
+
+.md-typeset .grid.cards > ul > li:hover,
+.md-typeset .grid > .card:hover {
+  border-color: var(--rt-line-strong);
+  box-shadow: none;
+  background: var(--rt-hover);
+}
+
+/* ---- Landing hero -------------------------------------------------------------------------- */
+
+.rt-hero {
+  margin: 0 0 2rem;
+  padding: 2.6rem 2.4rem 2.2rem;
+  border: 1px solid var(--rt-line);
+  border-radius: var(--rt-r-2xl);
+  background: var(--rt-panel);
+}
+
+.md-typeset .rt-hero h1 {
+  margin: 0 0 0.6rem;
+  font-size: 2.2rem;
+  line-height: 1.15;
+  max-width: 22em;
+}
+
+.rt-hero .rt-hero__lead {
+  margin: 0 0 1.4rem;
+  font-size: 0.95rem;
+  line-height: 1.6;
+  max-width: 44em;
+  color: var(--rt-muted);
+}
+
+.md-typeset .rt-hero .md-button {
+  margin: 0 0.5rem 0.5rem 0;
+}
+
+.md-typeset .rt-hero .md-button:not(.md-button--primary) {
+  color: var(--rt-text);
+  border-color: var(--rt-line-strong);
+}
+
+.md-typeset .rt-hero .md-button:not(.md-button--primary):hover {
+  color: var(--rt-text);
+  background: var(--rt-hover);
+  border-color: var(--rt-line-strong);
+}
+
+@media screen and (max-width: 44.9375em) {
+  .rt-hero {
+    margin: 0 -0.4rem 1.5rem;
+    padding: 2rem 1.2rem;
+  }
+  .md-typeset .rt-hero h1 {
+    font-size: 1.7rem;
+  }
+}

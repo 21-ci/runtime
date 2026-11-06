@@ -26,7 +26,13 @@ const QUEUE_READERS: usize = 2;
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/queue_0001_init.sql")),
     (2, include_str!("../migrations/queue_0002_delayed.sql")),
+    (3, include_str!("../migrations/queue_0003_invocations.sql")),
+    (4, include_str!("../migrations/queue_0004_invocation_bytes.sql")),
 ];
+
+#[path = "invocations.rs"]
+pub mod invocations;
+pub use invocations::*;
 
 /// Message size cap.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -129,7 +135,25 @@ pub trait QueueStore: Send + Sync {
         self.retry(id, delay).await
     }
     // LCOV_EXCL_STOP
+    /// Hand leased messages back without using up their delivery: the attempt the lease added
+    /// is refunded (`attempt - 1`, never below 0) and the message is visible again after
+    /// `delay`. Fenced like [`QueueStore::ack_leased`]; returns how many messages were released.
+    /// Used when the delivery never ran (admission refusal, shutdown).
+    // LCOV_EXCL_START: trait default body; the SQLite store overrides it, so only other implementors reach it
+    async fn release_leased(&self, msgs: &[(MsgId, u16)], delay: Duration) -> Result<u64> {
+        let mut n = 0;
+        for (id, attempt) in msgs {
+            if self.retry_leased(*id, *attempt, delay).await.is_ok() {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+    // LCOV_EXCL_STOP
     async fn stats(&self, s: ServiceId) -> Result<QueueStats>;
+    /// [`QueueStore::stats`] of every service holding messages or dead letters, in one grouped
+    /// read (bulk stats: no per-service query). A service without any is not listed.
+    async fn stats_all(&self) -> Result<HashMap<ServiceId, QueueStats>>;
     async fn dlq_list(&self, s: ServiceId, limit: usize) -> Result<Vec<DlqEntry>>;
     /// Move DLQ messages back with `attempt = 1`; returns how many.
     async fn dlq_redrive(&self, s: ServiceId) -> Result<u64>;
@@ -176,6 +200,8 @@ pub struct SqliteQueueStore {
     due: DueHint,
     /// Times `services_with_ready` went to the database (diagnostics, tests).
     scans: AtomicU64,
+    /// Failed invocations evicted by the per-service cap, not yet taken by the engine.
+    evicted: AtomicU64,
 }
 
 impl SqliteQueueStore {
@@ -227,6 +253,7 @@ impl SqliteQueueStore {
             max_attempts: max_attempts.max(1),
             due: Arc::new(Mutex::new(due)),
             scans: AtomicU64::new(0),
+            evicted: AtomicU64::new(0),
         }))
     }
 
@@ -240,7 +267,7 @@ impl SqliteQueueStore {
                 let tx = c.transaction()?;
                 let key = s.to_string();
                 let mut n = 0u64;
-                for table in ["messages", "dlq", "dedup", "delayed"] {
+                for table in ["messages", "dlq", "dedup", "delayed", "invocations"] {
                     n += tx.execute(&format!("DELETE FROM {table} WHERE service_id = ?1"), [&key])? as u64;
                 }
                 tx.commit()?;
@@ -529,6 +556,40 @@ impl QueueStore for SqliteQueueStore {
             .await
     }
 
+    async fn release_leased(&self, msgs: &[(MsgId, u16)], delay: Duration) -> Result<u64> {
+        if msgs.is_empty() {
+            return Ok(0);
+        }
+        let msgs: Vec<(String, i64)> = msgs.iter().map(|(id, a)| (id.to_string(), i64::from(*a))).collect();
+        let due = self.due.clone();
+        self.db
+            .call(move |c| {
+                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let at = now_ms().saturating_add(ms(delay));
+                let mut released = 0u64;
+                let mut services = Vec::new();
+                {
+                    let mut stmt = tx.prepare_cached(
+                        "UPDATE messages SET leased = 0, attempt = max(attempt - 1, 0), visible_at = ?3 \
+                         WHERE id = ?1 AND leased = 1 AND attempt = ?2 RETURNING service_id",
+                    )?;
+                    for (id, attempt) in &msgs {
+                        let s: Option<String> = stmt.query_row(params![id, attempt, at], |r| r.get(0)).optional()?;
+                        if let Some(s) = s {
+                            released += 1;
+                            services.push(s);
+                        }
+                    }
+                }
+                tx.commit()?;
+                for s in services {
+                    lower_due(&due, parse_col(&s, 0)?, at);
+                }
+                Ok(released)
+            })
+            .await
+    }
+
     async fn retry(&self, id: MsgId, delay: Duration) -> Result<RetryResult> {
         let (max_attempts, due) = (self.max_attempts, self.due.clone());
         self.db
@@ -561,6 +622,48 @@ impl QueueStore for SqliteQueueStore {
                     oldest_age_ms: oldest.map(|t| (now - t).max(0) as u64).unwrap_or(0),
                     dlq: dlq.max(0) as u64,
                 })
+            })
+            .await
+    }
+
+    async fn stats_all(&self) -> Result<HashMap<ServiceId, QueueStats>> {
+        self.db
+            .read(move |c| {
+                let now = now_ms();
+                let mut all: HashMap<ServiceId, QueueStats> = HashMap::new();
+                let mut msgs = c.prepare_cached(
+                    "SELECT service_id, \
+                     sum(leased = 0 OR visible_at <= ?1), \
+                     sum(leased = 1 AND visible_at > ?1), \
+                     min(CASE WHEN leased = 0 OR visible_at <= ?1 THEN enqueued_at END) \
+                     FROM messages GROUP BY service_id",
+                )?;
+                let rows = msgs.query_map([now], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, depth, in_flight, oldest) = row?;
+                    if let Ok(id) = id.parse::<ServiceId>() {
+                        let e = all.entry(id).or_default();
+                        e.depth = depth.max(0) as u64;
+                        e.in_flight = in_flight.max(0) as u64;
+                        e.oldest_age_ms = oldest.map(|t| (now - t).max(0) as u64).unwrap_or(0);
+                    }
+                }
+                let mut dlq = c.prepare_cached("SELECT service_id, count(*) FROM dlq GROUP BY service_id")?;
+                let rows = dlq.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+                for row in rows {
+                    let (id, n) = row?;
+                    if let Ok(id) = id.parse::<ServiceId>() {
+                        all.entry(id).or_default().dlq = n.max(0) as u64;
+                    }
+                }
+                Ok(all)
             })
             .await
     }

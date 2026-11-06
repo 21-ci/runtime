@@ -69,9 +69,25 @@ pub fn run(app: &App, cmd: &SecretCmd) -> Result<()> {
             }
             let rows: Vec<Vec<String>> = items
                 .iter()
-                .map(|s| vec![cell(s, "name"), fmt::ts_field(s, "updated_at")])
+                .map(|s| vec![cell(s, "name"), cell(s, "source"), fmt::ts_field(s, "updated_at")])
                 .collect();
-            fmt::emit(&fmt::table(&["NAME", "UPDATED"], &rows));
+            fmt::emit(&fmt::table(&["NAME", "SOURCE", "UPDATED"], &rows));
+        }
+        SecretCmd::Ref { svc, name, path, field } => {
+            let c = app.client()?;
+            let svc = resolve(&c, svc)?;
+            let url = svc.path(&format!("/secrets/{}/ref", fmt::enc(name)));
+            fmt::print_json(&c.put(&url, &json!({"path": path, "field": field}))?);
+        }
+        SecretCmd::Unref { svc, name } => {
+            let c = app.client()?;
+            let svc = resolve(&c, svc)?;
+            c.delete(&svc.path(&format!("/secrets/{}/ref", fmt::enc(name))), &[])?;
+        }
+        SecretCmd::Sync(a) => {
+            let c = app.client()?;
+            let svc = resolve(&c, &a.svc)?;
+            c.send(c.req(Method::POST, &svc.path("/secrets/sync")))?;
         }
         SecretCmd::Delete { svc, name } => {
             let c = app.client()?;

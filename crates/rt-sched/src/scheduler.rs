@@ -54,6 +54,8 @@ pub(crate) trait ErasedExecutor {
     fn interrupter(&self) -> Arc<dyn Interrupter>;
     fn on_idle(&mut self, budget: Duration);
     fn between_tasks(&mut self, budget: Duration);
+    fn next_deadline(&self) -> Option<std::time::Instant>;
+    fn wake_signal(&self) -> Option<Arc<tokio::sync::Notify>>;
 }
 
 impl<E: Executor> ErasedExecutor for E {
@@ -74,6 +76,14 @@ impl<E: Executor> ErasedExecutor for E {
 
     fn between_tasks(&mut self, budget: Duration) {
         Executor::between_tasks(self, budget)
+    }
+
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        Executor::next_deadline(self)
+    }
+
+    fn wake_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Executor::wake_signal(self)
     }
 }
 
@@ -340,6 +350,16 @@ impl Scheduler {
     /// Admission state of one service: adaptive limit, running and waiting tasks.
     pub fn service_admission(&self, service: ServiceId) -> Option<ServiceAdmission> {
         self.inner.admission.service(service)
+    }
+
+    /// Guest tasks of one service version admitted and not finished (the drain of a switch).
+    pub fn inflight_of(&self, service: ServiceId, version: u32) -> u32 {
+        self.inner.admission.inflight_of(service, version)
+    }
+
+    /// [`Scheduler::inflight_of`], or `None` when the version's tasks cannot be counted any more.
+    pub fn inflight_known(&self, service: ServiceId, version: u32) -> Option<u32> {
+        self.inner.admission.inflight_known(service, version)
     }
 
     /// One service's autoscaler view: admission state, learned latency baseline, demand, smoothed

@@ -551,6 +551,7 @@ async fn services_are_filtered_by_project_and_environment() {
             environment: environment.map(str::to_string),
             project_ids: None,
             environments: None,
+            ..ServiceFilter::default()
         };
         async move {
             let mut slugs: Vec<String> = m

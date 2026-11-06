@@ -1,6 +1,6 @@
 ---
 name: 21cloud-wasm-service
-description: Builds, debugs and reviews WebAssembly component services for the 21 Cloud Functions Runtime (WASI P2 `wasi:http` components run in wasmtime), in Rust (`wasm32-wasip2`, `wasip2` + `wit-bindgen`) or JavaScript (`jco componentize`). Use when a service uses the `wasm` runtime, when code imports the `std:host` WIT package (`std:host/kv`, `call`, `queue`, `sql`, `blob`, `sockets`, `durable`, `rpc`, ...), or when the user asks to write a Rust/WASM function, gateway or RPC service for 21 Cloud.
+description: Builds, debugs and reviews WebAssembly component services for the 21 Cloud Functions Runtime (WASI P2 `wasi:http` components run in wasmtime), in Rust (`wasm32-wasip2`, `wasip2` + `wit-bindgen`) or JavaScript (`jco componentize`). Use when a service uses the `wasm` runtime, when code imports the `std:host` WIT package (`std:host/kv`, `call`, `queue`, `pubsub`, `streams`, `sql`, `blob`, `sockets`, `durable`, `rpc`, ...), or when the user asks to write a Rust/WASM function, gateway or RPC service for 21 Cloud.
 ---
 
 # 21 Cloud: WASM component services
@@ -17,6 +17,9 @@ References:
 - [references/js-componentize.md](references/js-componentize.md): JavaScript with `jco componentize`.
 - Limits and invoke outcomes are shared with Deno: [21cloud-deno-service limits](../21cloud-deno-service/references/limits.md)
   (if that skill is not installed: https://github.com/21-ci/runtime/blob/main/skills/21cloud-deno-service/references/limits.md).
+
+
+Schema changes: `21ci push app.wasm --migrations DIR` stores `NNNN_name.sql` files with the version; they run once, in order, before it goes live. See `21ci-deploy`.
 
 ## Contract
 
@@ -40,8 +43,11 @@ References:
 | interval / cron schedule | `POST /__rt/scheduled` | `{"scheduleId", "scheduledTime", "payload"}` |
 | one-off (`std:host/schedule`) | `POST /__rt/scheduled` | `{"id", "scheduledAt", "payload"}` |
 | queue | `POST /__rt/queue` | `{"messages": [{"id", "body", "attempt"}]}`; answer `2xx` to ack the batch, anything else retries it |
+| pub/sub subscriber (`events.subscribe`) | `POST /__rt/pubsub` | `{"id", "subject", "body", "headers", "replyable", "publishedAt"}`; for a `request` (`replyable: true`) the response is the reply, otherwise answer `2xx`/`204` |
+| stream consumer (`events.consume`) | `POST /__rt/stream` | `{"topic", "group", "partition", "attempt", "messages": [{"partition", "offset", "key", "body", "headers", "timestamp"}]}`; `2xx` commits the batch; `2xx` with `x-rt-stream-fail-at: <offset>` commits the records before that offset and redelivers from it; anything else retries |
 
-   Route on `x-rt-trigger` or the path. `/__rt/` is reserved for the runtime.
+   Route on `x-rt-trigger` or the path. `/__rt/` is reserved for the runtime. The pub/sub and stream deliveries set
+   `x-rt-trigger: pubsub` / `stream`. Delivery is at least once for streams and async invocations, at most once for pub/sub.
 7. **Env and secrets** are the WASI environment (`wasi:cli/environment`); `std:host/secrets.get(name)` reads secret
    values only. Changes apply to the next task.
 8. **Logs:** stdout lines go to the service log at `info`, stderr at `error`, tagged with the task id (at most 1,000

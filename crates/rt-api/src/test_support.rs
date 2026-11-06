@@ -21,7 +21,9 @@ use rt_sec::{
     AuditEvent, AuditSink, DefaultAuthenticator, KeyHasher, KeyLookup, LocalQuotaEnforcer, LocalSecrets, MasterKey,
     PlanSource, QuotaEnforcer, SecretsBackend, SystemClock as WallSystemClock,
 };
-use rt_store::{DataConfig, LocalArtifactStore, LocalServiceData, MetaStore, SqliteMetaStore, SqliteQueueStore};
+use rt_store::{
+    DataConfig, LocalArtifactStore, LocalServiceData, MetaStore, SqliteMetaStore, SqliteQueueStore, SqliteStreamStore,
+};
 use rt_testkit::{MockBuildExecutor, MockDenoExecutor, MockPreparedSource, MockWasmExecutor, ScriptBook};
 use rt_triggers::{HubConfig, RouteTable, SocketHub};
 use rt_types::{
@@ -270,15 +272,46 @@ pub async fn node() -> TestNode {
         Arc::new(NoSocketTasks),
         tokio::runtime::Handle::current(),
     );
+    let config = Arc::new(ArcSwap::from_pointee(Config::default()));
+    let routes_table = RouteTable::new(None);
+    let routes_for_state = routes_table.clone();
+    let buckets = Arc::new(IngressBuckets::default());
+    let ingress = Arc::new(IngressCache::default());
+    let service_table = Arc::new(ArcSwap::from_pointee(Default::default()));
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let promoter = crate::promote::Promoter::new(crate::promote::PromoterDeps {
+        data: data.clone(),
+        meta: meta.clone(),
+        scheduler: scheduler.clone(),
+        config: config.clone(),
+        plans: plans.clone(),
+        clock: clock.clone(),
+        events,
+        refresher: Arc::new(crate::control::ApiRouteRefresh {
+            meta: meta.clone(),
+            routes: routes_table,
+            buckets: buckets.clone(),
+            ingress: ingress.clone(),
+            service_table: Arc::clone(&service_table),
+            node: facts.clone(),
+        }),
+    });
     let state = ApiState {
-        config: Arc::new(ArcSwap::from_pointee(Config::default())),
+        backups: Arc::new(crate::backups::NoBackups),
+        app_bundles: crate::app_bundle::AppBundles::new(
+            std::env::temp_dir().join(format!("rt-app-bundles-{}", ulid::Ulid::new())),
+        ),
+        promoter,
+        config,
         meta: meta.clone(),
         artifacts,
         queue: queue.clone(),
         delayed: queue.clone(),
         data,
+        streams: SqliteStreamStore::open_in_memory().expect("streams"),
+        invocations: queue.clone(),
         scheduler,
-        routes: RouteTable::new(None),
+        routes: routes_for_state,
         auth,
         quotas,
         plans,
@@ -294,12 +327,15 @@ pub async fn node() -> TestNode {
         node: facts.clone(),
         idem: Arc::new(IdemStore::default()),
         sse: Arc::new(SseLimiter::default()),
-        buckets: Arc::new(IngressBuckets::default()),
-        service_table: Arc::new(ArcSwap::from_pointee(Default::default())),
+        buckets,
+        service_table,
         tenant_table: Arc::new(DashMap::new()),
-        ingress: Arc::new(IngressCache::default()),
+        ingress,
         sockets,
+        data_browse: Arc::default(),
+        fetches: Arc::default(),
         uploads: Arc::new(tokio::sync::Semaphore::new(crate::MAX_CONCURRENT_UPLOADS)),
+        archives: Arc::new(crate::state::NoArchiveFetcher),
     };
     TestNode {
         dir,

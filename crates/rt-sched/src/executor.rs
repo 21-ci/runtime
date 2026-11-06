@@ -91,6 +91,21 @@ pub trait Executor: 'static {
     /// disposed or created) and starts another only while less than `budget` has elapsed. A new
     /// task may be waiting meanwhile, so never do more. The simulation never calls it.
     fn between_tasks(&mut self, _budget: Duration) {}
+
+    /// The earliest instant this executor has housekeeping due on its own (a kept instance's
+    /// keep-alive ends), so an idle Machine wakes for it instead of only at the next task. After
+    /// waking, the driver runs [`Executor::between_tasks`] as usual. `None`: nothing timed. Must
+    /// not return an instant that housekeeping leaves due (that would spin the Machine).
+    fn next_deadline(&self) -> Option<Instant> {
+        None
+    }
+
+    /// Notified by the executor when its [`Executor::next_deadline`] moved earlier or deferred
+    /// work appeared while the Machine may be parked (a task finished and kept or retired its
+    /// instance). The driver re-reads the deadline and housekeeps. Created once per executor.
+    fn wake_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+        None
+    }
 }
 
 /// The real-thread driver runs [`Executor::between_tasks`] at least once per this many

@@ -332,6 +332,11 @@ A non-empty target directory is refused unless you pass `--force`.
 
 ## Versions, activation and rollback
 
+A branch and the switch history of its parent, as `21ci` shows them:
+
+![21ci branch list and switch status output](../assets/screenshots/cli-branch-switch-light.png#only-light)
+![21ci branch list and switch status output](../assets/screenshots/cli-branch-switch-dark.png#only-dark)
+
 ```bash
 21ci versions hello             # all retained versions; * marks the live one
 21ci versions hello 2           # one version: build state, digests, failure
@@ -559,9 +564,9 @@ network, or ask your operator what route exists.
 
 === "21ci"
 
-    The `21ci` binary must be on the runner. There are no published binaries yet; build it from the runtime
-    repository (`make cli-install`, see [Install](../getting-started/install.md#install-the-cli)) or ask your operator for
-    one.
+    The `21ci` binary must be on the runner. Install a published release (Homebrew, apt, or the install script, see the
+    [README quickstart](https://github.com/21-ci/runtime#quickstart)), build it from the runtime repository
+    (`make cli-install`, see [Install](../getting-started/install.md#install-the-cli)), or ask your operator for one.
 
     ```yaml title=".github/workflows/deploy.yml"
     jobs:
@@ -600,6 +605,7 @@ network, or ask your operator what route exists.
 
 ## See also
 
+- [Deploy from a URL](../deploy.md#deploying-from-a-url), and [branches and switches](../deploy.md#branches-and-switches): `21ci from-url`, `21ci branch`, `21ci switch`.
 - [Get access](access.md): keys, scopes and `21ci` setup.
 - [Configure a service](configure.md): limits, access, env, secrets and callers.
 - [Logs, stats and usage](logs-and-usage.md): check what the new version does.

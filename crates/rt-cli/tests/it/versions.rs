@@ -333,3 +333,42 @@ fn rollback_close_sockets_is_in_the_body() {
     ctx.run(&["rollback", "hello", "--to", "2", "--close-sockets"]).ok();
     put.assert();
 }
+
+#[test]
+fn from_url_posts_the_archive_request() {
+    let ctx = Ctx::new();
+    ctx.lookup("hello", "svc_1");
+    let m = ctx.server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/services/svc_1/versions/from-url")
+            .json_body(json!({
+                "url": "https://git.example/a.tar.gz?t=x",
+                "headers": {"PRIVATE-TOKEN": "tok"},
+                "strip_components": 1,
+                "subdir": "apps/x",
+                "meta": {"git": {"sha": "abc1234"}},
+                "activate": "after_build",
+            }));
+        then.status(202).json_body(version_json(4, "building"));
+    });
+    let out = ctx
+        .run(&[
+            "from-url",
+            "hello",
+            "https://git.example/a.tar.gz?t=x",
+            "--header",
+            "PRIVATE-TOKEN: tok",
+            "--strip-components",
+            "1",
+            "--subdir",
+            "apps/x",
+            "--meta",
+            r#"{"git":{"sha":"abc1234"}}"#,
+            "--after-build",
+        ])
+        .ok();
+    m.assert();
+    assert!(out.lines().iter().any(|l| l.contains("after the build")));
+    ctx.run(&["from-url", "hello", "https://x.test/a", "--header", "no-colon"])
+        .fails_with(2);
+}

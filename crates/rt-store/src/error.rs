@@ -39,6 +39,16 @@ pub enum StoreError {
     /// with `LIMIT`/`OFFSET` or select fewer columns.
     #[error("sql result too large")]
     SqlResultTooLarge,
+    /// The data browser takes one read-only statement that returns rows (R9).
+    #[error("only one read-only statement is allowed")]
+    SqlNotReadonly,
+    /// A browse statement failed: SQLite's code and, for a syntax error, the offset.
+    #[error("sql error: {message}")]
+    SqlFailed {
+        code: i32,
+        offset: Option<i32>,
+        message: String,
+    },
     /// `kv.incr` on a value that is not a JSON integer in the `i64` range (`kv_not_integer`).
     #[error("kv value is not an integer")]
     KvNotInteger,
@@ -58,6 +68,9 @@ pub enum StoreError {
     /// plan's `max_warm_floor_total` (`limit_exceeds_plan`).
     #[error("`scaling.min_instances` summed over the tenant's services would be {total}, the plan allows {cap}")]
     WarmFloorTotal { total: u64, cap: u32 },
+    /// A migration did not run, or would not: nothing it did stays.
+    #[error("migration refused: {}", .0.code)]
+    Migration(Box<rt_types::MigrationFailure>),
 }
 
 impl StoreError {
@@ -74,9 +87,12 @@ impl StoreError {
             StoreError::SqlNotAuthorized => "sql_not_authorized",
             StoreError::SqlBusy => "sql_busy",
             StoreError::SqlResultTooLarge => "sql_result_too_large",
+            StoreError::SqlNotReadonly => "sql_not_readonly",
+            StoreError::SqlFailed { .. } => "sql_error",
             StoreError::KvNotInteger => "kv_not_integer",
             StoreError::KvOverflow => "kv_overflow",
             StoreError::WarmFloorTotal { .. } => "limit_exceeds_plan",
+            StoreError::Migration(f) => f.code,
             StoreError::Corrupt(_) | StoreError::Sqlite(_) | StoreError::Io(_) | StoreError::Internal(_) => "internal",
         }
     }

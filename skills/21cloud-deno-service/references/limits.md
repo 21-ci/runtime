@@ -6,6 +6,9 @@ operator can change profiles and plans; `21ci whoami --json` and `21ci limits` s
 
 ## Per task
 
+The `min_run_time_ms` knob (`scaling`, per service) keeps a reused isolate alive after it answered, for queued work; the
+plan caps it at `limits_max.min_run_time_ms` (60 s on `free`). `0` drops the isolate right after the answer unless work waits.
+
 | Limit | HTTP / call / socket event / alarm | interval, cron, one-off schedule | queue |
 |---|---|---|---|
 | Wall time | 30 s (call: min(own, caller remaining)) | 300 s | 300 s |
@@ -24,8 +27,9 @@ A service may lower or raise `limits.wall_ms`, `cpu_ms`, `memory_mb`, `max_body_
 
 `max_services` 10, `max_concurrency` 10, `max_instances` 4 per service, `rps` 50, `invocations_per_day` 100,000,
 `storage_mb` 100, `egress_mb_per_day` 1,000, `max_schedules` 3 per service, `min_schedule_seconds` 60,
-`max_queue_depth` 10,000, `builds_per_hour` 20, `allowed_triggers` `http interval queue call websocket` (**no `cron`**),
-`limits_max` wall 30 s / CPU 1 s / 128 MB, no custom host suffixes, no cross-tenant calls, `max_sockets` 1,000,
+`max_queue_depth` 10,000, `builds_per_hour` 20, `allowed_triggers` `http interval queue call websocket pubsub stream` (**no `cron`**),
+`limits_max` wall 30 s / CPU 1 s / 128 MB / `min_run_time_ms` 60 s, `max_async_pending` 10,000, `max_topics` 10, `max_topic_partitions` 4,
+`max_stream_retention_hours` 72, `max_stream_mb` 100, no custom host suffixes, no cross-tenant calls, `max_sockets` 1,000,
 `max_sockets_per_object` 1,000, `ws_max_message_bytes` 1 MiB. Other plans are operator-defined.
 
 ## Uploads (Deno)
@@ -51,6 +55,11 @@ Syntax errors and forbidden imports are `422 validation_failed` at upload, with 
 | Total | plan `storage_mb` across KV, SQL, blobs and durable storage (`storage_quota`) |
 | Env + secrets | at most 100 entries per service, values at most 32 KB, names `[A-Z_][A-Z0-9_]*`, no `RT_` prefix |
 | Queue message | 1 MB, delay at most 7 days, dedup window 24 h |
+| Pub/sub | subject 256 bytes and 16 tokens, body 1 MiB, headers 32 / 16 KiB, fan-out 100 receivers per publish, 64 deliveries in flight per subscriber, 32 subscriptions per service, `request` timeout 5 s default, 30 s max |
+| Stream append | 100 records and 4 MiB per call, key 256 bytes, dedup id 128 bytes and a 2-minute window, one rate token per call |
+| Stream read | 100 records and 1 MiB per page, `partition` required on a multi-partition topic |
+| Stream consumer | `batch_size` 1 to 1,000 (1 MiB of bodies), `max_attempts` 1 to 100 (default 10), 8 consumers per service, 1,000 dead letters per consumer kept 7 days |
+| Async invocation | request body 1 MiB (larger runs sync with `Prefer`, `413` with `Event`), `max_attempts` 1 to 10 (default 3), `max_event_age_s` 60 to 86,400 (default 3,600), 256 attempts at once per node, failed records kept 7 days (1,000 per service), succeeded 24 h |
 | One-off schedules | 1,000 pending per service, payload 16 KiB, at most 30 days ahead |
 | Interval/cron schedule payload | 64 KB |
 | RPC / SDK call argument and result | 256 KiB each way |

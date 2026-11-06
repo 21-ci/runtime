@@ -99,6 +99,7 @@ jobs:
       TARGET: ${{ matrix.target }}
       BINS: ${{ matrix.bins }}
       DOCKER_ARCH: ${{ matrix.docker_arch }}
+      RT_TELEMETRY_URL: ${{ vars.RT_TELEMETRY_URL }}
       MACOSX_DEPLOYMENT_TARGET: "11.0"
       CC_x86_64_unknown_linux_musl: musl-gcc
       CC_aarch64_unknown_linux_musl: musl-gcc

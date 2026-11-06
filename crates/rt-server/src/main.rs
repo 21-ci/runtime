@@ -61,6 +61,14 @@ async fn main() -> anyhow::Result<()> {
             server.shutdown().await;
         }
         Command::Openapi => unreachable!("handled above"),
+        Command::Telemetry {
+            action: rt_server::cli::TelemetryCommand::Show,
+        } => {
+            println!("{}", rt_server::telemetry::show(&loaded.config).await?);
+        }
+        Command::Backup { action } => {
+            std::process::exit(rt_server::backup::run_offline(&action, &loaded.config, &loaded.secrets));
+        }
         Command::Secrets {
             action: rt_server::SecretsCommand::Reseal,
         } => {

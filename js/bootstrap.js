@@ -62,6 +62,7 @@ const {
   SetPrototypeHas,
   StringFromCharCode,
   StringPrototypeCharCodeAt,
+  StringPrototypeSplit,
   StringPrototypeStartsWith,
   StringPrototypeToLowerCase,
   StringPrototypeTrim,
@@ -114,6 +115,11 @@ const {
   op_rt_blob_delete,
   op_rt_blob_list,
   op_rt_enqueue,
+  op_rt_pubsub_publish,
+  op_rt_pubsub_request,
+  op_rt_stream_append,
+  op_rt_stream_read,
+  op_rt_stream_info,
   op_rt_lock_acquire,
   op_rt_lock_release,
   op_rt_schedule_after,
@@ -875,6 +881,300 @@ async function enqueue(service, body, opts) {
   );
   return { id };
 }
+
+// ---------------------------------------------------------------------------------------------
+// std:pubsub / std:stream. The bounds mirror rt_types::events (the host checks them again).
+// ---------------------------------------------------------------------------------------------
+
+const EVENT_BODY_MAX_BYTES = 1024 * 1024;
+const EVENT_HEADERS_MAX = 32;
+const EVENT_HEADERS_MAX_BYTES = 16 * 1024;
+const EVENT_HEADER_VALUE_MAX = 4096;
+const SUBJECT_MAX_BYTES = 256;
+const SUBJECT_MAX_TOKENS = 16;
+const TOPIC_NAME_MAX = 63;
+const STREAM_KEY_MAX_BYTES = 256;
+const DEDUP_ID_MAX_BYTES = 128;
+const APPEND_BATCH_MAX = 100;
+const APPEND_BATCH_MAX_BYTES = 4 * 1024 * 1024;
+const READ_LIMIT_MAX = 100;
+const PARTITIONS_HARD_MAX = 16;
+const SUBJECT_TOKEN_RE = /^[A-Za-z0-9_-]+$/;
+const TOPIC_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
+const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const HEADER_VALUE_BAD_RE = /[\r\n\0]/;
+const STREAM_FAIL_AT_HEADER = "x-rt-stream-fail-at";
+
+function invalid() {
+  return coded(new Error("validation_failed"));
+}
+
+function tooLarge() {
+  return coded(new Error("too_large"));
+}
+
+function utf8Len(s) {
+  return textEncoder.encode(s).byteLength;
+}
+
+function eventBody(body) {
+  if (body instanceof Uint8Array) {
+    return body;
+  }
+  const text = JSONStringify(body);
+  return text === undefined ? new Uint8Array(0) : textEncoder.encode(text);
+}
+
+function checkEventBody(bytes) {
+  if (TypedArrayPrototypeGetByteLength(bytes) > EVENT_BODY_MAX_BYTES) {
+    throw tooLarge();
+  }
+  return bytes;
+}
+
+function eventOpts(opts) {
+  if (opts === undefined || opts === null) {
+    return { __proto__: null };
+  }
+  if (typeof opts !== "object") {
+    throw invalid();
+  }
+  return opts;
+}
+
+// `{name: value}` -> `[[name, value]]`, checked like `validate_headers`.
+function eventHeaders(h) {
+  if (h === undefined || h === null) {
+    return [];
+  }
+  if (typeof h !== "object" || ArrayIsArray(h)) {
+    throw invalid();
+  }
+  const out = [];
+  let bytes = 0;
+  for (const k of ObjectKeys(h)) {
+    const v = String(h[k]);
+    bytes += utf8Len(k) + utf8Len(v);
+    ArrayPrototypePush(out, [k, v]);
+  }
+  if (out.length > EVENT_HEADERS_MAX || bytes > EVENT_HEADERS_MAX_BYTES) {
+    throw tooLarge();
+  }
+  for (let i = 0; i < out.length; i++) {
+    const k = out[i][0];
+    const v = out[i][1];
+    if (!RegExpPrototypeTest(HEADER_NAME_RE, k) || StringPrototypeStartsWith(StringPrototypeToLowerCase(k), "x-rt-")) {
+      throw invalid();
+    }
+    if (utf8Len(v) > EVENT_HEADER_VALUE_MAX || RegExpPrototypeTest(HEADER_VALUE_BAD_RE, v)) {
+      throw invalid();
+    }
+  }
+  return out;
+}
+
+function checkSubject(subject) {
+  if (typeof subject !== "string" || subject === "" || utf8Len(subject) > SUBJECT_MAX_BYTES) {
+    throw invalid();
+  }
+  const tokens = StringPrototypeSplit(subject, ".");
+  if (tokens.length > SUBJECT_MAX_TOKENS || tokens[0] === "_rt") {
+    throw invalid();
+  }
+  for (let i = 0; i < tokens.length; i++) {
+    if (!RegExpPrototypeTest(SUBJECT_TOKEN_RE, tokens[i])) {
+      throw invalid();
+    }
+  }
+  return subject;
+}
+
+function checkTopic(topic) {
+  if (
+    typeof topic !== "string" ||
+    topic.length > TOPIC_NAME_MAX ||
+    !RegExpPrototypeTest(TOPIC_NAME_RE, topic) ||
+    StringPrototypeStartsWith(topic, "tpc_")
+  ) {
+    throw invalid();
+  }
+  return topic;
+}
+
+// `publish(subject, body, opts)` -> `{receivers, dropped}`.
+async function pubsubPublish(subject, body, opts) {
+  checkSubject(subject);
+  const o = eventOpts(opts);
+  const headers = eventHeaders(o.headers);
+  const bytes = checkEventBody(eventBody(body));
+  const r = await guard(op_rt_pubsub_publish({ __proto__: null, subject, headers }, bytes));
+  return { receivers: r.receivers, dropped: r.dropped };
+}
+
+// The reply of a request, decoded by its content type.
+function decodeReply(r) {
+  const body = r.body;
+  if (TypedArrayPrototypeGetByteLength(body) === 0) {
+    return undefined;
+  }
+  const ct = r.contentType === null || r.contentType === undefined ? "" : StringPrototypeToLowerCase(r.contentType);
+  if (StringPrototypeStartsWith(ct, "application/json")) {
+    return JSONParse(textDecoder.decode(body));
+  }
+  if (StringPrototypeStartsWith(ct, "text/")) {
+    return textDecoder.decode(body);
+  }
+  return body;
+}
+
+// `request(subject, body, opts)` -> the decoded reply.
+async function pubsubRequest(subject, body, opts) {
+  checkSubject(subject);
+  const o = eventOpts(opts);
+  const headers = eventHeaders(o.headers);
+  if (o.timeoutMs !== undefined && (typeof o.timeoutMs !== "number" || !NumberIsFinite(o.timeoutMs))) {
+    throw invalid();
+  }
+  const bytes = checkEventBody(eventBody(body));
+  const r = await guard(
+    op_rt_pubsub_request(
+      { __proto__: null, subject, headers, timeoutMs: o.timeoutMs === undefined ? null : o.timeoutMs },
+      bytes,
+    ),
+  );
+  return decodeReply(r);
+}
+
+// One record to append: its metadata and its body bytes.
+function appendRecord(body, opts) {
+  const o = eventOpts(opts);
+  let key = null;
+  if (o.key !== undefined && o.key !== null) {
+    key = String(o.key);
+    if (utf8Len(key) > STREAM_KEY_MAX_BYTES) {
+      throw invalid();
+    }
+  }
+  let dedupId = null;
+  if (o.dedupId !== undefined && o.dedupId !== null) {
+    dedupId = String(o.dedupId);
+    const n = utf8Len(dedupId);
+    if (n === 0 || n > DEDUP_ID_MAX_BYTES) {
+      throw invalid();
+    }
+  }
+  const headers = eventHeaders(o.headers);
+  const bytes = checkEventBody(eventBody(body));
+  return { meta: { __proto__: null, key, headers, dedupId, len: TypedArrayPrototypeGetByteLength(bytes) }, bytes };
+}
+
+async function appendRecords(topic, recs) {
+  let total = 0;
+  for (let i = 0; i < recs.length; i++) {
+    total += recs[i].bytes.byteLength;
+  }
+  if (total > APPEND_BATCH_MAX_BYTES) {
+    throw tooLarge();
+  }
+  const all = new Uint8Array(total);
+  let at = 0;
+  for (let i = 0; i < recs.length; i++) {
+    TypedArrayPrototypeSet(all, recs[i].bytes, at);
+    at += recs[i].bytes.byteLength;
+  }
+  const out = await guard(
+    op_rt_stream_append({ __proto__: null, topic, entries: ArrayPrototypeMap(recs, (r) => r.meta) }, all),
+  );
+  return ArrayPrototypeMap(out, (a) => ({ partition: a.partition, offset: a.offset, duplicate: a.duplicate }));
+}
+
+// `append(topic, body, opts)` -> `{partition, offset, duplicate}`.
+async function streamAppend(topic, body, opts) {
+  checkTopic(topic);
+  const out = await appendRecords(topic, [appendRecord(body, opts)]);
+  return out[0];
+}
+
+// `appendBatch(topic, records)`: 1..100 records, one transaction.
+async function streamAppendBatch(topic, records) {
+  checkTopic(topic);
+  if (!ArrayIsArray(records) || records.length === 0) {
+    throw invalid();
+  }
+  if (records.length > APPEND_BATCH_MAX) {
+    throw tooLarge();
+  }
+  const recs = ArrayPrototypeMap(records, (r) => {
+    if (r === null || typeof r !== "object") {
+      throw invalid();
+    }
+    return appendRecord(r.body, r);
+  });
+  return await appendRecords(topic, recs);
+}
+
+function wholeNumber(v) {
+  return typeof v === "number" && NumberIsSafeInteger(v) && v >= 0;
+}
+
+// `read(topic, opts)` -> `{records, next, end}`.
+async function streamRead(topic, opts) {
+  checkTopic(topic);
+  const o = eventOpts(opts);
+  let partition = null;
+  if (o.partition !== undefined && o.partition !== null) {
+    if (!wholeNumber(o.partition) || o.partition >= PARTITIONS_HARD_MAX) {
+      throw invalid();
+    }
+    partition = o.partition;
+  }
+  const hasFrom = o.from !== undefined && o.from !== null;
+  const hasTime = o.fromTime !== undefined && o.fromTime !== null;
+  if (hasFrom && hasTime) {
+    throw invalid();
+  }
+  let kind = "earliest";
+  let value = 0;
+  if (hasTime) {
+    if (!wholeNumber(o.fromTime)) {
+      throw invalid();
+    }
+    kind = "time";
+    value = o.fromTime;
+  } else if (hasFrom) {
+    if (o.from === "earliest" || o.from === "latest") {
+      kind = o.from;
+    } else if (wholeNumber(o.from)) {
+      kind = "offset";
+      value = o.from;
+    } else {
+      throw invalid();
+    }
+  }
+  let limit = READ_LIMIT_MAX;
+  if (o.limit !== undefined && o.limit !== null) {
+    if (!wholeNumber(o.limit) || o.limit < 1 || o.limit > READ_LIMIT_MAX) {
+      throw invalid();
+    }
+    limit = o.limit;
+  }
+  return await guard(op_rt_stream_read({ __proto__: null, topic, partition, kind, value, limit }));
+}
+
+// `info(topic)`.
+async function streamInfo(topic) {
+  checkTopic(topic);
+  return await guard(op_rt_stream_info(topic));
+}
+
+const pubsubApi = ObjectFreeze({ __proto__: null, publish: pubsubPublish, request: pubsubRequest });
+const streamApi = ObjectFreeze({
+  __proto__: null,
+  append: streamAppend,
+  appendBatch: streamAppendBatch,
+  read: streamRead,
+  info: streamInfo,
+});
 
 // `services.fetch(slug, request)` (and the legacy `call`): the callee answers any response. The paths
 // under `/__rt/` are the runtime's own (RPC below) and are not reachable this way.
@@ -1923,6 +2223,11 @@ function makeCtx(p, pending) {
                 : ObjectFreeze({ name: p.ctx.caller.sdk.name, version: p.ctx.caller.sdk.version }),
             environment: p.ctx.caller.environment,
           }),
+    // An async HTTP invocation only: its id and this delivery's attempt (1-based).
+    invocation:
+      p.ctx.invocation === null || p.ctx.invocation === undefined
+        ? undefined
+        : ObjectFreeze({ id: p.ctx.invocation.id, attempt: p.ctx.invocation.attempt }),
     deadline: p.ctx.deadline,
     // The object this task acts for (a socket event, an alarm, a request to a durable object).
     object: p.ctx.object === null || p.ctx.object === undefined ? undefined : ObjectFreeze({ name: p.ctx.object.name }),
@@ -2100,6 +2405,76 @@ async function handle(p, pending) {
     return await pumpResponse(checkResponse(res));
   }
 
+  if (trigger === "pubsub") {
+    if (isB && typeof def.pubsub === "function") {
+      const m = p.pubsub;
+      const msg = ObjectFreeze({
+        id: m.id,
+        subject: m.subject,
+        body: m.body,
+        headers: ObjectFreeze(m.headers),
+        replyable: m.replyable,
+        publishedAt: m.publishedAt,
+      });
+      const out = await def.pubsub(msg, ctx);
+      if (!m.replyable) {
+        return plainResponse(204);
+      }
+      return await pumpResponse(replyResponse(out));
+    }
+    if (fetchFn === null) {
+      throw new TypeError("handler has neither pubsub() nor fetch()");
+    }
+    const res = await fetchFn(syntheticRequest(p, "/__rt/pubsub", p.pubsub), ctx);
+    return await pumpResponse(checkResponse(res));
+  }
+
+  if (trigger === "stream") {
+    if (isB && typeof def.stream === "function") {
+      const b = p.stream;
+      const offsets = new SafeSet();
+      const messages = ArrayPrototypeMap(b.messages, (r) => {
+        SetPrototypeAdd(offsets, r.offset);
+        return ObjectFreeze({
+          partition: r.partition,
+          offset: r.offset,
+          key: r.key,
+          body: r.body,
+          headers: ObjectFreeze(r.headers),
+          timestamp: r.timestamp,
+        });
+      });
+      let failAt = null;
+      const batch = ObjectFreeze({
+        topic: b.topic,
+        group: b.group,
+        partition: b.partition,
+        attempt: b.attempt,
+        messages: ObjectFreeze(messages),
+        failAt(m) {
+          const off = typeof m === "number" ? m : m !== null && typeof m === "object" ? m.offset : undefined;
+          if (!SetPrototypeHas(offsets, off)) {
+            throw invalid();
+          }
+          if (failAt === null || off < failAt) {
+            failAt = off;
+          }
+        },
+      });
+      await def.stream(batch, ctx);
+      const headers = { __proto__: null };
+      if (failAt !== null) {
+        headers[STREAM_FAIL_AT_HEADER] = String(failAt);
+      }
+      return plainResponse(200, headers);
+    }
+    if (fetchFn === null) {
+      throw new TypeError("handler has neither stream() nor fetch()");
+    }
+    const res = await fetchFn(syntheticRequest(p, "/__rt/stream", p.stream), ctx);
+    return await pumpResponse(checkResponse(res));
+  }
+
   if (fetchFn === null) {
     throw new TypeError("module has no default handler");
   }
@@ -2109,6 +2484,24 @@ async function handle(p, pending) {
     await guard(op_rt_task_commit());
   }
   return await pumpResponse(res);
+}
+
+// The reply of a `pubsub()` handler to a request: undefined -> 204, a Response as is, bytes,
+// text or JSON.
+function replyResponse(out) {
+  if (out === undefined) {
+    return new Response(null, { status: 204 });
+  }
+  if (out instanceof Response) {
+    return out;
+  }
+  if (out instanceof Uint8Array) {
+    return new Response(out, { headers: { "content-type": "application/octet-stream" } });
+  }
+  if (typeof out === "string") {
+    return new Response(out, { headers: { "content-type": "text/plain; charset=utf-8" } });
+  }
+  return new Response(JSONStringify(out), { headers: { "content-type": "application/json" } });
 }
 
 function checkResponse(res) {
@@ -2320,6 +2713,8 @@ ObjectDefineProperty(globalThis, "__rt", {
     sql,
     blob,
     queue: ObjectFreeze({ __proto__: null, enqueue }),
+    pubsub: pubsubApi,
+    stream: streamApi,
     services: ObjectFreeze({ __proto__: null, fetch: serviceFetch, call: rpcCall, bind: rpcBind }),
     serviceError: ServiceError,
     sdk: ObjectFreeze({ __proto__: null, sdk, SdkError, defineSdk }),

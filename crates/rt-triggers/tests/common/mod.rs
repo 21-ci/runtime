@@ -47,6 +47,7 @@ pub fn entry(tenant: u128, service: u128, slug: &str, version: u32) -> RouteEntr
         project: rt_types::ProjectId::from_u128(tenant),
         environment: rt_types::DEFAULT_ENVIRONMENT.to_string(),
         call: rt_types::CallAccess::default(),
+        isolated: false,
     }
 }
 
@@ -143,6 +144,7 @@ struct StoreInner {
     retries: Vec<RetryRecord>,
     acked: Vec<MsgId>,
     enqueued: Vec<(ServiceId, NewMessage)>,
+    releases: Vec<RetryRecord>,
 }
 
 /// In-memory `QueueStore` on a virtual clock. Semantics follow `rt_store::queue`:
@@ -173,6 +175,11 @@ impl FakeQueueStore {
 
     pub fn retry_log(&self) -> Vec<RetryRecord> {
         self.inner.lock().retries.clone()
+    }
+
+    /// Throttle releases (`release_leased`): `result` carries the refunded attempt.
+    pub fn release_log(&self) -> Vec<RetryRecord> {
+        self.inner.lock().releases.clone()
     }
 
     pub fn acked(&self) -> Vec<MsgId> {
@@ -294,6 +301,33 @@ impl QueueStore for FakeQueueStore {
         Ok(result)
     }
 
+    async fn release_leased(&self, msgs: &[(MsgId, u16)], delay: Duration) -> Result<u64, StoreError> {
+        let now = self.now();
+        let mut g = self.inner.lock();
+        let mut n = 0;
+        for (id, attempt) in msgs {
+            let Some(m) = g
+                .msgs
+                .iter_mut()
+                .find(|m| m.id == *id && m.attempt == *attempt && m.in_flight_until_ms > 0)
+            else {
+                continue;
+            };
+            m.attempt = m.attempt.saturating_sub(1);
+            m.in_flight_until_ms = 0;
+            m.visible_at_ms = now + delay.as_millis() as i64;
+            let attempt = m.attempt;
+            g.releases.push(RetryRecord {
+                id: *id,
+                at_ms: now,
+                delay,
+                result: RetryResult::Requeued { attempt },
+            });
+            n += 1;
+        }
+        Ok(n)
+    }
+
     async fn stats(&self, s: ServiceId) -> Result<QueueStats, StoreError> {
         let now = self.now();
         let g = self.inner.lock();
@@ -313,6 +347,22 @@ impl QueueStore for FakeQueueStore {
             oldest_age_ms: oldest.max(0) as u64,
             dlq,
         })
+    }
+
+    async fn stats_all(&self) -> Result<HashMap<ServiceId, QueueStats>, StoreError> {
+        let services: std::collections::HashSet<ServiceId> = {
+            let g = self.inner.lock();
+            g.msgs
+                .iter()
+                .map(|m| m.service)
+                .chain(g.dlq.iter().map(|(svc, _)| *svc))
+                .collect()
+        };
+        let mut all = HashMap::new();
+        for s in services {
+            all.insert(s, self.stats(s).await?);
+        }
+        Ok(all)
     }
 
     async fn dlq_list(&self, s: ServiceId, limit: usize) -> Result<Vec<DlqEntry>, StoreError> {

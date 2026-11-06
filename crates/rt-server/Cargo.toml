@@ -34,12 +34,14 @@ rt-store.workspace = true
 rt-cache.workspace = true
 rt-host.workspace = true
 rt-build.workspace = true
+rt-backup.workspace = true
 rt-exec-deno.workspace = true
 rt-exec-wasm.workspace = true
 rt-triggers.workspace = true
 rt-api.workspace = true
 clap.workspace = true
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal", "fs", "io-util"] }
+tempfile.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -71,3 +73,8 @@ reqwest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 zip.workspace = true
+tar.workspace = true
+zstd.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+flate2.workspace = true

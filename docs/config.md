@@ -188,6 +188,10 @@ max_queued = 0                  # Node bound on waiting tasks; over it 503 overl
                                  # 0 = auto (4 x max_inflight); one service may hold half
 max_queued_mb = 0               # Node bound on bytes held by waiting tasks (MB)
                                  # 0 = auto (1/16 of the memory budget)
+min_run_time_max_ms = 600000    # Largest scaling.min_run_time_ms any service may set (0..=86400000)
+                                 # The plan's limits_max.min_run_time_ms may lower it
+aging_factor = 4                # Admission aging k (0..=64): deadline = since + min(k*pred, queue_timeout/2)
+                                 # 0 = arrival order within a tenant
 
 spin_us = 10                    # Processor spin time (μs) before sleep
                                  # Higher = lower latency but more CPU usage
@@ -216,7 +220,9 @@ warm_share = 0.15               # Share of the memory budget warm instances may 
 Per-service concurrency is adaptive: each service starts at a profile limit and the
 scheduler grows it while requests wait and latency holds, and shrinks it on latency regressions, memory
 pressure or saturated processors. An *instance* is one concurrently running copy of a service
-A service's `scaling.max_instances` is a hard cap on its instances (the adaptive limit)
+A service's `scaling.max_instances` is a hard cap on its instances (the adaptive limit; only the
+service's own self-calls and self-request replies may borrow the instance their waiting parent
+holds: at most one per waiting parent, and never more than 15 past the cap)
 and `scaling.min_instances` keeps that many warm and floors the limit; both are at most the plan's
 `max_instances`, and the plan's `max_concurrency` caps a tenant. Over a limit, requests wait (FIFO per
 service, fair across tenants).
@@ -387,8 +393,12 @@ max_conns_per_ip = 256          # Open connections per peer IP
 h2_max_streams = 100            # Concurrent HTTP/2 streams per connection
 sse_streams_per_key = 10        # Concurrent log/event streams per credential
 backlog = 4096                  # listen() backlog of each TCP listener
+rate_keys_max = 0               # Client cells of by-IP rate rules (0 = auto)
 ```
 
+- **`rate_keys_max`** bounds the memory of by-IP `ingress.rate_rules`, at about 90 bytes per client.
+  One service holds at most 1/8 of the cells, so its IP churn cannot crowd out the others. `0` is as many
+  as fit in 1/64 of the memory budget (at least 1024). Past a cap, new clients share one cell per rule.
 - **`backlog`** is the queue of connections the kernel has accepted but the node has not yet
   picked up. A burst larger than the backlog gets connection resets. The kernel silently caps
   the value: raise `kern.ipc.somaxconn` (macOS, default 128) or `net.core.somaxconn` (Linux,
@@ -469,9 +479,53 @@ Remaining sections keep the shape of the defconfigs; every key is listed in `con
 |---------|------|
 | `[build]` | `threads`, `memory_mb`, `timeout` (Deno build), `wasm_timeout`, `fetch_timeout` (per module), `npm_cdn`, `allowed_hosts`, `max_deps_mb`, `compile` |
 | `[queue]` | `batch_size`, `max_attempts`, `max_concurrency` (per-service concurrent queue tasks) |
-| `[sysmon]` `[rebalance]` `[io]` `[disk]` `[deploy]` `[s3]` `[supervisor]` `[secrets]` `[egress]` `[logs]` `[metrics]` `[otel]` | see the defconfigs |
-| `[plans.<name>]` | tenant plans (a `free` plan always exists), see [SECURITY.md](https://github.com/21-ci/runtime/blob/main/SECURITY.md#tenancy-plans-and-quotas) |
+| `[backup]` | `enabled` (false), `schedule` (`"0 3 * * *"`, cron, UTC; a bad one stops startup when enabled), `dir` (empty: `<data_dir>/backups`), `keep_last` (3, at least 1), `encrypt_to` (`[]`, age public keys), `allow_plaintext_remote` (false). `[backup.s3]`: `endpoint` (empty: no upload), `bucket`, `prefix`, `region` (`auto`), `access_key_file`, `secret_key_file`, `keep_local` (1), `keep_last` (7), `keep_daily` (7), `keep_weekly` (4); an endpoint needs `encrypt_to` unless plaintext is allowed. Restart required. See the [deploy guide](deploy.md#backup-and-restore). |
+| `[telemetry]` | `enabled` (true), `url` (`"auto"`: the URL set at build time with `RT_TELEMETRY_URL`, if any; `""`: no sending; otherwise an `https` URL without credentials, query or fragment). `RT_TELEMETRY_URL` at run time beats `url`; `DO_NOT_TRACK=1` beats everything. Restart-required. See [SECURITY.md](https://github.com/21-ci/runtime/blob/main/SECURITY.md#telemetry) |
+| `[deploy]` | `retain_versions` (10), `auto_rollback` (true), `drain_max` (`"15m"`, bounded `1s`..`24h`; restart required): the longest a superseded version may keep a switch in `draining` after a live-version flip. The drain deadline is the longest task wall or queue timeout plus 30 s, capped by this. `dry_run_max_mb` (256, at least 1; restart required): the most data a branch's `copy_data` may copy, database and blobs together; over it the create is `413 copy_data_too_large`, and a migration dry run is `413 dry_run_too_large`. `migration_budget` (`"60s"`, bounded `1s`..`1h`): how long one version's SQL migrations may take at a promote; over it they roll back with `409 migration_timeout`. |
+| `[import]` | `max_bundle_mb` (4096, at least 1; restart required): the largest app bundle `POST /v1/services/import` takes, counted as it arrives; over it the import is `413 too_large`. A bundle may unpack to eight times this. |
+| `[sysmon]` `[rebalance]` `[io]` `[disk]` `[s3]` `[supervisor]` `[secrets]` `[egress]` `[logs]` `[metrics]` `[otel]` | see the defconfigs |
+| `[plans.<name>]` | tenant plans (a `free` plan always exists), see [SECURITY.md](https://github.com/21-ci/runtime/blob/main/SECURITY.md#tenancy-plans-and-quotas). Preview keys: `max_scratch` (5; 0 = no cap of its own), `scratch_ttl_max` (604800 seconds; 0 = no cap). Event keys: `max_async_pending` (pending async invocations per service, free 10000), `max_topics` (topics per tenant, free 10), `max_topic_partitions` (1..=16, free 4), `max_stream_mb` (stream record MB per tenant, free 100), `max_stream_retention_hours` (free 72). Platform caps, 0 = none: `cpu_ms_per_day` (free 0), `max_projects` (free 20), `max_environments_per_project` (free 10), `max_branches` (free 10), `max_secrets_per_service` (free 100), `max_custom_hosts` (free 10), `max_versions_retained` and `log_retention_days` (free 0 = the node's value; a plan only lowers it), `max_fetches_per_call` and `max_log_lines_per_call` (free 0 = trigger defaults; a plan only lowers them). See the hosted plan example below; `limits_max.min_run_time_ms` (largest `scaling.min_run_time_ms`, free 60000; the effective cap is the lower of it and `sched.min_run_time_max_ms`). `allowed_triggers` values: `http`, `interval`, `cron`, `queue`, `call`, `websocket`, `pubsub`, `stream` (free default: all but `cron`) |
 | `[[binding]]` | operator platform bindings (reachable from operator SDK services only). Operator SDKs are not configured here: `21ci sdk publish`; a leftover `[[sdk]]` fails to load |
+
+Hosted plan example. Defconfigs state no plans, so a node runs the built-in `free` until you add these:
+
+```toml
+[plans.free]
+cpu_ms_per_day = 3600000
+max_projects = 3
+max_environments_per_project = 3
+max_branches = 3
+max_secrets_per_service = 25
+max_custom_hosts = 1
+max_versions_retained = 5
+log_retention_days = 1
+max_fetches_per_call = 25
+
+[plans.pro]
+max_services = 100
+invocations_per_day = 10000000
+storage_mb = 10240
+egress_mb_per_day = 100000
+cpu_ms_per_day = 86400000
+max_projects = 50
+max_environments_per_project = 10
+max_branches = 25
+max_custom_hosts = 25
+max_versions_retained = 20
+log_retention_days = 7
+
+[plans.enterprise]
+max_services = 1000
+rps = 5000
+invocations_per_day = 0
+storage_mb = 1048576
+egress_mb_per_day = 10000000
+max_projects = 0
+max_environments_per_project = 0
+max_branches = 0
+max_secrets_per_service = 0
+max_custom_hosts = 0
+```
 
 `scaling` is **not** in this list: it is a per-service block, not node configuration.
 
@@ -864,3 +918,16 @@ Increase queue timeout:
 [sched]
 queue_timeout = "10s"  # From 5s
 ```
+
+## External secrets: `[secrets.vault]`
+
+Off while `address` is empty. Values sync into the sealed store; tasks never talk to Vault.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `address` | `""` | `https://…` (plain `http` to loopback only) |
+| `token_file` | `""` | File holding a token, read at each use. Or `role_id_file` plus `secret_id_file` (AppRole) |
+| `mount` | `secret` | KV v2 mount |
+| `path_template` | `rt/{tenant}/{project}/{environment}/` | Must name all three variables; values are ids and the environment name |
+| `poll` | `60s` | Sync interval, at least `10s`; at most 50 reads a pass. Restart to change |
+| `ca_file` | `""` | PEM of a private CA. Verification cannot be turned off |

@@ -15,6 +15,8 @@ export default {
   fetch(req: Request, ctx: Ctx): Response | Promise<Response>,
   scheduled(event: ScheduledEvent, ctx: Ctx): void | Promise<void>,
   queue(batch: QueueBatch, ctx: Ctx): void | Promise<void>,
+  pubsub(msg: PubsubMessage, ctx: Ctx): unknown | Promise<unknown>,
+  stream(batch: StreamBatch, ctx: Ctx): void | Promise<void>,
   webSocketMessage(ws: Socket, message: string | ArrayBuffer, ctx: Ctx): void | Promise<void>,
   webSocketClose(ws: Socket, code: number, reason: string, wasClean: boolean, ctx: Ctx): void | Promise<void>,
   webSocketError(ws: Socket, error: Error & { code: string }, ctx: Ctx): void | Promise<void>,
@@ -33,6 +35,8 @@ export default class Room {
 | `http`, `call` | `fetch` (Form A function = `fetch`) | `500 guest_error` (`module has no default handler`) |
 | `interval`, `cron` | `scheduled(event, ctx)` | `fetch` gets `POST http://localhost/__rt/scheduled`, JSON `{scheduleId, scheduledTime, payload}`, header `x-rt-trigger`; status is only logged |
 | `queue` | `queue({messages}, ctx)` | `fetch` gets `POST /__rt/queue`, JSON `{messages: [{id, body, attempt}]}`; `2xx` = ack all, otherwise retry all |
+| `pubsub` | `pubsub(msg, ctx)`; its return value is the reply to a `request()` | `fetch` gets `POST /__rt/pubsub` (see [pub/sub](#stdpubsub)) |
+| `stream` | `stream(batch, ctx)` | `fetch` gets `POST /__rt/stream` (see [streams](#stdstream)) |
 | `websocket` | `webSocketMessage` / `webSocketClose` / `webSocketError` | the event is done (nothing runs) |
 | `alarm` | `alarm(info, ctx)` (a durable class) | the alarm is done |
 
@@ -41,7 +45,8 @@ export default class Room {
 interface Ctx {
   taskId: string;                                   // = x-rt-task-id response header
   service: { id: string; slug: string; version: number };   // slug is currently "" (known gap): use id
-  trigger: "http" | "interval" | "cron" | "schedule" | "queue" | "call" | "websocket" | "alarm";
+  trigger: "http" | "interval" | "cron" | "schedule" | "queue" | "call" | "websocket" | "alarm" | "pubsub" | "stream";
+  invocation?: { id: string; attempt: number };     // async HTTP invocation only (see "Async invocation"); undefined otherwise
   object?: { name: string };                        // the object a socket event, alarm or request to a durable object is for
   storage?: Storage;                                // that object's storage (std:durable)
   invoker?: string;                                 // x-rt-invoker, internal listener only
@@ -69,6 +74,36 @@ Queue semantics: `body` is parsed JSON (or a string when it is not JSON). Messag
 - The runtime adds `x-rt-task-id`, `x-rt-version`, `server-timing` to the response.
 - A throw, or a rejected promise, is `500 guest_error`; the body is generic, stack and message go to the service logs.
 
+## Async invocation
+
+Off by default. A service opts in with `async.enabled = true` in its service config. Then a client can ask for the
+request to be queued instead of run now:
+
+| Request header | Effect |
+|---|---|
+| `Prefer: respond-async` | Queued if async is allowed. Otherwise ignored and the request runs synchronously. A body over the limit (1 MiB or the service's body limit, whichever is smaller) runs synchronously |
+| `X-Rt-Invocation-Type: Event` | Queued, and required: refused with `403 async_not_allowed` when async is off, or with `413 too_large` when the body is over the limit |
+| `X-Rt-Invocation-Type: RequestResponse` | Synchronous (the default). Any other value is `400 bad_request` when async is on, and ignored when it is off |
+| `Idempotency-Key: <1..255 visible ASCII>` | Same key on the same service while its record exists: the original `202` again, with `x-rt-idempotent-replay: true`. Same key with a different request is `409 idempotency_mismatch` |
+
+The accepted request answers `202 Accepted` with `{"id":"inv_…","state":"pending"}` and `x-rt-invocation-id`. The
+request's headers and body are stored sealed (encrypted) in the node's queue database and are read back only to run
+the invocation. A full backlog answers `429 async_backlog_full` with `Retry-After: 1`: the service holds `max_async_pending` pending
+invocations, or the tenant's pending and failed invocations would hold more than its plan `storage_mb` of stored bytes.
+
+The invocation runs the same `fetch` handler with `ctx.trigger = "http"`, the same method, path, query, headers and
+body as accepted, plus `x-rt-invocation-id` and `x-rt-invocation-attempt` (1-based), and `ctx.invocation = { id,
+attempt }`. The response body is discarded. The status decides the outcome:
+
+- `2xx`, `3xx`, `4xx` (except `429`): done. A `4xx` is the handler's answer and is not retried.
+- `5xx`, `429`, a guest error, or a kill (CPU, memory, wall time): a failed attempt. It is retried with backoff
+  (about `30 s × 2^(n-1)`, capped at 15 min) until `async.max_attempts` (default 3) is used up, then the record fails.
+- Refused by admission, or the service has no live version: not an attempt. It is retried after a short delay.
+- Still pending `async.max_event_age_s` (default 3600 s) after it was accepted: failed.
+
+Delivery is at-least-once. Use `x-rt-invocation-id` as the idempotency key in your own writes. Finished records are
+kept 24 h when they succeeded and 7 d when they failed; a service keeps at most 1000 failed records.
+
 ## Runtime environment
 
 | Topic | Rule |
@@ -81,9 +116,53 @@ Queue semantics: `body` is parsed JSON (or a string when it is not JSON). Messag
 | Removed | `Worker`, `SharedWorker`, `SharedArrayBuffer`, `Atomics.wait/waitAsync/notify`, `ShadowRealm`, `caches`; `Deno` is reduced to `Deno.env` |
 | `WebSocket` | Outbound only (`new WebSocket("wss://…", protocols)`, WHATWG events, `binaryType`), through the same egress guard as `fetch`: one of the task's fetches, received bytes count against the egress quota, closed when the task ends. An `error` event carries `.code` (`egress_denied`, `egress_timeout`, `egress_upstream`, `egress_limit`, `egress_quota`) |
 | `console.*` | goes to the service logs (`console.debug/log/info/warn/error` = levels); ≤ 1,000 lines per task, message ≤ 10,000 chars |
-| Imports | relative files; `std:kv` `std:sql` `std:sqlite` (also `bun:sqlite`) `std:blob` `std:queue` `std:services` `std:platform` `std:log` `std:secrets` `std:lock` `std:schedule` `std:sockets` `std:durable`; operator `sdk:<name>`; `npm:` / `jsr:` / allowlisted `https:` (resolved **at build**, via `build.npm_cdn`); an `rt.json` import map is applied first. Anything else is `422` at deploy, and a runtime import outside the bundle fails with `module_not_in_bundle` |
+| Imports | relative files; `std:kv` `std:sql` `std:sqlite` (also `bun:sqlite`) `std:blob` `std:queue` `std:pubsub` `std:stream` `std:services` `std:platform` `std:log` `std:secrets` `std:lock` `std:schedule` `std:sockets` `std:durable`; operator `sdk:<name>`; `npm:` / `jsr:` / allowlisted `https:` (resolved **at build**, via `build.npm_cdn`); an `rt.json` import map is applied first. Anything else is `422` at deploy, and a runtime import outside the bundle fails with `module_not_in_bundle` |
 | Egress | `fetch` goes through the SSRF guard: public internet only (loopback, private ranges, metadata addresses denied; ports 25/465/587 denied by default). Failures reject with a `TypeError` whose message is a code: `egress_denied`, `egress_limit` (fetches per task), `egress_too_large`, `egress_quota`, `egress_timeout`, `egress_dns`, `egress_upstream` |
 | Env / secrets | `Deno.env.get(name)` (`undefined` if unset), `.has(name)`, `.toObject()`; `set` / `delete` throw; reads throw `env_unavailable` if the env could not be fetched. Env (readable through the API) and secrets (write-only, AES-256-GCM at rest) appear together; names `[A-Z_][A-Z0-9_]*`, `RT_` reserved, ≤ 100 entries, values ≤ 32 KB. Changes apply to the next task. `std:secrets` reads only the secret values (table below) |
+
+## Instance lifetime and min_run_time
+
+An instance (a Deno isolate or a WASM instance) can be reused by the next task of the same service version on the same
+Machine. Reuse is on only where the executor setting allows it (`deno.reuse_isolates`, `wasm.reuse_instances`, see
+[Execution](concepts/execution.md)). `scaling.min_run_time_ms` controls how long a reused instance may stay idle after
+it answered:
+
+| Value | After the answer |
+|---|---|
+| unset (inherit) | Today's behaviour: `deno.reuse_idle_ttl` (60 s) for Deno, the service's `cache.idle_ttl` for WASM |
+| `n > 0` | Kept for at most `n` ms, then released. It can be released earlier under memory pressure, after `reuse_max_uses`, or after a version change |
+| `0` | Released at once, unless tasks of this service are waiting for a run slot. Then it is kept for them, at most `queue_timeout` |
+
+- **When the clock starts.** The answer is done when the handler has finished and the response body has ended, after
+  every `ctx.waitUntil` promise has settled. Streaming time and `waitUntil` time are not keep-alive time: the instance
+  is busy until then, bounded by `limits.wall_ms`. The client's TCP acknowledgement is not waited for.
+- **What survives.** Module state and globals. They are a cache, not storage: a later task can run on a different
+  instance, and the runtime can drop any idle instance at any time. Keep data in `std:kv`, `std:sql` or `std:blob`.
+  Only instances that finished cleanly are kept, whatever the setting. A killed, failed or tainted instance is never
+  kept.
+- **Warm floor.** The instances that `scaling.min_instances` asks for are always kept, even at `0`. `min_run_time`
+  only governs the instances above that.
+- **Waiting work.** At `0`, an instance that is kept for waiting tasks is handed to the first task of its service that
+  is granted a slot. A handoff happens for buffered answers. For streamed answers it is best effort: the slot is freed
+  when the head is sent, before the tail ends.
+- **Reuse off.** With reuse off every task gets a fresh instance and `min_run_time_ms` has no effect. The setting is
+  accepted anyway, because reuse may come from a profile.
+- **WebSockets and durable objects.** Socket event tasks and durable requests always use reuse when `ws.warm` is on
+  (the default). With `0`, a warm object's instance, and the state its constructor set up, goes cold between events
+  unless more events are waiting.
+- **Expiry timing.** A kept instance is released when its time runs out, also on a node with no other work: an idle
+  node wakes for the earliest expiry, so the instance goes at most about 50 ms after `min_run_time_ms`.
+- **Limits.** The value is an integer in milliseconds, `>= 0`. The node caps it at `sched.min_run_time_max_ms` (600000)
+  and the plan at `limits_max.min_run_time_ms` (60000 by default). A larger value is refused with `422
+  limit_exceeds_plan`.
+
+```bash
+21ci service update hello --min-run-time 0       # release at once unless work waits
+21ci service update hello --min-run-time 5000     # keep an idle instance for up to 5 s
+21ci service update hello --unset scaling.min_run_time_ms
+```
+
+The service's `effective.min_run_time_ms` shows the value in force and its source (`service`, `plan` or `default`).
 
 ## SDK modules (Deno)
 
@@ -95,6 +174,8 @@ import { sql } from "std:sql";
 import { Database } from "std:sqlite"; // or "bun:sqlite"
 import { blob } from "std:blob";
 import { enqueue } from "std:queue";
+import { publish, request } from "std:pubsub";
+import { append, read } from "std:stream";
 import { call } from "std:services";
 import { platform } from "std:platform";
 ```
@@ -210,6 +291,41 @@ Keys are 1 to 512 bytes; locks are per service and per node. The hold is release
 
 The handler gets the due schedule as `scheduled(event, ctx)`: `event.id`, `event.scheduledAt` (Unix ms), `event.payload`, `ctx.trigger === "schedule"`. Delivery is at-least-once: a failed delivery is retried with backoff, and a schedule whose 5th attempt fails is dropped. A pending id is replaced by a new `after`/`at` with the same id. Ids are 1 to 128 of `a-z A-Z 0-9 . _ - :`. Codes: `validation_failed`, `schedule_limit` (1 000 pending per service), `unavailable` (outside a task). Components: `std:host/schedule`, the same calls with `after(seconds, payload-json, id)`, `at(at-ms, payload-json, id)`, `cancel(id)`, `%list(after, limit)`.
 
+### `std:pubsub`
+
+In-memory publish and subscribe between services of the same namespace (tenant, project and environment). Delivery is
+at-most-once: nothing is stored, and in-flight messages are lost on a node restart or drain. Subscriptions are declared
+in the service config (`events.subscribe`); the handler is `pubsub(msg, ctx)`.
+
+| Call | Notes |
+|---|---|
+| `publish(subject, body, { headers? }) → { receivers, dropped }` | Resolves after routing, not after delivery. `receivers` = deliveries handed to the scheduler; `dropped` = deliveries refused (more than 100 matches, the subscriber already has 64 in flight, quota, or admission refused). Publishing itself is checked against the tenant's rate and daily quota. Codes: `validation_failed` (wildcard or `_rt` subject), `too_large`, `rate_limited`, `quota_exceeded`, `call_depth` |
+| `request(subject, body, { headers?, timeoutMs? }) → reply` | One responder, first answer wins. `timeoutMs` defaults to 5000, max 30000, and never runs past the task deadline. The reply is parsed JSON, a string for text, or bytes. Codes: `no_responders` (at once), `timeout`, `responder_failed`, plus the admission and quota codes of `publish` |
+
+A subscriber's `pubsub(msg, ctx)` gets `{ id, subject, body, headers, replyable, publishedAt }`. Its return value is the
+reply to a `request()`; for `publish()` it is ignored. A throw is `responder_failed` for the requester. A service that
+subscribes to a subject it publishes also receives its own messages. A chain of pub/sub hops is limited to 15 deep
+(`call_depth`).
+
+### `std:stream`
+
+Durable, replayable log per topic, split into partitions. A topic is a tenant resource created with the control API;
+the service only reads and writes it. `append` is durable when it resolves. A consumer declared in `events.consume`
+(topic, group, batch size, attempts, `on_exhausted`) gets `stream(batch, ctx)`: each record is delivered at least once,
+in order within its partition.
+
+| Call | Notes |
+|---|---|
+| `append(topic, body, { key?, headers?, dedupId? }) → { partition, offset, duplicate }` | Same `key` means same partition, so the order holds for that key. Without a key, partitions are used round robin. The same `dedupId` on a topic within 2 min returns the original position with `duplicate: true`. Codes: `validation_failed`, `too_large`, `not_found`, `stream_full`, `rate_limited`, `quota_exceeded` |
+| `appendBatch(topic, records)` | 1 to 100 records, 4 MiB in total, all or nothing. Returns one result per record |
+| `read(topic, { partition?, from?, fromTime?, limit? }) → { records, next, end }` | Replay without a consumer group. `from` is `"earliest"` (default), `"latest"` or an offset; `fromTime` (unix ms) is the alternative. `limit` is 1 to 100 records. `partition` defaults to 0 and must be given when the topic has more than one partition (`validation_failed`) |
+| `info(topic)` | The topic's partitions (first and next offset), retention, size and cap |
+
+Consumer rules: `batch.messages` is ordered and contiguous. A normal return commits the whole batch. `batch.failAt(m)`
+commits the records before `m` and redelivers from `m`. A throw commits nothing and retries. A record that keeps
+failing gets `max_attempts` deliveries, then `on_exhausted` decides (`dlq`, `skip` or `block`); the records next to it
+are not dead-lettered.
+
 ## WebSockets and durable objects
 
 The node holds every WebSocket: between two messages no isolate runs for it. A message, a close or an
@@ -315,6 +431,9 @@ drops an object's storage.
 | Durable service | a class default export | must export `socket-handler` (`422 missing_export` at deploy) |
 | Outbound WebSocket | `new WebSocket(url)` | `std:host/ws-client` (`connect`, `connection.send` / `recv(timeout-ms)` / `close`) |
 | Blob reads | `blob.get` streams the object (≤ 100 MB) | `std:host/blob` `get` buffers the object and refuses one larger than `max_response_buffered_bytes` (10 MB) with `blob_too_large` |
+| Pub/sub | `publish`, `request`, `pubsub(msg, ctx)` export | `std:host/pubsub` (`publish` returns `{receivers, dropped}`); delivery is `POST /__rt/pubsub`, and the 2xx body is the reply |
+| Streams | `append`, `appendBatch`, `read`, `info`, `stream(batch, ctx)` export | `std:host/streams` (`append`, `read`, `info`); consumption is `POST /__rt/stream`, with `x-rt-stream-fail-at` to stop mid-batch |
+| Async invocation | `ctx.invocation` | runtime headers `x-rt-invocation-id`, `x-rt-invocation-attempt` |
 | Outside a task | | every import answers `unavailable` |
 
 ## Limits (defaults, `balanced`; plan maxima apply)
@@ -330,6 +449,36 @@ drops an object's storage.
 | Call depth | 15 | | |
 
 `free` plan maxima: wall 30 s, CPU 1 s, 128 MB; schedules ≥ 60 s apart, ≤ 3 per service, no `cron`. Details: [api.md](api.md#plans-built-in-free-more-under-plansname).
+
+### Event limits
+
+| Limit | Value |
+|---|---|
+| Message body (pub/sub, stream record, async request) | 1 MiB; an async body is also capped at the service's max body |
+| Headers per message | 32 entries, 16 KiB in total, value ≤ 4096 bytes, no CR/LF/NUL |
+| Subject | 256 bytes, 16 tokens |
+| Subscriptions / consumers per service | 32 / 8 |
+| Deliveries per publish | 100; the rest are counted in `dropped` |
+| Pub/sub deliveries in flight per subscriber service | 64 |
+| Request timeout | 5 s default, 30 s max, never past the deadline |
+| Topic / group name | 63 characters; a topic name may not start with `tpc_` |
+| Stream key / dedup id | 256 / 128 bytes |
+| Append batch | 100 records, 4 MiB |
+| Read page | 100 records, 1 MiB |
+| Delivery batch | 100 by default, 1000 max, 1 MiB |
+| Partitions per topic | 1 to 16 (plan: free 4, system 16) |
+| Topics per tenant | plan: free 10, system 1000 |
+| Stream bytes per tenant (records and dead letters) | plan: free 100 MB, system 10 GB |
+| Retention | 24 h by default (plan max: free 72 h, system 720 h) |
+| Dead letters per consumer | 1000, kept 7 days |
+| Pending async invocations per service | plan: free 10,000, system 100,000 |
+| Async attempts / max event age | 3 by default (1 to 10) / 3600 s (60 to 86400 s) |
+| `Idempotency-Key` | 1 to 255 visible ASCII characters |
+| Concurrency | async: `queue.max_concurrency` (default 4) per service, 256 invocations per node; streams: 8 batches in flight per service, 256 per node |
+
+## Previews
+
+A service made by `POST /v1/scratch` runs alone: `std:stream`, `std:pubsub` and `std:schedule` throw `preview_isolated`, `call` throws `call_not_allowed`, `std:queue` and `std:sdk` are refused, and `fetch` reaches only the preview's `allowed_hosts`. See [Previews](api.md#previews).
 
 ## Outcome to HTTP
 
@@ -417,3 +566,19 @@ export default async function (req: Request): Promise<Response> {
 ## See also
 
 [api.md](api.md) · [SECURITY.md](https://github.com/21-ci/runtime/blob/main/SECURITY.md) · [sample/README.md](https://github.com/21-ci/runtime/blob/main/sample/README.md)
+
+## Data-change events
+
+With `events.data_events` set (`PUT /v1/services/{s}/data-events`), committed changes of the listed tables and KV prefixes reach a topic of the service's namespace. There is no new `std:*` API: consume them with a normal `stream` handler.
+
+```json
+{"event_id":"svc_…:42","service":"svc_…","seq":42,"ts":1760000000000,"source":"sql:orders","op":"insert","key":[7],"row":{"id":7}}
+```
+
+- Delivery is at least once and in order per service: dedupe on `event_id`.
+- `key` is the primary key, or the rowid. KV events have `source` `kv` and `key` `[<hex of the key>]`; `row` is `{"value_hex":…}`.
+- `row` appears with `payload: "row"`. BLOBs are hex; a row over 64 KB has no `row`. A row stays in the stream for its retention after it is deleted.
+- `INSERT OR REPLACE` appears as `insert`, with no `delete`. KV expiry sweeps appear as `delete`. Blobs and durable storage are not covered.
+- `DROP TABLE` on a subscribed table is refused: unsubscribe first. Dropping a column used by a `row` trigger fails the same way. After `ALTER TABLE`, triggers are regenerated within about a minute.
+- Past `max_backlog` the triggers are dropped, state becomes `paused_overflow`, a `data_events.paused` event is raised and writes go on; `PUT` rearms.
+- A `key` over 64 KiB arrives as `[{"truncated": true, "prefix": "..."}]`. A change the stream refuses is dropped with a `data_events.dropped` event and `last_error: "event_dropped"`, so the ones behind it still flow.

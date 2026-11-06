@@ -58,6 +58,11 @@ impl PlanPolicy {
     }
 
     /// Storage the tenant used at the last scan.
+    /// Bytes on disk over all tenants, from the last scan.
+    pub fn storage_total(&self) -> u64 {
+        self.storage.iter().map(|e| *e.value()).sum()
+    }
+
     pub fn storage_used(&self, tenant: TenantId) -> u64 {
         self.storage.get(&tenant).map_or(0, |v| *v)
     }

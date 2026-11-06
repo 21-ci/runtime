@@ -18,6 +18,7 @@ and an invoke listener (`/s/{slug}`, `:8080`). `21ci` (`crates/rt-cli`) is the C
 | `crates/rt-config`, `rt-mem`, `rt-obs` | config parse/profiles/effective values; memory governor; logs, metrics, stats (L1) |
 | `crates/rt-sched`, `rt-sec`, `rt-store` | GMP scheduler and admission; auth, keys, scopes, crypto, quotas, egress classifier; `meta.db`, `queue.db`, artifacts, per-service KV/SQL/blob (L2) |
 | `crates/rt-cache`, `rt-host` | prepared-artifact cache; host capability handles (egress guard, storage facades, calls, bindings) (L3) |
+| `crates/rt-backup` | archive format, untrusted-archive validator, create, verify, restore, schedule (L3) |
 | `crates/rt-build`, `rt-exec-deno`, `rt-exec-wasm` | upload validation, resolution, bundling; Deno executor; WASM executor and `std:host` host impl (L4) |
 | `crates/rt-api`, `rt-triggers` | control API, invoke router, OpenAPI, MCP (`src/mcp/`); routes, schedules, queues, calls (L5) |
 | `crates/rt-server` | binary `rt`: wiring, startup, drain |

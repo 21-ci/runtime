@@ -246,6 +246,30 @@ pub(crate) async fn socket_close(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(delete, path = "/v1/services/{s}/sockets", tag = "sockets",
+    params(("s" = String, Path, description = "service id"), CloseQuery),
+    responses((status = 200, body = ClosedView), (status = 404, body = ErrorEnvelope)))]
+pub(crate) async fn service_sockets_close(
+    State(s): State<ApiState>,
+    a: Auth,
+    Path(id): Path<String>,
+    ApiQuery(q): ApiQuery<CloseQuery>,
+) -> R<ClosedView> {
+    a.require_scope(Scope::SocketsWrite)?;
+    let svc = load_service(&s, &a, &id).await?;
+    let (code, reason) = close_args(&q)?;
+    let closed = s.sockets.close_service(svc.id, None, q.tag.as_deref(), code, &reason);
+    audit(
+        &s,
+        &a,
+        "sockets.closed_by_api",
+        Some(svc.tenant_id),
+        Some(svc.id),
+        json!({"tag": q.tag, "code": code, "closed": closed}),
+    );
+    Ok(Json(ClosedView { closed }))
+}
+
 #[utoipa::path(delete, path = "/v1/services/{s}/objects/{name}/sockets", tag = "sockets",
     params(("s" = String, Path, description = "service id"), ("name" = String, Path, description = "object name"), CloseQuery),
     responses((status = 200, body = ClosedView), (status = 404, body = ErrorEnvelope)))]

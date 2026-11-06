@@ -496,6 +496,72 @@ fn memory_budget_mb_is_bounded() {
     cfg.validate().expect("64 GiB is fine");
 }
 
+/// `sched.aging_factor` is at most 64 and `sched.min_run_time_max_ms` at most 24 h; one past
+/// either edge is refused with the key named.
+#[test]
+fn aging_factor_and_min_run_time_max_bounds_name_the_key() {
+    let mut cfg = Config::default();
+    cfg.sched.aging_factor = 64;
+    cfg.sched.min_run_time_max_ms = 86_400_000;
+    cfg.validate().expect("the edges are accepted");
+    cfg.sched.aging_factor = 65;
+    cfg.sched.min_run_time_max_ms = 86_400_001;
+    let v = validation_messages(&cfg);
+    assert!(
+        v.iter().any(|m| m.starts_with("sched.aging_factor must be <= 64")),
+        "{v:?}"
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.starts_with("sched.min_run_time_max_ms must be <= 86400000")),
+        "{v:?}"
+    );
+}
+
+/// `plans.<name>.max_topic_partitions` is within `1..=PARTITIONS_HARD_MAX` (16).
+#[test]
+fn plan_topic_partitions_are_bounded_by_the_hard_max() {
+    let doc = |n: u32| format!("[plans.pro]\nmax_topic_partitions = {n}");
+    Config::from_toml(&doc(16), &[])
+        .expect("16 is the hard max")
+        .validate()
+        .expect("valid");
+    Config::from_toml(&doc(1), &[]).expect("1").validate().expect("valid");
+    for n in [0, 17] {
+        let e = err_text(&doc(n), &[]);
+        assert!(e.contains("plans.pro.max_topic_partitions"), "{n}: {e}");
+    }
+}
+
+/// The event plan keys and the new trigger kinds parse from `[plans.<name>]`.
+#[test]
+fn event_plan_keys_and_trigger_kinds_parse() {
+    let cfg = Config::from_toml(
+        "[plans.pro]\nmax_async_pending = 5\nmax_topics = 6\nmax_topic_partitions = 7\n\
+         max_stream_mb = 8\nmax_stream_retention_hours = 9\nallowed_triggers = [\"pubsub\", \"stream\"]\n\
+         [plans.pro.limits_max]\nmin_run_time_ms = 1234",
+        &[],
+    )
+    .expect("parses");
+    cfg.validate().expect("valid");
+    let p = &cfg.plans["pro"];
+    assert_eq!(
+        (
+            p.max_async_pending,
+            p.max_topics,
+            p.max_topic_partitions,
+            p.max_stream_mb,
+            p.max_stream_retention_hours
+        ),
+        (5, 6, 7, 8, 9)
+    );
+    assert_eq!(
+        p.allowed_triggers,
+        vec![rt_types::TriggerKind::Pubsub, rt_types::TriggerKind::Stream]
+    );
+    assert_eq!(p.limits_max.min_run_time_ms, 1234);
+}
+
 #[test]
 fn default_and_profile_configs_validate() {
     Config::default().validate().expect("built-in config is valid");
@@ -561,6 +627,37 @@ fn ingress_backlog_defaults_to_4096_loads_from_file_and_env_and_must_be_positive
     let mut cfg = Config::default();
     cfg.ingress.backlog = 0;
     assert!(validation_messages(&cfg).iter().any(|m| m.contains("ingress.backlog")));
+}
+
+/// `deploy.drain_max` defaults to 15 minutes, parses as a human duration from the file and the
+/// environment, and is bounded to 1 s .. 24 h (inclusive); one past either edge is refused with
+/// the key named.
+#[test]
+fn deploy_drain_max_defaults_to_15m_loads_and_is_bounded() {
+    assert_eq!(Config::default().deploy.drain_max, Duration::from_secs(15 * 60));
+    assert_eq!(
+        ok("[deploy]\ndrain_max = \"30m\"\n", &[]).deploy.drain_max,
+        Duration::from_secs(30 * 60)
+    );
+    assert_eq!(
+        ok("", &[("RT__DEPLOY__DRAIN_MAX", "2h")]).deploy.drain_max,
+        Duration::from_secs(2 * 3600)
+    );
+
+    let with = |d: Duration| {
+        let mut cfg = Config::default();
+        cfg.deploy.drain_max = d;
+        validation_messages(&cfg)
+    };
+    for bad in [Duration::ZERO, Duration::from_millis(999), Duration::from_secs(86_401)] {
+        let v = with(bad);
+        assert!(v.iter().any(|m| m.starts_with("deploy.drain_max")), "{bad:?}: {v:?}");
+    }
+    for good in [Duration::from_secs(1), Duration::from_secs(86_400)] {
+        let mut cfg = Config::default();
+        cfg.deploy.drain_max = good;
+        cfg.validate().unwrap_or_else(|e| panic!("{good:?} is in bounds: {e}"));
+    }
 }
 
 #[test]

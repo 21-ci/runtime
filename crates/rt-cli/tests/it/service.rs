@@ -696,3 +696,145 @@ fn create_and_update_a_durable_service_with_ws_knobs() {
     .ok();
     m.assert();
 }
+
+// ---- min_run_time (keep-alive) ----------------------------------------------------------------
+
+/// `--min-run-time` sends `scaling.min_run_time_ms` in milliseconds on create.
+#[test]
+fn create_sends_min_run_time_in_the_scaling_block() {
+    let ctx = Ctx::new();
+    let m = ctx.server.mock(|when, then| {
+        when.method(POST).path("/v1/services").json_body(json!({
+            "slug": "hello", "runtime": "deno", "scaling": {"min_run_time_ms": 30000}
+        }));
+        then.status(201).json_body(service_json("svc_1", "hello"));
+    });
+    ctx.run(&["service", "create", "hello", "--min-run-time", "30s"]).ok();
+    m.assert();
+}
+
+/// Durations of any unit work, and `0` (dispose after the answer unless work waits) is allowed.
+#[test]
+fn min_run_time_accepts_durations_and_zero() {
+    for (arg, ms) in [("0", 0u64), ("500ms", 500), ("2m", 120_000), ("1s 250ms", 1250)] {
+        let ctx = Ctx::new();
+        let m = ctx.server.mock(|when, then| {
+            when.method(POST).path("/v1/services").json_body(json!({
+                "slug": "hello", "runtime": "deno", "scaling": {"min_run_time_ms": ms}
+            }));
+            then.status(201).json_body(service_json("svc_1", "hello"));
+        });
+        ctx.run(&["service", "create", "hello", "--min-run-time", arg]).ok();
+        m.assert();
+    }
+    let ctx = Ctx::new();
+    let out = ctx
+        .run(&["service", "create", "hello", "--min-run-time", "soon"])
+        .fails_with(2);
+    assert!(out.stderr.contains("min-run-time"), "{}", out.stderr);
+}
+
+/// `update --min-run-time` merges into the current scaling block; `--unset
+/// scaling.min_run_time_ms` removes the key (back to inherit).
+#[test]
+fn update_min_run_time_and_unset_it() {
+    let ctx = Ctx::new();
+    let mut svc = service_json("svc_1", "hello");
+    svc["scaling"] = json!({"max_instances": 4, "min_run_time_ms": 1000});
+    ctx.server.mock(|when, then| {
+        when.method(GET).path("/v1/services").query_param("slug", "hello");
+        then.status(200).json_body(json!({"items": [svc], "next_cursor": null}));
+    });
+    let set = ctx.server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/v1/services/svc_1")
+            .json_body(json!({"scaling": {"max_instances": 4, "min_run_time_ms": 0}}));
+        then.status(200).json_body(service_json("svc_1", "hello"));
+    });
+    ctx.run(&["service", "update", "hello", "--min-run-time", "0"]).ok();
+    set.assert();
+    let unset = ctx.server.mock(|when, then| {
+        when.method(PATCH)
+            .path("/v1/services/svc_1")
+            .json_body(json!({"scaling": {"max_instances": 4}}));
+        then.status(200).json_body(service_json("svc_1", "hello"));
+    });
+    ctx.run(&["service", "update", "hello", "--unset", "scaling.min_run_time_ms"])
+        .ok();
+    unset.assert();
+}
+
+/// The "Keep-alive" row: inherit, `0` (disposed after the answer), or the effective value and
+/// its source; without an `effective` entry, the service's own setting.
+#[test]
+fn service_get_shows_the_keep_alive() {
+    let cases = [
+        (json!({}), json!({}), "Keep-alive: inherit (node idle TTL)"),
+        (
+            json!({"min_run_time_ms": 0}),
+            json!({}),
+            "Keep-alive: 0 ms (disposed after the answer unless work waits)",
+        ),
+        (
+            json!({"min_run_time_ms": 30000}),
+            json!({}),
+            "Keep-alive: 30000 ms (service)",
+        ),
+        (
+            json!({"min_run_time_ms": 90000}),
+            json!({"min_run_time_ms": {"value": 60000, "source": "plan"}}),
+            "Keep-alive: 60000 ms (plan)",
+        ),
+        (
+            json!({}),
+            json!({"min_run_time_ms": {"value": null, "source": "default"}}),
+            "Keep-alive: inherit (node idle TTL)",
+        ),
+    ];
+    for (scaling, effective, want) in cases {
+        let ctx = Ctx::new();
+        let mut svc = service_json("svc_1", "hello");
+        svc["scaling"] = scaling;
+        svc["effective"] = effective;
+        ctx.server.mock(|when, then| {
+            when.method(GET).path("/v1/services/svc_1");
+            then.status(200).json_body(svc);
+        });
+        let lines = ctx.run(&["service", "get", "svc_1"]).ok().lines();
+        assert!(lines.contains(&want.to_string()), "missing {want:?} in {lines:?}");
+    }
+}
+
+/// `--set` takes the `events` and `async` blocks (JSON values) and `get` shows them.
+#[test]
+fn service_set_accepts_events_and_async_blocks() {
+    let ctx = Ctx::new();
+    let m = ctx.server.mock(|when, then| {
+        when.method(POST).path("/v1/services").json_body(json!({
+            "slug": "hello", "runtime": "deno",
+            "events": {"subscribe": [{"subject": "orders.>"}]},
+            "async": {"enabled": true, "max_attempts": 5}
+        }));
+        let mut v = service_json("svc_1", "hello");
+        v["events"] = json!({"subscribe": [{"subject": "orders.>"}]});
+        v["async"] = json!({"enabled": true});
+        then.status(201).json_body(v);
+    });
+    let lines = ctx
+        .run(&[
+            "service",
+            "create",
+            "hello",
+            "--set",
+            r#"events.subscribe=[{"subject":"orders.>"}]"#,
+            "--set",
+            "async.enabled=true",
+            "--set",
+            "async.max_attempts=5",
+        ])
+        .ok()
+        .lines();
+    m.assert();
+    assert!(lines.contains(&"Async: enabled=true".to_string()), "{lines:?}");
+    assert!(lines.iter().any(|l| l.starts_with("Events: ")), "{lines:?}");
+}

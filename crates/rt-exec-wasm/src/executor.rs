@@ -48,10 +48,12 @@ use rt_host::rpc::{
 use rt_host::{HostHandle, HostServices, RpcError};
 use rt_mem::{MemCategory, Owner, Pressure, Reservation};
 use rt_obs::{LogLevel, Metrics};
-use rt_sched::{ExecCx, Executor, Interrupter, TaskFuture, WarmKey, WarmTargets};
+use rt_sched::{
+    after_answer, AfterAnswer, ExecCx, Executor, Interrupter, TaskFuture, WarmKey, WarmTarget, WarmTargets,
+};
 use rt_types::{
     Body, BodyError, BodySender, EnvBundle, HttpRequest, KillReason, Outcome, Payload, PreparedKey, ProcId, Reply,
-    RuntimeKind, ServiceRef, TaskId, TaskKind, TaskSpec, TaskTimings, Trigger,
+    RuntimeKind, ServiceId, ServiceRef, TaskId, TaskKind, TaskSpec, TaskTimings, Trigger,
 };
 use tokio::sync::oneshot;
 use wasmtime::component::ResourceTable;
@@ -100,6 +102,8 @@ pub struct WasmExecutor {
     /// The process-wide idle-slot budget (shared by every Machine in production).
     slots: Arc<IdleSlots>,
     reuse_max_idle: usize,
+    /// [`Executor::wake_signal`]: an instance was stashed (its expiry may be the next deadline).
+    signal: Arc<tokio::sync::Notify>,
     metrics: Option<Arc<Metrics>>,
     /// The autoscaler's per-P warm targets (`None`: no warm pool).
     warm: Option<Arc<WarmTargets>>,
@@ -129,6 +133,7 @@ impl WasmExecutor {
             idle,
             slots,
             reuse_max_idle: DEFAULT_REUSE_MAX_IDLE,
+            signal: Arc::default(),
             metrics: None,
             warm: None,
             proc: None,
@@ -212,6 +217,7 @@ impl WasmExecutor {
                 }
                 pool.drain_all()
             };
+            keepalive(&self.metrics, "shed", shed.iter().filter(|i| i.uses > 0).count());
             drop(shed);
             return;
         }
@@ -223,19 +229,15 @@ impl WasmExecutor {
         self.poll_prewarming(started, budget, &mut units);
 
         let targets = self.warm.as_ref().map(|w| w.snapshot());
-        let want = |k: &IdleKey| -> usize {
-            targets
-                .as_ref()
-                .and_then(|t| {
-                    t.get(&WarmKey {
-                        service: k.service,
-                        key: k.prepared,
-                    })
-                })
-                .filter(|t| t.service.tenant == k.tenant && t.service.version == k.version)
-                .map_or(0, |t| (t.per_proc as usize).min(MAX_WARM_PER_KEY))
-        };
-        let dropped = self.idle.lock().scale_down(Instant::now(), want);
+        let want = |k: &IdleKey| -> usize { want_of(targets.as_deref(), k) };
+        let warm = self.warm.clone();
+        let has_waiting = |s: ServiceId| warm.as_ref().is_some_and(|w| w.waiting(s) > 0);
+        let dropped = self.idle.lock().scale_down(Instant::now(), want, has_waiting);
+        keepalive(
+            &self.metrics,
+            "expired",
+            dropped.iter().filter(|i| i.expires.is_some()).count(),
+        );
         drop(dropped);
         self.backoff.retain(|k, _| want(k) > 0);
 
@@ -333,6 +335,28 @@ impl WasmExecutor {
     }
 }
 
+/// The warm target of `k` on its P (0 without one), capped at [`MAX_WARM_PER_KEY`].
+fn want_of(targets: Option<&HashMap<WarmKey, WarmTarget>>, k: &IdleKey) -> usize {
+    targets
+        .and_then(|t| {
+            t.get(&WarmKey {
+                service: k.service,
+                key: k.prepared,
+            })
+        })
+        .filter(|t| t.service.tenant == k.tenant && t.service.version == k.version)
+        .map_or(0, |t| (t.per_proc as usize).min(MAX_WARM_PER_KEY))
+}
+
+/// Count `n` `rt_instance_keepalive_total{kind="wasm",outcome}`.
+fn keepalive(metrics: &Option<Arc<Metrics>>, outcome: &str, n: usize) {
+    if let (Some(m), true) = (metrics, n > 0) {
+        m.instance_keepalive_total
+            .with_label_values(&["wasm", outcome])
+            .inc_by(n as u64);
+    }
+}
+
 impl Executor for WasmExecutor {
     const KIND: TaskKind = TaskKind::WASM;
     type Prepared = WasmPrepared;
@@ -352,12 +376,32 @@ impl Executor for WasmExecutor {
             idle: self.idle.clone(),
             slots: self.slots.clone(),
             reuse_max_idle: self.reuse_max_idle,
+            signal: self.signal.clone(),
             metrics: self.metrics.clone(),
+            warm: self.warm.clone(),
         }))
     }
 
     fn interrupter(&self) -> Arc<dyn Interrupter> {
         self.interrupter.clone()
+    }
+
+    /// The earliest own keep-alive end (`min_run_time`) of a used idle instance that is still
+    /// ahead: past ones were dropped by the housekeeping before the park, or are kept by the warm
+    /// floor (never expire), so they are not reported (that would spin the Machine).
+    fn next_deadline(&self) -> Option<Instant> {
+        let now = Instant::now();
+        let pool = self.idle.lock();
+        pool.map
+            .values()
+            .flat_map(|l| l.used.iter())
+            .filter_map(|i| i.expires)
+            .filter(|e| *e > now)
+            .min()
+    }
+
+    fn wake_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(self.signal.clone())
     }
 
     fn on_idle(&mut self, budget: Duration) {
@@ -460,7 +504,9 @@ struct Args {
     idle: Arc<Mutex<IdlePool>>,
     slots: Arc<IdleSlots>,
     reuse_max_idle: usize,
+    signal: Arc<tokio::sync::Notify>,
     metrics: Option<Arc<Metrics>>,
+    warm: Option<Arc<WarmTargets>>,
 }
 
 struct Unregister {
@@ -530,6 +576,8 @@ fn guest_request(spec: &mut TaskSpec, task: TaskId, deadline_ms: i64) -> http::R
                 .collect();
             json_post("/__rt/queue", serde_json::json!({ "messages": items }))
         }
+        Payload::Pubsub(m) => json_post("/__rt/pubsub", m.guest_json()),
+        Payload::Stream(b) => json_post("/__rt/stream", b.guest_json()),
         // Socket events reach a component through its `socket-handler` export, never this path
         // (an HTTP-only component gets none: the hub only runs events of components that export it).
         Payload::Socket(_) | Payload::None => (
@@ -752,7 +800,9 @@ async fn run_task(a: Args) -> Outcome {
         idle,
         slots,
         reuse_max_idle,
+        signal,
         metrics,
+        warm,
     } = a;
     let ExecCx {
         task,
@@ -782,6 +832,9 @@ async fn run_task(a: Args) -> Outcome {
     let limit_bytes = (spec.limits.memory_mb as usize) << 20;
     let reuse = spec.knobs.reuse_instances;
     let idle_ttl = spec.knobs.idle_ttl;
+    let min_run_time = spec.knobs.min_run_time;
+    let min_instances = spec.knobs.min_instances;
+    let queue_timeout = spec.knobs.queue_timeout;
     let key = IdleKey {
         tenant: svc.tenant,
         service: svc.service,
@@ -848,6 +901,8 @@ async fn run_task(a: Args) -> Outcome {
             env: built_with,
             since: _,
             slot,
+            expires: _,
+            handoff: _,
         } = inst;
         drop(slot);
         let mut res = reservation.take().expect("reservation is taken once");
@@ -868,6 +923,9 @@ async fn run_task(a: Args) -> Outcome {
             st.clock.resume();
             st.wasi_ctx = build_wasi_ctx(&st.clock, &st.logs, &env);
             set_limits(&mut store, &limits, &acc, &switch, &handle);
+            if uses > 0 {
+                keepalive(&metrics, "reused", 1);
+            }
             taken = Some((store, guest, uses + 1));
         } else {
             reservation = Some(res);
@@ -964,7 +1022,13 @@ async fn run_task(a: Args) -> Outcome {
         reuse,
         idle_ttl,
         reuse_max_idle,
+        signal,
         unregister,
+        warm,
+        min_run_time,
+        min_instances,
+        queue_timeout,
+        metrics: metrics.clone(),
     };
     // Until the head the guest runs inside this future's polls: the scheduler's per-poll
     // accounting measures, bills and limits it (WSM-18).
@@ -1270,7 +1334,16 @@ struct Driver {
     reuse: bool,
     idle_ttl: Duration,
     reuse_max_idle: usize,
+    /// [`Executor::wake_signal`]: notified when an instance is stashed with its own expiry.
+    signal: Arc<tokio::sync::Notify>,
     unregister: Unregister,
+    /// Warm targets (the floor) and the admission backlog (`WarmTargets::waiting`).
+    warm: Option<Arc<WarmTargets>>,
+    min_run_time: Option<Duration>,
+    /// `scaling.min_instances`: the only floor a `min_run_time = 0` instance is kept for.
+    min_instances: u32,
+    queue_timeout: Duration,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl Driver {
@@ -1297,7 +1370,13 @@ impl Driver {
             reuse,
             idle_ttl,
             reuse_max_idle,
+            signal,
             unregister,
+            warm,
+            min_run_time,
+            min_instances,
+            queue_timeout,
+            metrics,
         } = self;
         let mut head_tx = Some(head_tx);
         let mut sender: Option<BodySender> = None;
@@ -1449,17 +1528,46 @@ impl Driver {
 
         // Clean completion: keep the instance for the next task of this service on this P, with
         // nothing of this task's left on it. Everything else drops it (and the task's memory).
+        // `min_run_time` (the decision at the answer) only applies to such a clean instance.
         if failed.is_none() && reuse && uses < MAX_REUSES {
-            let parked = Parked {
-                idle: &idle,
-                slots: &slots,
-                host: &host,
-                key,
-                svc,
-                max_idle: reuse_max_idle,
-                idle_ttl,
+            let now = Instant::now();
+            let waiting = warm.as_ref().map_or(0, |w| w.waiting(svc.service));
+            let keep = match after_answer(min_run_time, waiting, queue_timeout) {
+                AfterAnswer::Inherit => Some((None, false, "kept")),
+                AfterAnswer::For(t) => Some((Some(now + t), false, "kept")),
+                AfterAnswer::Handoff { cap } => Some((Some(now + cap), true, "handoff")),
+                // Below the `min_instances` floor the instance stays (protected by the target, expired);
+                // the autoscaler's demand target alone keeps nothing.
+                AfterAnswer::Dispose => {
+                    let want =
+                        want_of(warm.as_ref().map(|w| w.snapshot()).as_deref(), &key).min(min_instances as usize);
+                    (idle.lock().ready(&key) < want).then_some((Some(now), false, "kept"))
+                }
             };
-            parked.stash(store, guest, uses, env);
+            match keep {
+                Some((expires, handoff, outcome)) => {
+                    let parked = Parked {
+                        idle: &idle,
+                        slots: &slots,
+                        host: &host,
+                        key,
+                        svc,
+                        max_idle: reuse_max_idle,
+                        idle_ttl,
+                        expires,
+                        handoff,
+                    };
+                    if parked.stash(store, guest, uses, env) {
+                        keepalive(&metrics, outcome, 1);
+                        // A parked Machine re-reads `next_deadline` (this expiry may be the next).
+                        signal.notify_one();
+                    }
+                }
+                None => {
+                    keepalive(&metrics, "disposed", 1);
+                    drop(store);
+                }
+            }
         } else {
             drop(store);
         }
@@ -1550,6 +1658,8 @@ struct Parked<'a> {
     svc: ServiceRef,
     max_idle: usize,
     idle_ttl: Duration,
+    expires: Option<Instant>,
+    handoff: bool,
 }
 
 impl Parked<'_> {
@@ -1558,11 +1668,11 @@ impl Parked<'_> {
     /// epoch callback without the task's state. Its memory stays reserved under `wasm_reuse`
     /// (evictable), and it holds a slot of the node's idle budget, taken from the least recently
     /// used idle instance of any Machine when the budget is full. Dropped instead when the node
-    /// is under pressure, the governor refuses, or the list is full.
-    fn stash(self, mut store: Store<WasmState>, guest: GuestExports, uses: u32, env: Env) {
+    /// is under pressure, the governor refuses, or the list is full. `true` when parked.
+    fn stash(self, mut store: Store<WasmState>, guest: GuestExports, uses: u32, env: Env) -> bool {
         let mem = &self.host.deps().mem;
         if self.max_idle == 0 || mem.pressure() >= Pressure::High {
-            return;
+            return false;
         }
         if self
             .idle
@@ -1571,15 +1681,15 @@ impl Parked<'_> {
             .get(&self.key)
             .is_some_and(|l| l.used.len() >= self.max_idle)
         {
-            return;
+            return false;
         }
         let bytes = store.data().limiter.used.max(MIN_IDLE_BYTES) as u64;
         let owner = Owner::service(self.key.tenant, self.key.service);
         let Ok(reservation) = mem.reserve(MemCategory::WasmReuse, bytes, owner) else {
-            return;
+            return false;
         };
         let Some(slot) = self.slots.acquire_evicting() else {
-            return;
+            return false;
         };
         let parked = self.host.detached_handle(self.svc);
         let st = store.data_mut();
@@ -1595,12 +1705,15 @@ impl Parked<'_> {
             env,
             since: Instant::now(),
             slot,
+            expires: self.expires,
+            handoff: self.handoff,
         };
         // The list had room above and only this Machine adds to it (others only evict).
         let mut pool = self.idle.lock();
         let list = pool.list(self.key);
         list.touch(self.idle_ttl);
         list.used.push(inst);
+        true
     }
 }
 
@@ -1874,5 +1987,87 @@ mod guest_request_tests {
     async fn a_request_that_names_its_host_keeps_it() {
         let (parts, _) = synth(Trigger::Http, http_with(&[("host", "api.example.com")])).await;
         assert_eq!(header(&parts, "host"), "api.example.com");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rt_types::events::{PubsubMessage, StreamBatch, StreamRecord};
+    use rt_types::{Digest, MsgId, RuntimeKind, ServiceId, ServiceRef, TaskKind, TenantId, VersionNo};
+
+    fn spec(trigger: Trigger, payload: Payload) -> TaskSpec {
+        let svc = ServiceRef {
+            tenant: TenantId::from_u128(1),
+            service: ServiceId::from_u128(2),
+            version: VersionNo(1),
+            digest: Digest::of(b"x"),
+        };
+        TaskSpec::new(TaskKind::Exec(RuntimeKind::Wasm), svc, trigger).with_payload(payload)
+    }
+
+    fn body_json(req: http::Request<Body>) -> serde_json::Value {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let buf = rt.block_on(req.into_body().collect(u64::MAX)).unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    /// Pub/sub and stream tasks reach a component as JSON `POST`s to `/__rt/pubsub` and
+    /// `/__rt/stream` with `x-rt-trigger` set and the guest JSON as the body.
+    #[test]
+    fn guest_request_maps_pubsub_and_stream_to_synthetic_posts() {
+        let msg = PubsubMessage {
+            id: MsgId::from_u128(3),
+            subject: "a.b".into(),
+            body: bytes::Bytes::from_static(b"\"hi\""),
+            headers: vec![],
+            replyable: false,
+            published_at_ms: 9,
+        };
+        let mut s = spec(
+            Trigger::Pubsub {
+                subject: "a.b".into(),
+                depth: 1,
+                reply: false,
+            },
+            Payload::Pubsub(msg.clone()),
+        );
+        let req = guest_request(&mut s, TaskId(1), 0);
+        assert_eq!((req.method(), req.uri().path()), (&http::Method::POST, "/__rt/pubsub"));
+        assert_eq!(req.headers()["x-rt-trigger"], "pubsub");
+        assert_eq!(req.headers()[http::header::CONTENT_TYPE], "application/json");
+        assert_eq!(body_json(req), msg.guest_json());
+
+        let batch = StreamBatch {
+            topic: "orders".into(),
+            group: "default".into(),
+            partition: 0,
+            attempt: 1,
+            records: vec![StreamRecord {
+                partition: 0,
+                offset: 3,
+                key: None,
+                headers: vec![("h".into(), "v".into())],
+                body: bytes::Bytes::from_static(b"{}"),
+                ts_ms: 1,
+            }],
+        };
+        let mut s = spec(
+            Trigger::Stream {
+                topic: "orders".into(),
+                partition: 0,
+                attempt: 1,
+            },
+            Payload::Stream(batch),
+        );
+        let req = guest_request(&mut s, TaskId(2), 0);
+        assert_eq!((req.method(), req.uri().path()), (&http::Method::POST, "/__rt/stream"));
+        assert_eq!(req.headers()["x-rt-trigger"], "stream");
+        let v = body_json(req);
+        assert_eq!(
+            (v["topic"].clone(), v["messages"][0]["offset"].clone()),
+            (serde_json::json!("orders"), serde_json::json!(3))
+        );
+        assert_eq!(v["messages"][0]["headers"], serde_json::json!({"h": "v"}));
     }
 }

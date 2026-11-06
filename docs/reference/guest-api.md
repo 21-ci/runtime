@@ -32,6 +32,8 @@ export default {
   fetch(req: Request, ctx: Ctx): Response | Promise<Response>,
   scheduled(event: ScheduledEvent, ctx: Ctx): void | Promise<void>,
   queue(batch: QueueBatch, ctx: Ctx): void | Promise<void>,
+  pubsub(msg: PubsubMessage, ctx: Ctx): unknown | Promise<unknown>,
+  stream(batch: StreamBatch, ctx: Ctx): void | Promise<void>,
   webSocketMessage(ws: Socket, message: string | ArrayBuffer, ctx: Ctx): void | Promise<void>,
   webSocketClose(ws: Socket, code: number, reason: string, wasClean: boolean, ctx: Ctx): void | Promise<void>,
   webSocketError(ws: Socket, error: Error & { code: string }, ctx: Ctx): void | Promise<void>,
@@ -50,11 +52,14 @@ export default class Room {
 | `http`, `call` | `fetch` (Form A: the function) | `500 guest_error` |
 | `interval`, `cron` | `scheduled(event, ctx)`; returning normally = success | `fetch(POST http://localhost/__rt/scheduled)` with JSON `{scheduleId, scheduledTime, payload}`; the status is logged |
 | `queue` | `queue(batch, ctx)` | `fetch(POST http://localhost/__rt/queue)` with JSON `{messages: [{id, body, attempt}]}`; `2xx` acks all, anything else retries all |
+| `pubsub` | `pubsub(msg, ctx)`; the return value is the reply to a `request()` | `fetch(POST http://localhost/__rt/pubsub)` with the message as JSON; the `2xx` body is the reply |
+| `stream` | `stream(batch, ctx)` | `fetch(POST http://localhost/__rt/stream)` with JSON `{topic, group, partition, attempt, messages}`; see `std:stream` below |
 | `websocket` | `webSocketMessage` / `webSocketClose` / `webSocketError` | the event is done |
 | `alarm` | `alarm(info, ctx)` of a durable class | the alarm is done |
 
 `fetch` must return a `Response`; any other value is a `TypeError` (`500 guest_error`). A throw or a rejected promise
-in any handler fails the task; for `queue` that redelivers the whole batch.
+in any handler fails the task; for `queue` that redelivers the whole batch, for `stream` it redelivers the batch from
+its first uncommitted record.
 
 ## Types
 
@@ -64,7 +69,8 @@ in any handler fails the task; for `queue` that redelivers the whole batch.
 |---|---|---|
 | `taskId` | `string` | id of this task (`task_…`), also in the `x-rt-task-id` response header and on every log line |
 | `service` | `{ id: string; slug: string; version: number }` | the service and the version that runs |
-| `trigger` | `"http" \| "interval" \| "cron" \| "schedule" \| "queue" \| "call" \| "websocket" \| "alarm"` | what started the task |
+| `trigger` | `"http" \| "interval" \| "cron" \| "schedule" \| "queue" \| "call" \| "websocket" \| "alarm" \| "pubsub" \| "stream"` | what started the task |
+| `invocation` | `{ id: string; attempt: number } \| undefined` | an async HTTP invocation (`http` trigger): its `inv_…` id and 1-based attempt. `undefined` for every other request; built only from the runtime's headers |
 | `object` | `{ name: string } \| undefined` | the object of a socket event, an alarm or a request to a durable object |
 | `storage` | `Storage \| undefined` | that object's storage ([`std:durable`](#stddurable)) |
 | `invoker` | `string \| undefined` | the `x-rt-invoker` header, only for requests on the internal listener |
@@ -415,6 +421,157 @@ Returns the message id (`msg_…`). The target's `queue` trigger must be on, its
 | `queue_full` | the target's queue is at the plan's `max_queue_depth` |
 | `call_failed` | the message was refused (for example over 1 MB, or a delay over 7 days) or could not be stored |
 
+## `std:pubsub`
+
+```ts
+import { publish, request } from "std:pubsub";
+
+// Fire and forget. Resolves after routing, not after delivery.
+publish(subject: string, body: unknown | Uint8Array, opts?: { headers?: Record<string, string> }):
+  Promise<{ receivers: number; dropped: number }>;
+
+// One responder; the first answer wins.
+request(subject: string, body: unknown | Uint8Array, opts?: { headers?: Record<string, string>; timeoutMs?: number }):
+  Promise<unknown>;
+```
+
+| Parameter | Description |
+|---|---|
+| `subject` | concrete `.`-separated tokens (`orders.42.created`), 256 bytes and 16 tokens at most; no wildcards, not starting with `_rt` |
+| `body` | a `Uint8Array` is sent as is; anything else as JSON. At most 1 MB |
+| `headers` | at most 32 headers, 16 KiB in total; names `[a-z0-9][a-z0-9-]{0,63}`, not starting with `x-rt-` |
+| `timeoutMs` | `request` only: default 5000, max 30000, never past the task deadline |
+
+`publish` returns `receivers` (deliveries handed to the scheduler) and `dropped` (deliveries refused). A delivery is
+dropped, and counted, when the publish has more than 100 matching subscribers (the start point rotates between
+publishes), when the subscriber service already has 64 deliveries in flight, when the tenant's quota is spent for that
+delivery, or when admission refuses it. Delivery is at-most-once and in memory: a restart or drain loses it.
+
+`request` picks one responder: the first matching group by name and its next member in turn, or else the next
+ungrouped subscriber in turn. The reply is parsed JSON when the reply says so, a string for `text/*`, bytes otherwise,
+`undefined` when empty.
+
+Subscriber (Form B), declared in the service config under `events.subscribe` (a subject pattern with `*` and `>`,
+and an optional `group`; each group shares its messages across its members):
+
+```ts
+export default {
+  async pubsub(msg: PubsubMessage, ctx: Ctx): Promise<unknown | void> {
+    // the return value is the reply when msg.replyable (a request); ignored for publish
+  },
+};
+
+interface PubsubMessage {
+  id: string;                  // msg_…
+  subject: string;             // the concrete subject that was published (never a wildcard)
+  body: unknown;               // parsed JSON, else a string
+  headers: Record<string, string>;
+  replyable: boolean;          // true for request()
+  publishedAt: number;         // epoch ms
+}
+```
+
+A reply from `pubsub()`: `undefined` gives `204`, a `Response` is used as is, `Uint8Array` is
+`application/octet-stream`, a `string` is `text/plain; charset=utf-8`, anything else is `application/json`. A throw
+makes the requester get `responder_failed`. A service that subscribes to a subject it publishes also gets its own
+messages. Publish chains are limited to 15 hops (`call_depth`).
+
+| Code | Call | When |
+|---|---|---|
+| `validation_failed` | both | bad subject, wildcard in a published subject, `_rt` subject, bad header or option |
+| `too_large` | both | body over 1 MB, headers over 32 or 16 KiB, reply over 1 MB |
+| `unavailable` | both | outside a task, or the node runs without the event bus |
+| `rate_limited` / `quota_exceeded` | both | the tenant's rate bucket or its daily invocations (checked like an invoke) |
+| `call_depth` | both | called from a task already 15 hops deep |
+| `no_responders` | `request` | nothing subscribes to a matching subject (returned at once) |
+| `timeout` | `request` | no reply within `timeoutMs` or before the deadline |
+| `responder_failed` | `request` | the responder threw, returned non-2xx, or was killed |
+| `overloaded` / `queue_timeout` / `shed` / `memory` / `draining` | `request` | the responder's task was refused |
+
+## `std:stream`
+
+```ts
+import { append, appendBatch, read, info } from "std:stream";
+
+append(topic: string, body: unknown | Uint8Array, opts?: {
+  key?: string;                // at most 256 bytes; the same key always goes to the same partition
+  headers?: Record<string, string>;
+  dedupId?: string;            // at most 128 bytes; same id on the topic within 2 min returns the original position
+}): Promise<{ partition: number; offset: number; duplicate: boolean }>;
+
+// 1 to 100 records, 4 MiB in total, one transaction: all or nothing.
+appendBatch(topic: string, records: Array<{ body: unknown | Uint8Array; key?: string;
+  headers?: Record<string, string>; dedupId?: string }>): Promise<Array<{ partition: number; offset: number; duplicate: boolean }>>;
+
+// Replay without a consumer group. At most one of `from` / `fromTime`.
+read(topic: string, opts?: {
+  partition?: number;          // default 0; required when the topic has more than one partition
+  from?: number | "earliest" | "latest";   // default "earliest"
+  fromTime?: number;           // epoch ms: the first record at or after it
+  limit?: number;              // 1 to 100, default 100 (and at most 1 MiB of bodies)
+}): Promise<{ records: StreamRecord[]; next: number; end: number }>;  // next = offset after the last record; end = the partition's next offset
+
+info(topic: string): Promise<{
+  name: string;
+  partitions: Array<{ partition: number; first: number; next: number }>;
+  retentionHours: number;
+  maxMb: number;               // 0 = only the tenant cap applies
+  bytes: number;
+}>;
+
+interface StreamRecord {
+  partition: number;
+  offset: number;
+  key: string | null;
+  body: unknown;               // parsed JSON, else a string
+  headers: Record<string, string>;
+  timestamp: number;           // epoch ms, non-decreasing within a partition
+}
+```
+
+A topic is created with the control API, not by the service; a topic name may not start with `tpc_`. Offsets are dense
+per partition from 0. A partition is `fnv1a64(key) % partitions` when a key is given (partitions never change), else
+round robin.
+
+Consumer (Form B), declared under `events.consume` in the service config (topic, group, `start`, `batch_size` 1 to
+1000, `max_attempts` 1 to 100, `on_exhausted` `dlq` / `skip` / `block`):
+
+```ts
+export default {
+  async stream(batch: StreamBatch, ctx: Ctx): Promise<void> {
+    for (const m of batch.messages) {
+      try { await apply(m); }
+      catch (e) { batch.failAt(m); return; }   // commit before m, redeliver from m
+    }
+  },                                            // a normal return commits the whole batch
+};                                              // a throw commits nothing and retries
+
+interface StreamBatch {
+  topic: string;
+  group: string;
+  partition: number;
+  attempt: number;             // 1 on the first delivery
+  messages: StreamRecord[];    // ordered by offset, contiguous
+  failAt(m: StreamRecord | number): void;   // the lowest offset passed wins
+}
+```
+
+Delivery is at-least-once, in order per partition, with one batch in flight per consumer cursor. A record that keeps
+failing gets `max_attempts` deliveries, and the batch is then narrowed to that one record, so records next to it are
+never dead-lettered. After the last attempt, `dlq` copies the record to the consumer's dead letters, `skip` moves on
+(logged), and `block` stops the cursor until it is reset. Retention is independent of consumption: records older than
+the topic's retention, or beyond its size cap, are removed, and a consumer behind them moves to the first retained
+record.
+
+| Code | Call | When |
+|---|---|---|
+| `validation_failed` | all | bad topic, key, dedup id, header or option; a `read` offset or partition out of range; `read` without `partition` on a multi-partition topic (the message names the partition count) |
+| `too_large` | all | body over 1 MB, batch over 100 records or 4 MiB, headers over 32 or 16 KiB |
+| `unavailable` | all | outside a task, or the node runs without the event bus |
+| `not_found` | all | no topic of that name in the service's namespace |
+| `stream_full` | `append` | the tenant's topics hold its stream quota (`max_stream_mb`, dead letters included) |
+| `rate_limited` / `quota_exceeded` | `append` | the tenant's rate bucket or daily invocations (one check per call) |
+
 ## `std:services`
 
 ```ts
@@ -717,6 +874,13 @@ codes are the same; WASM gets them as `error { code, message }` results.
 | `ctx.taskId`, `ctx.trigger`, `ctx.deadline` | request headers `x-rt-task-id`, `x-rt-trigger`, `x-rt-deadline` | |
 | `ctx.client.ip` | request header `x-rt-client-ip` | `http` trigger only |
 | `scheduled`, `queue` handlers | `POST /__rt/scheduled`, `POST /__rt/queue` | synthetic requests, like Form A |
+| `publish(subject, body, opts)` | `pubsub.publish(subject, body, headers)` | `body` is bytes; returns `{receivers, dropped}` as a record |
+| `request(subject, body, opts)` | `pubsub.request(subject, body, headers, timeout-ms)` | the reply is `{content-type, body}` |
+| `pubsub(msg, ctx)` handler | `POST /__rt/pubsub` (the 2xx body is the reply) | the message is the same JSON as Deno's `PubsubMessage` |
+| `append`, `appendBatch` | `streams.append(topic, entries)` | one call for one or many entries; returns the `appended` list |
+| `read(topic, opts)`, `info(topic)` | `streams.read(topic, {partition, start, limit})`, `streams.info(topic)` | `start` is a `position` variant (`earliest`, `latest`, `offset`, `time-ms`); `partition` is always passed |
+| `stream(batch, ctx)` handler | `POST /__rt/stream` | a 2xx commits the batch; `x-rt-stream-fail-at: <offset>` stops mid-batch |
+| `ctx.invocation` | headers `x-rt-invocation-id`, `x-rt-invocation-attempt` | async HTTP invocations only |
 | `sockets.accept(req)` | `sockets.accept(opts)`, then answer status 101 | an upgrade offer is the header `x-rt-websocket: 1` |
 | `std:sockets` (`send`, `broadcast`, `close`, `closeAll`, `list`, `get`, `setTags`, attachments, `setAutoResponse`) | `sockets.*` | attachments are raw bytes; no `count` / `objects` |
 | `webSocketMessage` / `webSocketClose` / `webSocketError` / `alarm` | export `socket-handler`: `on-message`, `on-close`, `on-error`, `on-alarm` (world `socket-service`) | an `err` or a trap fails the event |

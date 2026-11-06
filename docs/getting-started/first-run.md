@@ -44,7 +44,7 @@ config           ok      context local; /home/me/.config/21ci/config.toml
 credentials      ok      root token (operator)
 control api      ok      http://127.0.0.1:8081 answers in 3 ms (API 1.0.0)
 auth             ok      operator: node routes allowed
-version          ok      client 0.1.0, node 0.1.0
+version          ok      client 0.1.1, node 0.1.1
 node mode        ok      normal
 invoke listener  ok      http://127.0.0.1:8080 answers in 2 ms (HTTP 404)
 ```
@@ -54,7 +54,7 @@ shows the node itself:
 
 ```console
 $ 21ci node status
-Version:          0.1.0
+Version:          0.1.1
 Mode:             normal
 Default profile:  balanced
 V8 sandbox:       false

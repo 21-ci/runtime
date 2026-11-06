@@ -21,6 +21,11 @@ rt is installed but not started. Next steps:
   2. review /etc/rt/rt.toml
   3. sudo systemctl enable --now rt
 Docs: https://21-ci.github.io/runtime/
+
+Telemetry: 21 Cloud Runtime sends one anonymous report a day: request, project, service, organization
+and user counts, plus the version and a random id. No IP addresses are stored. See the exact payload
+with: rt telemetry show. Opt out with telemetry.enabled = false or DO_NOT_TRACK=1. The first report
+is sent 24 hours after the first start.
 EOF
   fi
 fi

@@ -392,3 +392,54 @@ fn data_export_needs_data_admin() {
         .fails_with(1);
     assert!(out.stderr.contains("insufficient_scope"), "{}", out.stderr);
 }
+
+#[test]
+fn data_query_posts_the_statement_and_prints_the_rows() {
+    let ctx = Ctx::new();
+    let m = ctx.server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/services/svc_1/data/query")
+            .json_body(serde_json::json!({"sql": "SELECT ?1", "args": [1], "limit": 5}));
+        then.status(200)
+            .json_body(serde_json::json!({"columns": ["a"], "rows": [[1]], "truncated": false, "elapsed_ms": 1}));
+    });
+    let out = ctx
+        .run(&["data", "query", "svc_1", "SELECT ?1", "--args", "[1]", "--limit", "5"])
+        .ok();
+    m.assert();
+    assert!(out.stdout.contains("\"columns\""), "{}", out.stdout);
+    ctx.run(&["data", "query", "svc_1", "SELECT 1", "--args", "{bad"])
+        .fails_with(2);
+}
+
+#[test]
+fn data_tables_kv_and_blobs_call_their_routes() {
+    let ctx = Ctx::new();
+    let mut mocks = Vec::new();
+    for (path, q) in [
+        ("/v1/services/svc_1/data/tables", None),
+        ("/v1/services/svc_1/data/kv", Some("a")),
+        ("/v1/services/svc_1/data/kv/YQ", None),
+        ("/v1/services/svc_1/data/blobs", Some("a")),
+    ] {
+        mocks.push(ctx.server.mock(|when, then| {
+            let mut w = when.method(GET).path(path);
+            if let Some(q) = q {
+                w = w
+                    .query_param("prefix", q)
+                    .query_param("cursor", "c")
+                    .query_param("limit", "2");
+            }
+            let _ = w;
+            then.status(200).json_body(serde_json::json!({"items": []}));
+        }));
+    }
+    let page = ["--prefix", "a", "--cursor", "c", "--limit", "2"];
+    ctx.run(&["data", "tables", "svc_1"]).ok();
+    ctx.run(&[&["data", "kv", "svc_1"][..], &page[..]].concat()).ok();
+    ctx.run(&["data", "kv", "svc_1", "--key", "YQ"]).ok();
+    ctx.run(&[&["data", "blobs", "svc_1"][..], &page[..]].concat()).ok();
+    for m in &mocks {
+        m.assert();
+    }
+}

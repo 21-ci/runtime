@@ -151,6 +151,22 @@
         "help": "Node bound on bytes held by queued tasks in MB (0=auto: 1/16 of the memory budget)",
         "profile_scoped": false
       },
+      "min_run_time_max_ms": {
+        "type": "int",
+        "default": 600000,
+        "min": 0,
+        "max": 86400000,
+        "help": "Largest scaling.min_run_time_ms any service may set on this node, ms (the plan may lower it)",
+        "profile_scoped": false
+      },
+      "aging_factor": {
+        "type": "int",
+        "default": 4,
+        "min": 0,
+        "max": 64,
+        "help": "Admission aging k in the deadline key since + min(k*pred, queue_timeout/2) (0 = arrival order within a tenant)",
+        "profile_scoped": false
+      },
       "spin_us": {
         "type": "int",
         "default": 10,
@@ -693,6 +709,137 @@
       }
     }
   },
+  "backup": {
+    "help": "Node backups: scheduled, verified archives, on disk and on S3",
+    "keys": {
+      "enabled": {
+        "type": "bool",
+        "default": false,
+        "help": "Take scheduled backups and accept POST /v1/node/backups",
+        "profile_scoped": false
+      },
+      "schedule": {
+        "type": "string",
+        "default": "0 3 * * *",
+        "help": "Cron expression (UTC) of the scheduled backup",
+        "profile_scoped": false
+      },
+      "dir": {
+        "type": "string",
+        "default": "",
+        "help": "Directory of the archives (empty: <data_dir>/backups)",
+        "profile_scoped": false
+      },
+      "keep_last": {
+        "type": "int",
+        "default": 3,
+        "min": 1,
+        "help": "Good archives kept locally",
+        "profile_scoped": false
+      },
+      "encrypt_to": {
+        "type": "list",
+        "default": [],
+        "help": "age public keys the archives are encrypted to; with any, no plaintext archive is on disk",
+        "profile_scoped": false,
+        "items": "string"
+      },
+      "allow_plaintext_remote": {
+        "type": "bool",
+        "default": false,
+        "help": "Allow backup.s3 without backup.encrypt_to",
+        "profile_scoped": false
+      }
+    },
+    "tables": {
+      "s3": {
+        "help": "S3 destination of the archives",
+        "keys": {
+          "endpoint": {
+            "type": "string",
+            "default": "",
+            "help": "S3 endpoint, https://host[:port] (empty: no upload; plain http to loopback only)",
+            "profile_scoped": false
+          },
+          "bucket": {
+            "type": "string",
+            "default": "",
+            "help": "Bucket of the archives",
+            "profile_scoped": false
+          },
+          "prefix": {
+            "type": "string",
+            "default": "",
+            "help": "Key prefix inside the bucket",
+            "profile_scoped": false
+          },
+          "region": {
+            "type": "string",
+            "default": "auto",
+            "help": "Region used in request signatures",
+            "profile_scoped": false
+          },
+          "access_key_file": {
+            "type": "string",
+            "default": "",
+            "help": "File holding the access key (empty: RT_BACKUP_S3_ACCESS_KEY)",
+            "profile_scoped": false
+          },
+          "secret_key_file": {
+            "type": "string",
+            "default": "",
+            "help": "File holding the secret key (empty: RT_BACKUP_S3_SECRET_KEY)",
+            "profile_scoped": false
+          },
+          "keep_local": {
+            "type": "int",
+            "default": 1,
+            "min": 0,
+            "help": "Archives kept on the local disk once uploaded",
+            "profile_scoped": false
+          },
+          "keep_last": {
+            "type": "int",
+            "default": 7,
+            "min": 1,
+            "help": "Newest complete objects kept in the bucket",
+            "profile_scoped": false
+          },
+          "keep_daily": {
+            "type": "int",
+            "default": 7,
+            "min": 0,
+            "help": "Days of which the newest complete object is kept",
+            "profile_scoped": false
+          },
+          "keep_weekly": {
+            "type": "int",
+            "default": 4,
+            "min": 0,
+            "help": "ISO weeks of which the newest complete object is kept",
+            "profile_scoped": false
+          }
+        }
+      }
+    }
+  },
+  "telemetry": {
+    "help": "Anonymous daily report: counts, version and a random id. RT_TELEMETRY_URL overrides the URL; DO_NOT_TRACK=1 stops it",
+    "keys": {
+      "enabled": {
+        "type": "bool",
+        "default": true,
+        "help": "false turns the report off",
+        "profile_scoped": false
+      },
+      "url": {
+        "type": "string",
+        "default": "auto",
+        "help": "auto = the URL set at build time, if any; empty = no sending; otherwise an https URL",
+        "profile_scoped": false
+      }
+    }
+  },
   "deploy": {
     "help": "Deployment configuration",
     "keys": {
@@ -707,6 +854,38 @@
         "type": "bool",
         "default": true,
         "help": "Automatically rollback on deploy failure",
+        "profile_scoped": false
+      },
+      "drain_max": {
+        "type": "duration",
+        "default": "15m",
+        "help": "Longest a superseded version may keep a switch in draining, bounded 1s to 24h; the drain deadline is the longest task wall or queue timeout plus 30s, capped by this.",
+        "profile_scoped": false
+      },
+      "dry_run_max_mb": {
+        "type": "int",
+        "default": 256,
+        "min": 1,
+        "help": "The most data a branch's copy_data or a migration dry run may copy, in MiB.",
+        "profile_scoped": false
+      },
+      "migration_budget": {
+        "type": "duration",
+        "default": "60s",
+        "help": "How long one version's SQL migrations may take at a promote, bounded 1s to 1h; over it they roll back with migration_timeout.",
+        "profile_scoped": false
+      }
+    }
+  },
+  "import": {
+    "title": "App import",
+    "help": "App bundles (POST /v1/services/import).",
+    "keys": {
+      "max_bundle_mb": {
+        "type": "int",
+        "default": 4096,
+        "min": 1,
+        "help": "The largest app bundle an import takes, in MiB, counted as it arrives; it may unpack to eight times this.",
         "profile_scoped": false
       }
     }
@@ -870,6 +1049,61 @@
         "help": "Anomaly threshold for secret requests per minute",
         "profile_scoped": false
       }
+    },
+    "tables": {
+      "vault": {
+        "help": "HashiCorp Vault KV v2, synced into the sealed store (off while address is empty)",
+        "keys": {
+          "address": {
+            "type": "string",
+            "default": "",
+            "help": "https URL (plain http to loopback only)",
+            "profile_scoped": false
+          },
+          "token_file": {
+            "type": "string",
+            "default": "",
+            "help": "File holding a token",
+            "profile_scoped": false
+          },
+          "role_id_file": {
+            "type": "string",
+            "default": "",
+            "help": "AppRole role id file",
+            "profile_scoped": false
+          },
+          "secret_id_file": {
+            "type": "string",
+            "default": "",
+            "help": "AppRole secret id file",
+            "profile_scoped": false
+          },
+          "mount": {
+            "type": "string",
+            "default": "secret",
+            "help": "KV v2 mount",
+            "profile_scoped": false
+          },
+          "path_template": {
+            "type": "string",
+            "default": "rt/{tenant}/{project}/{environment}/",
+            "help": "Must name {tenant}, {project} and {environment}",
+            "profile_scoped": false
+          },
+          "poll": {
+            "type": "duration",
+            "default": "60s",
+            "help": "Sync interval (at least 10s)",
+            "profile_scoped": false
+          },
+          "ca_file": {
+            "type": "string",
+            "default": "",
+            "help": "PEM of a private CA",
+            "profile_scoped": false
+          }
+        }
+      }
     }
   },
   "ingress": {
@@ -920,6 +1154,13 @@
         "default": 4096,
         "min": 1,
         "help": "listen() backlog of the TCP listeners (capped by kern.ipc.somaxconn / net.core.somaxconn)",
+        "profile_scoped": false
+      },
+      "rate_keys_max": {
+        "type": "int",
+        "default": 0,
+        "min": 0,
+        "help": "Client cells of by-IP ingress.rate_rules on this node; one service holds at most 1/8 (0 = auto: 1/64 of the memory budget)",
         "profile_scoped": false
       }
     }
@@ -1219,7 +1460,9 @@
             "interval",
             "queue",
             "call",
-            "websocket"
+            "websocket",
+            "pubsub",
+            "stream"
           ],
           "help": "Trigger kinds the plan allows",
           "items": "enum",
@@ -1229,7 +1472,9 @@
             "cron",
             "queue",
             "call",
-            "websocket"
+            "websocket",
+            "pubsub",
+            "stream"
           ],
           "profile_scoped": false
         },
@@ -1291,6 +1536,126 @@
           "min": 1,
           "help": "Largest WebSocket message a client may send; a larger one closes the socket with 1009",
           "profile_scoped": false
+        },
+        "max_async_pending": {
+          "type": "int",
+          "default": 10000,
+          "min": 0,
+          "help": "Pending async invocations per service (more answer `429 async_backlog_full`)",
+          "profile_scoped": false
+        },
+        "max_topics": {
+          "type": "int",
+          "default": 10,
+          "min": 0,
+          "help": "Stream topics per tenant",
+          "profile_scoped": false
+        },
+        "max_topic_partitions": {
+          "type": "int",
+          "default": 4,
+          "min": 1,
+          "max": 16,
+          "help": "Partitions of one topic (1..=16)",
+          "profile_scoped": false
+        },
+        "max_stream_mb": {
+          "type": "int",
+          "default": 100,
+          "min": 0,
+          "help": "Stream record bytes across the tenant's topics, in MB (not part of storage_mb)",
+          "profile_scoped": false
+        },
+        "max_stream_retention_hours": {
+          "type": "int",
+          "default": 72,
+          "min": 0,
+          "help": "Longest retention a topic may set, in hours",
+          "profile_scoped": false
+        },
+        "max_scratch": {
+          "type": "int",
+          "default": 5,
+          "min": 0,
+          "help": "Previews per tenant, also counted in max_services (0 = no cap of its own)",
+          "profile_scoped": false
+        },
+        "scratch_ttl_max": {
+          "type": "int",
+          "default": 604800,
+          "min": 0,
+          "help": "Longest life of a preview, in seconds (0 = no cap)",
+          "profile_scoped": false
+        },
+        "cpu_ms_per_day": {
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "help": "CPU milliseconds per UTC day across the tenant; new invocations then get 429 cpu_quota (0 = no cap)",
+          "profile_scoped": false
+        },
+        "max_projects": {
+          "type": "int",
+          "default": 20,
+          "min": 0,
+          "help": "Projects per tenant, at most the hard cap of 100 (0 = no cap of its own)",
+          "profile_scoped": false
+        },
+        "max_environments_per_project": {
+          "type": "int",
+          "default": 10,
+          "min": 0,
+          "help": "Environments of one project, at most the hard cap of 20 (0 = no cap of its own)",
+          "profile_scoped": false
+        },
+        "max_branches": {
+          "type": "int",
+          "default": 10,
+          "min": 0,
+          "help": "Branch services per tenant, also counted in max_services (0 = no cap of its own)",
+          "profile_scoped": false
+        },
+        "max_secrets_per_service": {
+          "type": "int",
+          "default": 100,
+          "min": 0,
+          "help": "Secrets of one service, refs included (0 = no cap)",
+          "profile_scoped": false
+        },
+        "max_custom_hosts": {
+          "type": "int",
+          "default": 10,
+          "min": 0,
+          "help": "Custom hosts a tenant may claim, active or pending (0 = no cap)",
+          "profile_scoped": false
+        },
+        "max_versions_retained": {
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "help": "Versions kept per service; the lower of this and deploy.retain_versions (0 = node value)",
+          "profile_scoped": false
+        },
+        "log_retention_days": {
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "help": "Days logs are kept; the lower of this and logs.retention_days (0 = node value)",
+          "profile_scoped": false
+        },
+        "max_fetches_per_call": {
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "help": "Outbound fetches of one call; only lowers the trigger default (0 = no cap)",
+          "profile_scoped": false
+        },
+        "max_log_lines_per_call": {
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "help": "Log lines of one call; only lowers the trigger default (0 = no cap)",
+          "profile_scoped": false
         }
       },
       "tables": {
@@ -1316,6 +1681,13 @@
               "default": 128,
               "min": 0,
               "help": "Memory limit, MB",
+              "profile_scoped": false
+            },
+            "min_run_time_ms": {
+              "type": "int",
+              "default": 60000,
+              "min": 0,
+              "help": "Largest scaling.min_run_time_ms a service may set, ms",
               "profile_scoped": false
             }
           }

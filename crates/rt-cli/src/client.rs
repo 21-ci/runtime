@@ -171,6 +171,11 @@ impl Client {
             .header(ACCEPT, "text/event-stream")
     }
 
+    /// A `POST` on the no-timeout client: a body that may take long to send, or to be taken in.
+    pub fn upload_req(&self, path: &str) -> RequestBuilder {
+        self.builder(&self.stream, Method::POST, path)
+    }
+
     /// Request on the no-timeout client for a raw (binary) download.
     pub fn download_req(&self, path: &str) -> RequestBuilder {
         self.builder(&self.stream, Method::GET, path).header(ACCEPT, "*/*")

@@ -122,6 +122,16 @@ pub struct EgressGuardConfig {
     /// Pinned clients kept for connection reuse (least recently used evicted first). `0` = no
     /// reuse: a fresh client per hop.
     pub max_pooled_clients: usize,
+    /// Refuse any hop that is not `https` (archive fetches).
+    pub require_https: bool,
+    /// On a cross-origin redirect drop every caller header, not only the standard credentials:
+    /// `PRIVATE-TOKEN` and the like must not follow a redirect either (archive fetches).
+    pub drop_headers_cross_origin: bool,
+    /// One more root certificate (PEM) to trust: an operator's private CA (`secrets.vault.ca_file`).
+    pub extra_root_pem: Option<Vec<u8>>,
+    /// Debug builds only: the one `host:port` this guard may reach although its address is private.
+    #[cfg(debug_assertions)]
+    pub local_test_origin: Option<String>,
 }
 
 impl Default for EgressGuardConfig {
@@ -136,9 +146,55 @@ impl Default for EgressGuardConfig {
             allow_https_downgrade: false,
             pool_idle_timeout: Duration::from_secs(30),
             max_pooled_clients: 256,
+            require_https: false,
+            drop_headers_cross_origin: false,
+            extra_root_pem: None,
+            #[cfg(debug_assertions)]
+            local_test_origin: None,
         }
     }
 }
+
+/// The R4 e2e allowance (SECURITY.md): an exact local `host:port` and a CA file, from the
+/// environment. Absent from release: a caller outside `cfg(debug_assertions)` does not compile
+/// there, and `tests/local_test_origin.rs` checks that every use is gated.
+#[cfg(debug_assertions)]
+pub mod local_test_origin {
+    use super::EgressGuardConfig;
+
+    pub const ORIGIN_ENV: &str = "RT_TEST_LOCAL_ORIGIN";
+    pub const CA_ENV: &str = "RT_TEST_LOCAL_CA_FILE";
+    /// Also let guests reach the origin (the console's calls to its Git host).
+    pub const GUESTS_ENV: &str = "RT_TEST_LOCAL_ORIGIN_GUESTS";
+
+    /// `cfg` with the allowance when both variables are set; a CA file that cannot be read panics.
+    pub fn apply(cfg: EgressGuardConfig) -> EgressGuardConfig {
+        apply_from(cfg, |name| std::env::var(name).ok())
+    }
+
+    pub fn apply_from(mut cfg: EgressGuardConfig, env: impl Fn(&str) -> Option<String>) -> EgressGuardConfig {
+        if let (Some(origin), Some(ca)) = (env(ORIGIN_ENV), env(CA_ENV)) {
+            let pem = std::fs::read(&ca).unwrap_or_else(|e| panic!("{CA_ENV}={ca}: {e}"));
+            tracing::warn!(origin, "debug build: egress allowance for a local test origin is on");
+            cfg.local_test_origin = Some(origin);
+            cfg.extra_root_pem = Some(pem);
+        }
+        cfg
+    }
+
+    /// [`apply`] for the guests' guard, which also needs [`GUESTS_ENV`].
+    pub fn apply_to_guests(cfg: EgressGuardConfig) -> EgressGuardConfig {
+        if std::env::var(GUESTS_ENV).as_deref() == Ok("1") {
+            apply(cfg)
+        } else {
+            cfg
+        }
+    }
+}
+
+/// Every release caller fails to compile against this empty module.
+#[cfg(not(debug_assertions))]
+pub mod local_test_origin {}
 
 /// Per-service policy.
 #[derive(Clone, Debug, Default)]
@@ -554,17 +610,21 @@ impl GuardedEgress {
         } else if policy.default_deny {
             return Err(EgressError::Denied);
         }
+        #[cfg(debug_assertions)]
+        let exempt = self.trusted || self.cfg.local_test_origin.as_deref() == Some(&*format!("{host_name}:{port}"));
+        #[cfg(not(debug_assertions))]
+        let exempt = self.trusted;
         let ips: Vec<IpAddr> = match host {
             Host::Ipv4(a) => vec![IpAddr::V4(a)],
             Host::Ipv6(a) => vec![IpAddr::V6(a)],
             Host::Domain(d) => {
-                if is_localhost_name(d) && !self.trusted {
+                if is_localhost_name(d) && !exempt {
                     return Err(EgressError::Denied);
                 }
                 self.lookup(d).await?
             }
         };
-        self.check_addrs(&host_name, &ips, self.trusted)?;
+        self.check_addrs(&host_name, &ips, exempt)?;
         let pinned = *ips.first().ok_or(EgressError::Dns)?;
         let rewrite = |ip: IpAddr| self.rewrite.as_ref().map_or(ip, |f| f(ip));
         let dial = rewrite(pinned);
@@ -615,6 +675,10 @@ impl GuardedEgress {
                 .redirect(reqwest::redirect::Policy::none())
                 .no_proxy()
                 .connect_timeout(self.cfg.connect_timeout);
+            if let Some(pem) = &self.cfg.extra_root_pem {
+                let cert = reqwest::Certificate::from_pem(pem).map_err(|_| EgressError::Upstream)?;
+                builder = builder.add_root_certificate(cert);
+            }
             builder = if pooled {
                 builder
                     .pool_max_idle_per_host(POOL_IDLE_PER_CLIENT)
@@ -666,6 +730,9 @@ impl GuardedEgress {
             let _ = url.set_username("");
             let _ = url.set_password(None);
             url.set_fragment(None);
+            if self.cfg.require_https && url.scheme() != "https" {
+                return Err(EgressError::Denied);
+            }
             let target = self.validate_hop(&url, policy).await?;
             let mut hop_url = url.clone();
             let (client, host_override) = self.client_for_hop(&mut hop_url, &target, budget.tenant)?;
@@ -700,6 +767,9 @@ impl GuardedEgress {
                         headers.remove(header::AUTHORIZATION);
                         headers.remove(header::COOKIE);
                         headers.remove(header::PROXY_AUTHORIZATION);
+                        if self.cfg.drop_headers_cross_origin {
+                            headers = sanitize_request_headers(HeaderMap::new());
+                        }
                     }
                     if !keep_body {
                         body_bytes = Bytes::new();

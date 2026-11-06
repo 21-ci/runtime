@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
-use rt_types::{Body, BodyError, ServiceId, TenantId};
+use rt_types::{AppliedMigration, Body, BodyError, MigrationEntry, MigrationFile, ServiceId, TenantId, VersionNo};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::limits::Limit;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -34,6 +34,9 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use crate::blocking::{BlockingRunner, TokioBlocking};
 use crate::error::{Result, StoreError};
+use crate::snapshot::{
+    snapshot_db, snapshot_estimate, BackupHolds, ExportCache, ExportFile, HeavyJobs, HeavySlot, HeavyThread,
+};
 use crate::sqlutil::{now_ms, prefix_end, unique_name};
 
 pub const SERVICE_DATA_BOOTSTRAP: &str = include_str!("../migrations/service_data_0001_init.sql");
@@ -166,10 +169,70 @@ pub trait SqlBackend: Send + Sync {
     /// All statements in one transaction.
     async fn batch(&self, stmts: Vec<SqlStatement>, mode: BatchMode) -> Result<Vec<SqlResult>>;
     async fn begin(&self) -> Result<Box<dyn SqlTx>>;
-    /// Consistent SQLite snapshot of the whole database file (`GET …/data/export`, API-11).
-    async fn export(&self) -> Result<Bytes>;
+    /// A new consistent SQLite snapshot of the whole database in a temp file, kept for a while so
+    /// that Range hops read one file (`GET …/data/export`, API-11). Taken on the heavy-job thread,
+    /// under the heavy-job rule (`heavy_job_busy`) and the disk bounds (`insufficient_storage`).
+    async fn export(&self) -> Result<ExportFile>;
+    /// The snapshot of this service called `etag`, while it is kept.
+    async fn export_cached(&self, etag: &str) -> Option<ExportFile>;
     /// Current database size in bytes (storage quota accounting).
     async fn size_bytes(&self) -> Result<u64>;
+    /// A consistent copy of this service's data for the new service `to`, which has no data yet:
+    /// the database (a snapshot, as `export` takes) and its blobs, under the same rule and thread;
+    /// the source's writers are not held up. Timers are left behind, since they belong to the
+    /// running service. Returns the bytes copied.
+    async fn copy_into(&self, to: ServiceId) -> Result<u64>;
+    /// [`SqlBackend::copy_into`] into files of a bundle's work directory: `db` and `objects/`, under
+    /// the same rule and thread. Returns the bytes copied.
+    async fn snapshot_into(&self, db: PathBuf, objects: PathBuf) -> Result<u64>;
+    /// Move a checked import into this new service, which has no data yet. `db` and `objects` lie
+    /// on this store's filesystem. Refused while the service has a database.
+    async fn install_staged(&self, db: PathBuf, objects: PathBuf) -> Result<()>;
+    /// The rows of `_rt_migrations`, by name.
+    async fn applied_migrations(&self) -> Result<Vec<AppliedMigration>>;
+    /// Apply what of `files` is pending in one `BEGIN IMMEDIATE`, under the guest authorizer, within
+    /// `budget`. Returns what ran. `StoreError::Migration` leaves the database as it was.
+    async fn migrate(
+        &self,
+        files: Vec<MigrationFile>,
+        version: VersionNo,
+        budget: Duration,
+    ) -> Result<Vec<MigrationEntry>>;
+    /// [`SqlBackend::migrate`] on a snapshot that is thrown away: real errors and timing, under the
+    /// heavy-job rule. `Conflict("dry_run_too_large")` over `max_bytes`.
+    async fn migrate_dry_run(
+        &self,
+        files: Vec<MigrationFile>,
+        version: VersionNo,
+        budget: Duration,
+        max_bytes: u64,
+    ) -> Result<MigrationDryRun>;
+    /// One read-only statement under the browse sandbox (`browse.rs`), on a connection of its own:
+    /// it never reaches the writer. `SqlBusy` when none can be had soon.
+    async fn query_readonly(
+        &self,
+        stmt: SqlStatement,
+        limits: crate::browse::BrowseLimits,
+    ) -> Result<crate::browse::BrowseResult>;
+    /// The service's tables and views, with `rows_estimate` taken without a scan.
+    async fn browse_tables(&self) -> Result<Vec<crate::browse::BrowseTable>>;
+    /// A page of live KV entries with `head` bytes of each value.
+    async fn browse_kv_list(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+        head: usize,
+    ) -> Result<crate::browse::BrowseKvPage>;
+    /// One live KV entry with at most `max` bytes of its value.
+    async fn browse_kv_get(&self, key: Vec<u8>, max: usize) -> Result<Option<crate::browse::BrowseKvEntry>>;
+}
+
+/// What a dry run of migrations found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationDryRun {
+    pub pending: Vec<String>,
+    pub elapsed_ms: u64,
 }
 
 // ---- Blob ------------------------------------------------------------------------------------
@@ -224,6 +287,8 @@ pub trait ServiceDataStore: Send + Sync {
     fn blob(&self, s: ServiceId) -> Arc<dyn BlobBackend>;
     /// Durable object storage of the service (rows keyed by object in its `data.db`).
     fn durable(&self, s: ServiceId) -> Arc<dyn DurableBackend>;
+    /// Deletion holds of this store (blob unlinks, the artifact GC pause).
+    fn holds(&self) -> Arc<BackupHolds>;
     /// Remove all data of a service (a data reset: the service may write again and start over).
     fn purge(&self, s: ServiceId) -> Result<()>;
     /// Remove all data of a deleted service for good: a task of it still running cannot re-create
@@ -283,6 +348,14 @@ pub struct DataConfig {
     /// Who owns each service (the runner's fair-queue lane) and how far its database may grow.
     /// `None`: every job runs in the node lane and only `max_db_bytes` bounds the databases.
     pub directory: Option<Arc<dyn ServiceDirectory>>,
+    /// How long a snapshot stays for Range hops.
+    pub export_ttl: Duration,
+    /// Disk the kept snapshots may take together, those being taken or streamed included.
+    pub export_cache_max_bytes: u64,
+    /// Free disk any scratch file (export, data copy) must leave behind.
+    pub scratch_floor_bytes: u64,
+    /// How long a snapshot waits for a connection slot when none is free (only a very small pool).
+    pub snapshot_slot_wait: Duration,
 }
 
 /// Per-service facts the data store needs from the node (service table + tenant plans).
@@ -314,6 +387,10 @@ impl DataConfig {
             mmap_bytes: 64 * 1024 * 1024,
             runner: Arc::new(TokioBlocking),
             directory: None,
+            export_ttl: Duration::from_secs(300),
+            export_cache_max_bytes: 2 * 1024 * 1024 * 1024,
+            scratch_floor_bytes: 64 * 1024 * 1024,
+            snapshot_slot_wait: Duration::from_secs(30),
         }
     }
 }
@@ -340,14 +417,14 @@ impl std::fmt::Debug for DataConfig {
 // ---- implementation --------------------------------------------------------------------------
 
 /// Index of the local blob backend (object bytes live in files next to it).
-const BLOB_BOOTSTRAP: &str = "CREATE TABLE IF NOT EXISTS _rt_blobs (\n  key BLOB PRIMARY KEY,\n  size INTEGER NOT NULL,\n  content_type TEXT,\n  file TEXT NOT NULL\n) WITHOUT ROWID;";
+pub(crate) const BLOB_BOOTSTRAP: &str = "CREATE TABLE IF NOT EXISTS _rt_blobs (\n  key BLOB PRIMARY KEY,\n  size INTEGER NOT NULL,\n  content_type TEXT,\n  file TEXT NOT NULL\n) WITHOUT ROWID;";
 
 /// Interactive transactions are rolled back after this long (STO-07).
 const TX_CAP: Duration = Duration::from_secs(5);
 /// Streamed blob reads use chunks of this size.
 const BLOB_CHUNK: usize = 256 * 1024;
 /// The progress handler runs every this many SQLite VM instructions.
-const PROGRESS_OPS: i32 = 1000;
+pub(crate) const PROGRESS_OPS: i32 = 1000;
 /// Pages of WAL after which a commit checkpoints (SQLite's default, set explicitly).
 const WAL_AUTOCHECKPOINT_PAGES: i64 = 1000;
 /// The WAL file is truncated back to this size after a checkpoint (otherwise it keeps its peak).
@@ -412,7 +489,7 @@ const DENIED_PRAGMAS: &[&str] = &[
 /// SQL functions guests may not call: native code (`load_extension`) and native pointers
 /// (`fts3_tokenizer` returns the address of a tokenizer module: an ASLR leak in a process every
 /// tenant shares, SQL-002).
-const DENIED_FUNCTIONS: &[&str] = &["load_extension", "fts3_tokenizer"];
+pub(crate) const DENIED_FUNCTIONS: &[&str] = &["load_extension", "fts3_tokenizer"];
 
 fn is_reserved(name: &str) -> bool {
     name.as_bytes()
@@ -426,8 +503,15 @@ fn is_reserved(name: &str) -> bool {
 /// connection outside the database file, so neither `max_page_count`, the storage scan nor the
 /// memory governor would see it, and it would survive across requests on the writer (repeated
 /// `CREATE TEMP TABLE … AS <large query>` could exhaust the node). Use ordinary tables.
-fn guest_auth(ctx: &AuthContext<'_>) -> Authorization {
+pub(crate) fn guest_auth(ctx: &AuthContext<'_>) -> Authorization {
     use AuthAction::*;
+    // A generated data-change trigger firing inside a guest statement (R14): it, and only it, may
+    // add to the outbox. Guests cannot make, alter or drop a `_rt_`-named trigger.
+    if let (Insert { table_name }, Some(accessor)) = (&ctx.action, ctx.accessor) {
+        if table_name.eq_ignore_ascii_case("_rt_changes") && crate::data_events::is_generated_trigger(accessor) {
+            return Authorization::Allow;
+        }
+    }
     let temp_db = ctx.database_name.is_some_and(|d| d.eq_ignore_ascii_case("temp"));
     let names: [Option<&str>; 2] = match ctx.action {
         Attach { .. } | Detach { .. } => return Authorization::Deny,
@@ -480,7 +564,7 @@ fn guest_auth(ctx: &AuthContext<'_>) -> Authorization {
 }
 
 /// `sql` without leading whitespace, comments and empty statements (`;`).
-fn skip_comments(sql: &str) -> &str {
+pub(crate) fn skip_comments(sql: &str) -> &str {
     let mut rest = sql.trim_start_matches(|c: char| c == ';' || c.is_whitespace());
     loop {
         if let Some(r) = rest.strip_prefix("--") {
@@ -537,7 +621,7 @@ pub(crate) fn precheck(sql: &str) -> Result<()> {
     Ok(())
 }
 
-fn sanitize(msg: &str) -> String {
+pub(crate) fn sanitize(msg: &str) -> String {
     // SQLite messages do not normally carry paths; strip file names defensively.
     let mut out = msg.replace("data.db", "database");
     if let Some(i) = out.find('/') {
@@ -561,8 +645,9 @@ pub(crate) fn map_sql_err(e: rusqlite::Error) -> StoreError {
         ErrorCode::OperationInterrupted => StoreError::SqlTimeout,
         ErrorCode::AuthorizationForStatementDenied => StoreError::SqlNotAuthorized,
         ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => StoreError::SqlBusy,
-        // A denied function is reported at prepare time as a plain error.
-        _ if msg.starts_with("not authorized") => StoreError::SqlNotAuthorized,
+        // A denied function is reported at prepare time as a plain error; in a view it is stopped
+        // before the authorizer is asked (see `import_check::is_refused_body`).
+        _ if msg.starts_with("not authorized") || msg.starts_with("unsafe use of") => StoreError::SqlNotAuthorized,
         _ => StoreError::Sql(sanitize(&msg)),
     }
 }
@@ -582,7 +667,7 @@ pub(crate) fn map_internal_err(e: rusqlite::Error) -> StoreError {
     }
 }
 
-fn to_value(v: &SqlValue) -> rusqlite::types::Value {
+pub(crate) fn to_value(v: &SqlValue) -> rusqlite::types::Value {
     use rusqlite::types::Value;
     match v {
         SqlValue::Null => Value::Null,
@@ -851,6 +936,16 @@ impl Conn {
         });
     }
 
+    /// [`Conn::with_guest`] with `budget` for everything `f` runs, not per statement.
+    pub(crate) fn with_guest_budget<R>(&self, budget: Duration, f: impl FnOnce(&Connection) -> R) -> R {
+        self.guest.store(true, Ordering::Relaxed);
+        let ns = (self.base.elapsed() + budget).as_nanos() as u64;
+        self.deadline.store(ns.max(1), Ordering::Relaxed);
+        let r = f(&self.c);
+        self.guest.store(false, Ordering::Relaxed);
+        r
+    }
+
     /// Run guest SQL with the authorizer enforcing and a fresh statement budget.
     pub(crate) fn with_guest<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
         self.guest.store(true, Ordering::Relaxed);
@@ -875,6 +970,8 @@ pub(crate) struct OpenOpts {
     readers_per_db: usize,
     max_result_rows: usize,
     max_result_bytes: usize,
+    /// Commit flags of the data-change pump (R14).
+    pub(crate) dirty: Arc<crate::data_events::DirtyFlags>,
 }
 
 fn service_dir(root: &Path, s: ServiceId) -> PathBuf {
@@ -883,6 +980,25 @@ fn service_dir(root: &Path, s: ServiceId) -> PathBuf {
 
 fn blob_dir(root: &Path, s: ServiceId) -> PathBuf {
     root.join("blobs").join(s.to_string())
+}
+
+/// Is `name` a file name this store generates for a blob ([`unique_name`]: three lowercase hex
+/// groups)? `_rt_blobs.file` is trusted nowhere: backups, restores and imports hand a table to the
+/// host that someone else may have written.
+pub fn blob_file_name_ok(name: &str) -> bool {
+    const MAX: usize = 96;
+    let lower_hex = |g: &str| !g.is_empty() && g.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    name.len() <= MAX && name.split('-').count() == 3 && name.split('-').all(lower_hex)
+}
+
+/// The path of blob file `file` under `objects`. This is the only way from a `_rt_blobs.file` to a
+/// path: `Path::join` with an absolute name would replace `objects`, so a crafted row could read or
+/// unlink any host file, such as `master.key`.
+fn object_path(objects: &Path, file: &str) -> Result<PathBuf> {
+    if !blob_file_name_ok(file) {
+        return Err(StoreError::Corrupt("bad blob file name".into()));
+    }
+    Ok(objects.join(file))
 }
 
 fn private_dirs(path: &Path) -> std::io::Result<()> {
@@ -1000,6 +1116,12 @@ pub(crate) fn open_rw(o: &OpenOpts, s: ServiceId, limit: DbLimit, role: ConnRole
     c.execute_batch(SERVICE_DATA_BOOTSTRAP)?;
     c.execute_batch(BLOB_BOOTSTRAP)?;
     apply_ceiling(&c, limit)?;
+    // One relaxed store per commit; the pump reads it only for subscribed services (R14).
+    let dirty = o.dirty.flag(s);
+    c.commit_hook(Some(move || {
+        dirty.store(true, Ordering::Relaxed);
+        false
+    }))?;
     if role == ConnRole::Local {
         // From here on a Machine thread never waits long for a lock held by the pool's writer.
         c.busy_timeout(o.sync_busy)?;
@@ -1116,6 +1238,21 @@ pub(crate) struct Shared {
     faults: crate::faults::FaultSlot,
     /// Deleted services ([`ServiceDataStore::retire`]): never revived, never re-opened.
     retired: Mutex<HashSet<ServiceId>>,
+    /// Runs snapshots and data copies, off the blocking runner.
+    heavy: HeavyThread,
+    heavy_jobs: HeavyJobs,
+    exports: ExportCache,
+    holds: Arc<BackupHolds>,
+}
+
+/// The connection slot of the one snapshot running; dropping it gives the slot back.
+struct SnapshotSlot(Arc<Shared>);
+
+impl Drop for SnapshotSlot {
+    fn drop(&mut self) {
+        self.0.state.lock().conns -= 1;
+        self.0.freed.notify_waiters();
+    }
 }
 
 /// Exclusive use of one service's connection slot.
@@ -1168,7 +1305,7 @@ pub(crate) fn reset_open_tx(c: &Connection, which: &str) -> bool {
 
 /// Rolls back a transaction left open when the code that began it unwinds (a panic), so the
 /// connection never goes back into use mid-transaction.
-struct RollbackOnUnwind<'a>(&'a Connection);
+pub(crate) struct RollbackOnUnwind<'a>(pub(crate) &'a Connection);
 
 impl Drop for RollbackOnUnwind<'_> {
     fn drop(&mut self) {
@@ -1341,7 +1478,7 @@ impl Shared {
     /// evicted inline, its connections closed here (the writer's `PRAGMA optimize`, the WAL
     /// checkpoint). `false`: every slot is in use.
     pub(crate) fn claim_local(self: &Arc<Self>, s: ServiceId, entry: &Arc<ServiceConn>, slot: &Arc<LocalSlot>) -> bool {
-        let cap = self.cfg.max_open_dbs.max(1);
+        let cap = self.pool_cap();
         loop {
             let eviction = {
                 let mut st = self.state.lock();
@@ -1412,7 +1549,7 @@ impl Shared {
             entry: entry.clone(),
             gate: Some(gate),
         };
-        let cap = self.cfg.max_open_dbs.max(1);
+        let cap = self.pool_cap();
         loop {
             let notified = self.freed.notified();
             tokio::pin!(notified);
@@ -1558,10 +1695,58 @@ impl Shared {
         .await
     }
 
+    /// Slots writers, readers and local connections may use: one stays for the snapshot thread, so
+    /// that a pool full of idle writers (the normal state of a busy node) neither starves a
+    /// snapshot nor has one of them evicted for it. A pool under [`SNAPSHOT_SLOT_RESERVED_FROM`] has
+    /// nothing to spare: there a snapshot waits for a free slot, and may give up.
+    fn pool_cap(&self) -> usize {
+        match self.cfg.max_open_dbs.max(1) {
+            n if n >= SNAPSHOT_SLOT_RESERVED_FROM => n - 1,
+            n => n,
+        }
+    }
+
+    /// Charge the snapshot connection against `max_open_dbs` (STO-14). Never evicts: with no free
+    /// slot it waits with backoff on the heavy thread, then `heavy_job_busy`.
+    fn claim_snapshot_slot(self: &Arc<Self>) -> Result<SnapshotSlot> {
+        let cap = self.cfg.max_open_dbs.max(1);
+        let deadline = Instant::now() + self.cfg.snapshot_slot_wait;
+        let mut backoff = Duration::from_millis(5);
+        loop {
+            {
+                let mut st = self.state.lock();
+                if st.conns < cap {
+                    st.conns += 1;
+                    return Ok(SnapshotSlot(self.clone()));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(crate::snapshot::HEAVY_JOB_BUSY);
+            }
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(250));
+        }
+    }
+
+    /// What every whole-database job starts with: the service exists and has a file to copy, and
+    /// the heavy-job rule lets it run.
+    async fn prepare_snapshot(self: &Arc<Self>, s: ServiceId) -> Result<(PathBuf, HeavySlot)> {
+        self.faults.check()?;
+        if self.is_retired(s) {
+            return Err(StoreError::NotFound);
+        }
+        self.unpurge(s);
+        let src = service_dir(&self.opts.root, s).join("data.db");
+        if !src.exists() {
+            self.with(s, |_| Ok(())).await?;
+        }
+        Ok((src, self.heavy_jobs.claim(self.tenant_of(s))?))
+    }
+
     /// Count one more reader of `s` if its writer is open and a connection slot is free (readers
     /// never evict other services: under slot pressure reads fall back to the writer).
     fn claim_reader_slot(&self, s: ServiceId, entry: &ServiceConn) -> bool {
-        let cap = self.cfg.max_open_dbs.max(1);
+        let cap = self.pool_cap();
         let mut st = self.state.lock();
         if st.conns >= cap || !entry.writer_open.load(Ordering::Acquire) {
             return false;
@@ -1645,6 +1830,9 @@ impl Shared {
     }
 }
 
+/// The smallest `max_open_dbs` that keeps one slot for the snapshot thread.
+const SNAPSHOT_SLOT_RESERVED_FROM: usize = 4;
+
 /// Most jobs one group commit takes (B3.2).
 const MAX_GROUP: usize = 64;
 
@@ -1695,6 +1883,12 @@ fn copy_err(e: &StoreError) -> StoreError {
         StoreError::Invalid(m) => StoreError::Invalid(m.clone()),
         StoreError::StorageQuota => StoreError::StorageQuota,
         StoreError::Sql(m) => StoreError::Sql(m.clone()),
+        StoreError::SqlNotReadonly => StoreError::SqlNotReadonly,
+        StoreError::SqlFailed { code, offset, message } => StoreError::SqlFailed {
+            code: *code,
+            offset: *offset,
+            message: message.clone(),
+        },
         StoreError::SqlTimeout => StoreError::SqlTimeout,
         StoreError::SqlNotAuthorized => StoreError::SqlNotAuthorized,
         StoreError::SqlBusy => StoreError::SqlBusy,
@@ -1705,6 +1899,7 @@ fn copy_err(e: &StoreError) -> StoreError {
         StoreError::Sqlite(err) => StoreError::Internal(format!("database error: {err}")),
         StoreError::Io(err) => StoreError::Io(std::io::Error::new(err.kind(), err.to_string())),
         StoreError::Internal(m) => StoreError::Internal(m.clone()),
+        StoreError::Migration(f) => StoreError::Migration(f.clone()),
         StoreError::WarmFloorTotal { total, cap } => StoreError::WarmFloorTotal {
             total: *total,
             cap: *cap,
@@ -1825,6 +2020,10 @@ pub struct LocalServiceData {
 }
 
 impl LocalServiceData {
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
+        &self.shared
+    }
+
     /// Make the next KV, SQL, blob and durable operations fail as `faults` plans (tests, TK-002).
     pub fn inject_faults(&self, faults: Arc<crate::faults::Faults>) {
         self.shared.faults.set(faults);
@@ -1841,6 +2040,7 @@ impl LocalServiceData {
                 .max(64),
         };
         let opts = OpenOpts {
+            dirty: Default::default(),
             root: cfg.root.clone(),
             budget: cfg.sql_budget,
             sync_budget: cfg.sql_sync_budget.max(Duration::from_millis(1)),
@@ -1853,6 +2053,12 @@ impl LocalServiceData {
             max_result_rows: cfg.max_result_rows.max(1),
             max_result_bytes: cfg.max_result_bytes.max(1),
         };
+        let exports = ExportCache::new(
+            opts.root.join("exports"),
+            cfg.export_ttl,
+            cfg.export_cache_max_bytes,
+            cfg.scratch_floor_bytes,
+        );
         let shared = Arc::new(Shared {
             cfg,
             opts,
@@ -1864,6 +2070,10 @@ impl LocalServiceData {
             next_job: AtomicU64::new(0),
             faults: crate::faults::FaultSlot::default(),
             retired: Mutex::new(HashSet::new()),
+            heavy: HeavyThread::default(),
+            heavy_jobs: HeavyJobs::default(),
+            exports,
+            holds: Arc::default(),
         });
         Ok(Arc::new(Self { shared }))
     }
@@ -1923,6 +2133,30 @@ impl LocalServiceData {
         }
     }
 
+    /// A consistent copy of `s`'s database at the new file `dst`, for a node backup, on the
+    /// calling thread (the backup's own). Charged to `max_open_dbs` like any snapshot, but outside
+    /// the heavy-job rule, so a tenant's exports cannot block the operator's backup. `NotFound`
+    /// when the service has no database. Take the service's hold first.
+    pub fn snapshot_for_backup(&self, s: ServiceId, dst: &Path) -> Result<u64> {
+        let src = service_dir(&self.shared.opts.root, s).join("data.db");
+        if self.shared.is_retired(s) || !src.exists() {
+            return Err(StoreError::NotFound);
+        }
+        let _conn = self.shared.claim_snapshot_slot()?;
+        snapshot_db(&src, dst)
+    }
+
+    /// The directory of `s`'s blob files.
+    pub fn blob_objects_dir(&self, s: ServiceId) -> PathBuf {
+        blob_dir(&self.shared.opts.root, s).join("objects")
+    }
+
+    /// Queue `job` on the heavy-job thread (tests: park it, observe it).
+    #[doc(hidden)]
+    pub fn run_on_heavy_thread(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        let _ = self.shared.heavy.submit(job);
+    }
+
     /// Transactions committed by KV and blob-index writes so far: with group commit, fewer than
     /// the writes when they queue up behind a busy writer. Test/diagnostics hook.
     pub fn write_commits(&self) -> u64 {
@@ -1950,6 +2184,7 @@ impl LocalServiceData {
     /// each service's work runs in its tenant's lane). Returns how many rows were deleted; a
     /// service that fails is logged and skipped.
     pub async fn sweep_open(&self) -> Result<u64> {
+        self.shared.exports.sweep();
         let ids: Vec<ServiceId> = self.shared.state.lock().open.keys().copied().collect();
         let mut total = 0;
         for s in ids {
@@ -1996,6 +2231,10 @@ impl ServiceDataStore for LocalServiceData {
         })
     }
 
+    fn holds(&self) -> Arc<BackupHolds> {
+        self.shared.holds.clone()
+    }
+
     fn retire(&self, s: ServiceId) -> Result<()> {
         self.shared.retired.lock().insert(s);
         self.purge(s)
@@ -2015,6 +2254,8 @@ impl ServiceDataStore for LocalServiceData {
             close_connections(&e);
         }
         self.shared.purged.lock().insert(s);
+        self.shared.exports.forget_service(s);
+        self.shared.opts.dirty.forget(s);
         for dir in [
             service_dir(&self.shared.opts.root, s),
             blob_dir(&self.shared.opts.root, s),
@@ -2508,8 +2749,147 @@ fn run_batch(conn: &Conn, stmts: &[SqlStatement], mode: BatchMode) -> Result<Vec
     Ok(out)
 }
 
+fn chrono_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// An empty stand-in database has no `_rt_kv`.
+fn has_kv_table(c: &Connection) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '_rt_kv'",
+        [],
+        |_| Ok(()),
+    )
+    .optional()?
+    .is_some())
+}
+
+impl Shared {
+    /// Run `f` on a connection of its own, for the data browser (`browse.rs`). Read-only for the OS
+    /// and never the writer. A service with no file yet (or a purged one) reads as an empty
+    /// in-memory database, so a browse never creates anything. Holds a reader permit, so that
+    /// eviction and purge wait for it as for any reader, and a connection slot of the pool. Either
+    /// one missing for [`BROWSE_WAIT`] is `SqlBusy`; a browse never evicts.
+    pub(crate) async fn browse<T, F>(self: &Arc<Self>, s: ServiceId, strict: bool, budget: Duration, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        self.faults.check()?;
+        if self.is_retired(s) {
+            return Err(StoreError::NotFound);
+        }
+        let entry = self.entry(s);
+        let permit = if self.opts.readers_per_db > 0 {
+            let wait = tokio::time::timeout(BROWSE_WAIT, entry.reader_permits.clone().acquire_owned());
+            Some(
+                wait.await
+                    .map_err(|_| StoreError::SqlBusy)?
+                    .map_err(|_| StoreError::SqlBusy)?,
+            )
+        } else {
+            None
+        };
+        let slot = self.claim_browse_slot().await?;
+        let opts = self.opts.clone();
+        let purged = self.is_purged(s);
+        run_job(&self.cfg.runner, self.tenant_of(s), move || {
+            let _held = (permit, slot);
+            let path = service_dir(&opts.root, s).join("data.db");
+            let c = if purged || !path.exists() {
+                let c = Connection::open_in_memory()?;
+                set_guest_limits(&c)?;
+                c
+            } else {
+                let c = crate::browse::open_file(&path)?;
+                tune(&c, &opts)?;
+                c
+            };
+            // A read of WAL mode waits only for recovery; a browse does not wait long for it.
+            c.busy_timeout(Duration::from_millis(500))?;
+            crate::browse::guard(&c, strict, budget)?;
+            f(&c)
+        })
+        .await
+    }
+
+    /// A slot against `max_open_dbs`, for one browse: the reserved snapshot slot may serve, since a
+    /// pool of idle writers is the normal state of a busy node and a browse is short.
+    async fn claim_browse_slot(self: &Arc<Self>) -> Result<SnapshotSlot> {
+        let cap = self.cfg.max_open_dbs.max(1);
+        let deadline = Instant::now() + BROWSE_WAIT;
+        loop {
+            {
+                let mut st = self.state.lock();
+                if st.conns < cap {
+                    st.conns += 1;
+                    return Ok(SnapshotSlot(self.clone()));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(StoreError::SqlBusy);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// How long a browse waits for a reader permit or a connection slot.
+const BROWSE_WAIT: Duration = Duration::from_secs(1);
+
 #[async_trait]
 impl SqlBackend for SqlHandle {
+    async fn query_readonly(
+        &self,
+        stmt: SqlStatement,
+        limits: crate::browse::BrowseLimits,
+    ) -> Result<crate::browse::BrowseResult> {
+        self.shared
+            .browse(self.svc, true, limits.budget, move |c| {
+                crate::browse::query(c, &stmt, limits)
+            })
+            .await
+    }
+
+    async fn browse_tables(&self) -> Result<Vec<crate::browse::BrowseTable>> {
+        self.shared
+            .browse(self.svc, false, crate::browse::BROWSE_BUDGET, crate::browse::tables)
+            .await
+    }
+
+    async fn browse_kv_list(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+        head: usize,
+    ) -> Result<crate::browse::BrowseKvPage> {
+        let now = chrono_now_ms();
+        self.shared
+            .browse(self.svc, false, crate::browse::BROWSE_BUDGET, move |c| {
+                if !has_kv_table(c)? {
+                    return Ok(Default::default());
+                }
+                crate::browse::kv_list(c, &prefix, cursor.as_deref(), limit, head, now)
+            })
+            .await
+    }
+
+    async fn browse_kv_get(&self, key: Vec<u8>, max: usize) -> Result<Option<crate::browse::BrowseKvEntry>> {
+        let now = chrono_now_ms();
+        self.shared
+            .browse(self.svc, false, crate::browse::BROWSE_BUDGET, move |c| {
+                if !has_kv_table(c)? {
+                    return Ok(None);
+                }
+                crate::browse::kv_get(c, &key, max, now)
+            })
+            .await
+    }
+
     async fn execute(&self, stmt: SqlStatement) -> Result<SqlResult> {
         if self.shared.is_purged(self.svc) {
             // Reading a purged service must not re-create its files; writes revive it.
@@ -2602,24 +2982,171 @@ impl SqlBackend for SqlHandle {
         }))
     }
 
-    async fn export(&self) -> Result<Bytes> {
+    async fn export(&self) -> Result<ExportFile> {
+        let (src, slot) = self.shared.prepare_snapshot(self.svc).await?;
+        let pending = self.shared.exports.reserve(snapshot_estimate(&src))?;
+        let shared = self.shared.clone();
+        let file = self
+            .shared
+            .heavy
+            .run(move || {
+                let _slot = slot;
+                let _conn = shared.claim_snapshot_slot()?;
+                match snapshot_db(&src, &pending.path) {
+                    Ok(size) => Ok(ExportCache::finish(pending, size)),
+                    Err(e) => Err(e),
+                }
+            })
+            .await?;
+        self.shared.exports.insert(self.svc, &file);
+        Ok(file)
+    }
+
+    async fn export_cached(&self, etag: &str) -> Option<ExportFile> {
+        self.shared.exports.get(self.svc, etag)
+    }
+
+    async fn copy_into(&self, to: ServiceId) -> Result<u64> {
+        let (src, slot) = self.shared.prepare_snapshot(self.svc).await?;
+        let root = self.shared.opts.root.clone();
+        crate::snapshot::check_disk_floor(&root, snapshot_estimate(&src), self.shared.cfg.scratch_floor_bytes)?;
+        let from = self.svc;
+        // Before the snapshot: a blob deleted after it still has its file for the walk below.
+        let hold = self.shared.holds.hold(from);
+        let shared = self.shared.clone();
+        self.shared
+            .heavy
+            .run(move || {
+                let _slot = slot;
+                let _hold = hold;
+                let _conn = shared.claim_snapshot_slot()?;
+                let dir = service_dir(&root, to);
+                private_dirs(&dir)?;
+                let tmp = dir.join(format!("copy-{}.tmp", unique_name()));
+                let dst = blob_dir(&root, to).join("objects");
+                let mut copied = Vec::new();
+                let res = copy_snapshot(&src, &tmp, &blob_dir(&root, from).join("objects"), &dst, &mut copied)
+                    .and_then(|bytes| {
+                        std::fs::rename(&tmp, dir.join("data.db"))?;
+                        std::fs::File::open(&dir)?.sync_all()?;
+                        Ok(bytes)
+                    });
+                if res.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                    for f in copied {
+                        let _ = std::fs::remove_file(f);
+                    }
+                }
+                res
+            })
+            .await
+    }
+
+    async fn snapshot_into(&self, db: PathBuf, objects: PathBuf) -> Result<u64> {
+        let (src, slot) = self.shared.prepare_snapshot(self.svc).await?;
+        let root = self.shared.opts.root.clone();
+        crate::snapshot::check_disk_floor(&root, snapshot_estimate(&src), self.shared.cfg.scratch_floor_bytes)?;
+        let from = self.svc;
+        let hold = self.shared.holds.hold(from);
+        let shared = self.shared.clone();
+        self.shared
+            .heavy
+            .run(move || {
+                let _slot = slot;
+                let _hold = hold;
+                let _conn = shared.claim_snapshot_slot()?;
+                let mut copied = Vec::new();
+                copy_snapshot(&src, &db, &blob_dir(&root, from).join("objects"), &objects, &mut copied)
+            })
+            .await
+    }
+
+    async fn install_staged(&self, db: PathBuf, objects: PathBuf) -> Result<()> {
+        let root = self.shared.opts.root.clone();
+        let to = self.svc;
+        self.shared
+            .heavy
+            .run(move || {
+                let dir = service_dir(&root, to);
+                private_dirs(&dir)?;
+                let target = dir.join("data.db");
+                if target.exists() {
+                    return Err(StoreError::Conflict("service_has_data"));
+                }
+                if objects.exists() {
+                    let blobs = blob_dir(&root, to);
+                    private_dirs(&blobs)?;
+                    std::fs::rename(&objects, blobs.join("objects"))?;
+                    std::fs::File::open(&blobs)?.sync_all()?;
+                }
+                std::fs::File::open(&db)?.sync_all()?;
+                std::fs::rename(&db, &target)?;
+                std::fs::File::open(&dir)?.sync_all()?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn applied_migrations(&self) -> Result<Vec<AppliedMigration>> {
+        if self.shared.is_purged(self.svc) {
+            return Ok(Vec::new());
+        }
+        self.shared
+            .with(self.svc, |conn| crate::migrate::read_applied(&conn.c))
+            .await
+    }
+
+    async fn migrate(
+        &self,
+        files: Vec<MigrationFile>,
+        version: VersionNo,
+        budget: Duration,
+    ) -> Result<Vec<MigrationEntry>> {
         self.shared.unpurge(self.svc);
-        let dir = service_dir(&self.shared.opts.root, self.svc);
+        let limit = self.shared.db_limit(self.svc);
         self.shared
             .with(self.svc, move |conn| {
-                let tmp = dir.join(format!("export-{}.tmp", unique_name()));
-                let res = (|| -> Result<Vec<u8>> {
-                    conn.c
-                        .execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()])
-                        .map_err(map_internal_err)?;
-                    // The copy must not announce WAL: it is a standalone file.
-                    let copy = Connection::open(&tmp)?;
-                    copy.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get::<_, String>(0))?;
-                    drop(copy);
-                    Ok(std::fs::read(&tmp)?)
-                })();
-                let _ = std::fs::remove_file(&tmp);
-                Ok(Bytes::from(res?))
+                // A writer opened before the node knew the service has a ceiling of no growth.
+                apply_ceiling(&conn.c, limit).map_err(map_internal_err)?;
+                crate::migrate::run(conn, &files, version, budget, true)
+            })
+            .await
+    }
+
+    async fn migrate_dry_run(
+        &self,
+        files: Vec<MigrationFile>,
+        version: VersionNo,
+        budget: Duration,
+        max_bytes: u64,
+    ) -> Result<MigrationDryRun> {
+        let (src, slot) = self.shared.prepare_snapshot(self.svc).await?;
+        let estimate = snapshot_estimate(&src);
+        if estimate > max_bytes {
+            return Err(StoreError::Conflict("dry_run_too_large"));
+        }
+        let pending = self.shared.exports.reserve(estimate)?;
+        let shared = self.shared.clone();
+        let limit = self.shared.db_limit(self.svc);
+        self.shared
+            .heavy
+            .run(move || {
+                let _slot = slot;
+                let _conn = shared.claim_snapshot_slot()?;
+                let size = snapshot_db(&src, &pending.path)?;
+                // Dropped at the end of this job, which deletes the copy.
+                let file = ExportCache::finish(pending, size);
+                let c = Connection::open(file.path())?;
+                c.execute_batch(SERVICE_DATA_BOOTSTRAP)?;
+                set_guest_limits(&c)?;
+                apply_ceiling(&c, limit)?;
+                let conn = Conn::guarded(c, &shared.opts, ConnRole::Scratch)?;
+                let started = Instant::now();
+                let done = crate::migrate::run(&conn, &files, version, budget, false)?;
+                Ok(MigrationDryRun {
+                    pending: done.into_iter().map(|e| e.name).collect(),
+                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                })
             })
             .await
     }
@@ -2642,6 +3169,50 @@ impl SqlBackend for SqlHandle {
             })
             .await
     }
+}
+
+/// Snapshot the source into `tmp`, drop its timers and copy its blobs; `tmp` ends up durable. A file
+/// already missing loses its row, as a read would treat it; the caller's hold keeps the others.
+fn copy_snapshot(src: &Path, tmp: &Path, from: &Path, to: &Path, copied: &mut Vec<PathBuf>) -> Result<u64> {
+    snapshot_db(src, tmp)?;
+    let copy = Connection::open(tmp)?;
+    copy.execute_batch("PRAGMA synchronous = OFF")?;
+    let has_alarms: i64 = copy.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name = '_rt_durable_alarm'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_alarms > 0 {
+        copy.execute("DELETE FROM _rt_durable_alarm", [])?;
+    }
+    // A copy never publishes to the source's topic, and a bundle carries no generated trigger.
+    crate::data_events::strip(&copy)?;
+    let rows = copy
+        .prepare("SELECT key, file FROM _rt_blobs")?
+        .query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !rows.is_empty() {
+        private_dirs(to)?;
+    }
+    let mut bytes = 0;
+    for (key, file) in rows {
+        let target = object_path(to, &file)?;
+        match std::fs::copy(object_path(from, &file)?, &target) {
+            Ok(n) => {
+                bytes += n;
+                copied.push(target);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                copy.execute("DELETE FROM _rt_blobs WHERE key = ?1", [key])?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    drop(copy);
+    // The branch's database, unlike a temp export, has to survive a crash.
+    let f = std::fs::File::open(tmp)?;
+    f.sync_all()?;
+    Ok(bytes + f.metadata()?.len())
 }
 
 /// State of one interactive transaction. The lease keeps every other user of the connection out
@@ -2850,7 +3421,7 @@ impl BlobBackend for BlobHandle {
                 })
                 .await?;
             let Some((meta, file)) = row else { return Ok(None) };
-            match tokio::fs::File::open(self.dir.join("objects").join(file)).await {
+            match tokio::fs::File::open(object_path(&self.dir.join("objects"), &file)?).await {
                 Ok(f) => break (meta, f),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempts < 8 => attempts += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2946,8 +3517,11 @@ impl BlobBackend for BlobHandle {
         };
         match old {
             Ok(old) => {
-                if let Some(o) = old {
-                    let _ = tokio::fs::remove_file(obj_dir.join(o)).await;
+                // A bad old name is left alone: the new row is written, and nothing is unlinked.
+                if let Some(path) = old.and_then(|o| object_path(&obj_dir, &o).ok()) {
+                    if !self.shared.holds.defer_unlink(self.svc, &path) {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
                 }
                 Ok(meta)
             }
@@ -2981,7 +3555,12 @@ impl BlobBackend for BlobHandle {
         };
         match old {
             Some(file) => {
-                let _ = tokio::fs::remove_file(self.dir.join("objects").join(file)).await;
+                // A bad name: the row is gone, and nothing is unlinked.
+                if let Ok(path) = object_path(&self.dir.join("objects"), &file) {
+                    if !self.shared.holds.defer_unlink(self.svc, &path) {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                }
                 Ok(true)
             }
             None => Ok(false),
@@ -3055,6 +3634,7 @@ mod tests {
 
     fn opts(root: &Path) -> OpenOpts {
         OpenOpts {
+            dirty: Default::default(),
             root: root.to_path_buf(),
             budget: Duration::from_secs(5),
             sync_budget: Duration::from_millis(100),

@@ -46,3 +46,16 @@ CLAUDE.local.md
 
 # Release tooling output (CI builds these in dist/)
 /dist/
+
+# Internal dev notes: plans, reviews, research, PR drafts (never published)
+/docs/design/
+/docs/plans/
+/docs/reviews/
+*.local.md
+/PLAN.md
+/TODO.md
+/NOTES.md
+
+# Local tooling
+.codegraph/
+.claude/launch.json

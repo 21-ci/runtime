@@ -4,6 +4,7 @@
 //! - [`KvFacade`] / [`SqlFacade`] / [`BlobFacade`] — guest-facing storage with stable errors;
 //! - [`Calls`] / [`PlatformBindings`] — service-to-service calls and operator bindings;
 //! - [`FairBlockingPool`] — per-tenant fair blocking work with CPU charging;
+//! - [`PubsubBus`] / [`StreamBus`] — `std:pubsub` and `std:stream` behind the host handle;
 //! - [`HostServices`] / [`HostHandle`] — per-task capability bundle used by both executors.
 
 // Request-path hygiene (security review step 5c): no panicking unwraps outside tests.
@@ -13,6 +14,7 @@
 pub mod blocking;
 pub mod calls;
 pub mod egress;
+pub mod events;
 pub mod facade;
 pub mod handle;
 pub mod lock;
@@ -20,13 +22,20 @@ pub mod rpc;
 pub mod schedule;
 pub mod self_endpoints;
 pub mod sockets;
+pub mod vault;
 pub mod ws_client;
 
 pub use blocking::{FairBlockingPool, FairPoolConfig};
 pub use calls::{BindingError, CallError, Calls, ConfigBindings, EnqueueOpts, PlatformBindings, TaskCtx};
+#[cfg(debug_assertions)]
+pub use egress::local_test_origin;
 pub use egress::{
     is_https_downgrade, is_redirect, redirect_method, ConnectRewrite, EgressBudget, EgressError, EgressGuard,
     EgressGuardConfig, EgressIo, EgressPolicy, EgressUsage, GuardedEgress, Request, Resolver, Response, SystemResolver,
+};
+pub use events::{
+    check_append, check_info, check_publish, check_read, AppendEntry, AppendedOut, PublishOpts, PublishOut, PubsubBus,
+    ReadOpts, ReadPage, ReadStart, Reply, RequestOpts, StreamBus, TopicInfo,
 };
 pub use facade::{BlobFacade, FacadeLimits, HostError, KvFacade, SqlFacade, StorageLeft};
 pub use handle::{

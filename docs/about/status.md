@@ -10,8 +10,8 @@ you should plan around. It is written for operators deciding whether the runtime
 developers who want to know what to expect.
 
 !!! info "Release state"
-    The current version is **0.1.0**. There is no tagged release yet: the [changelog](changelog.md) tracks the work
-    by date. The runtime is a single node.
+    The current version is **0.1.1**, the first public release (tag `v0.1.1`). The [changelog](changelog.md) lists
+    the changes of each version. The runtime is a single node.
 
 ## What works in this release
 
@@ -119,7 +119,7 @@ These are out of scope for the first version by design, not missing work.
 | Non-goal | Note |
 |---|---|
 | Hosted SaaS, multi-region, multi-node clustering, high availability | One node; the data layout keeps a later cluster possible |
-| Web console | A paid management feature. The REST API, OpenAPI and the `21ci` CLI are the interfaces |
+| Web console | Not in this repository. [Runtime Web](https://github.com/21-ci/runtime-web) is a separate, free self-hosted console (Apache-2.0). The REST API, OpenAPI and the `21ci` CLI are the interfaces here |
 | Full Node.js compatibility, native addons | npm through esm.sh builds only |
 | Email triggers | Not a trigger kind |
 | Module state that survives across Deno requests by default | A fresh isolate per task is the default; reuse is an opt-in cache, not a guarantee |

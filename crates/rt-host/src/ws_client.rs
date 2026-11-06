@@ -56,7 +56,7 @@ fn err(code: &'static str, message: &str) -> HostError {
 impl WsClient {
     /// The client handshake over a connection the egress guard opened.
     /// `slot` is the task's `max_concurrent_fetches` permit, held while the socket is open.
-    pub(crate) async fn handshake(
+    pub async fn handshake(
         io: Box<dyn EgressIo>,
         url: &url::Url,
         protocols: &[String],

@@ -87,7 +87,8 @@ A `503` without `Retry-After` (`control_disabled`, `draining`, `restarting`) is 
 
 The control API serves an MCP endpoint at `POST <api>/mcp` (tenant keys only; the operator token is refused). Tools
 cover services, `deploy_code` (one TS/JS file or a files bundle, up to 3 MiB; WASM must go through `21ci push`),
-versions, `rollback`, logs, stats, env, secrets, projects, SDKs, sockets and tokens; schedules (except listing pending
+versions, `rollback`, branches and switches (`create_branch`, `list_branches`, `delete_branch`, `switch_service`,
+`get_switch`, `rollback_switch`), logs, stats, env, secrets, projects, SDKs, sockets and tokens; schedules (except listing pending
 one-offs), queues, hosts and data export are not exposed. Tools visible = the key's scopes.
 
 ```bash

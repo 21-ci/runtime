@@ -34,7 +34,7 @@ done
 passed=0; failed=0; skipped=0
 failed_names=()
 shopt -s nullglob
-scripts=("$DIR"/[0-9][0-9]_*.sh)
+scripts=("$DIR"/[0-9][0-9]_*.sh "$DIR"/switch.sh)
 if [[ ${#scripts[@]} -eq 0 ]]; then
   echo "FAIL run_all: no scripts found in $DIR"
   exit 1

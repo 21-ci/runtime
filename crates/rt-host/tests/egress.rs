@@ -1675,3 +1675,32 @@ async fn egr_006_an_unreachable_first_address_falls_back_to_the_next() {
     .expect("fetched over IPv4");
     assert_eq!(res.text(), "v4");
 }
+
+// ---- archive settings (`from-url`) ---------------------------------------------------------------
+
+/// `require_https` refuses a plain first hop and a plain redirect target, before any connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn require_https_refuses_every_plain_hop() {
+    let r = rig_with(
+        EgressGuardConfig {
+            require_https: true,
+            ..cfg()
+        },
+        empty_denylist(),
+    );
+    let req = http::Request::builder()
+        .uri("http://93.184.216.34/x")
+        .body(Body::empty())
+        .unwrap();
+    let mut budget = EgressBudget::new(
+        &rt_types::Limits::default(),
+        Instant::now() + Duration::from_secs(5),
+        None,
+    );
+    let e = r
+        .guard
+        .send(req, &EgressPolicy::default(), &mut budget)
+        .await
+        .unwrap_err();
+    assert_eq!(e, EgressError::Denied);
+}

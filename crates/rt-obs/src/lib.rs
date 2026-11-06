@@ -1,6 +1,7 @@
 //! rt-obs (L1): guest/system logs, Prometheus metrics, per-service HDR stats, scheduler
 //! trace formatting, tracing setup.
 
+pub mod hostinfo;
 pub mod log;
 pub mod metrics;
 pub mod schedtrace;
@@ -9,6 +10,7 @@ pub mod tracing_init;
 
 use thiserror::Error;
 
+pub use hostinfo::{HostPoint, HostSampler, HostSources, HostStatus, SeriesRange};
 pub use log::{
     parse_log_fields, FileLogStore, LogCursor, LogFieldsError, LogKind, LogLevel, LogPage, LogQuery, LogRecord,
     LogSink, LogStore, LogStoreConfig, LogStream, MemoryLogSink, NullLogSink, SweepReport, MAX_LOG_FIELDS,
@@ -16,7 +18,9 @@ pub use log::{
 };
 pub use metrics::{names as metric_names, Metrics, MetricsOptions, NODE_METRIC_NAMES};
 pub use schedtrace::{format_schedtrace, format_schedtrace_detail};
-pub use stats::{HdrStatsStore, Percentiles, ServiceStats, StatsStore, Window};
+pub use stats::{
+    HdrStatsStore, Percentiles, RingFootprint, SeriesPoint, SeriesStep, ServiceCounts, ServiceStats, StatsStore, Window,
+};
 pub use tracing_init::{init_tracing, TracingOptions};
 
 #[derive(Debug, Error)]

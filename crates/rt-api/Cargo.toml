@@ -23,6 +23,8 @@ rt-obs.workspace = true
 rt-sec.workspace = true
 rt-sched.workspace = true
 rt-store.workspace = true
+rt-backup.workspace = true
+ulid.workspace = true
 rt-triggers.workspace = true
 axum.workspace = true
 tower.workspace = true
@@ -35,8 +37,9 @@ utoipa-scalar.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros", "fs", "io-util"] }
 tokio-stream.workspace = true
+tokio-util.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 http.workspace = true
@@ -51,6 +54,7 @@ dashmap.workspace = true
 parking_lot.workspace = true
 sha2.workspace = true
 hickory-resolver.workspace = true
+url.workspace = true
 base64.workspace = true
 
 [dev-dependencies]

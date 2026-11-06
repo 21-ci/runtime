@@ -39,8 +39,8 @@
 //! then taken from the pool instead of being created on the request path).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashMap};
 use std::future::{poll_fn, Future};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -54,7 +54,7 @@ use futures_util::FutureExt;
 use rt_host::{HostHandle, HostServices};
 use rt_mem::{MemCategory, Owner, Pressure};
 use rt_obs::{LogLevel, Metrics};
-use rt_sched::{ExecCx, Executor, Interrupter, TaskFuture, WarmKey};
+use rt_sched::{after_answer, AfterAnswer, ExecCx, Executor, Interrupter, TaskFuture, WarmKey};
 use rt_types::{
     Body, BodyError, KillReason, Limits, Outcome, Payload, PreparedKey, Reply, ServiceId, ServiceKnobs, ServiceRef,
     TaskId, TaskKind, TaskSpec, TaskTimings, TenantId, Trigger,
@@ -87,6 +87,37 @@ struct Shared {
     warming: HashMap<(TenantId, ServiceId), usize>,
     /// Numbers the ids of warm-up tasks.
     warmups: u64,
+    /// Keep-alive ends of parked isolates (coalesced within [`EXPIRY_SLACK`]): what
+    /// [`Executor::next_deadline`] reports so an idle Machine wakes to expire them.
+    expiries: BTreeSet<Instant>,
+    /// [`Executor::wake_signal`]: notified when an isolate is parked or queued for disposal.
+    signal: Arc<tokio::sync::Notify>,
+}
+
+/// Expiries this close together share one wake-up (the later one): an isolate expires at most
+/// this late on an idle Machine, and the set holds at most one entry per slack of keep-alive.
+const EXPIRY_SLACK: Duration = Duration::from_millis(50);
+
+impl Shared {
+    /// Remember a keep-alive end for [`Executor::next_deadline`] and wake a parked Machine.
+    fn note_expiry(&mut self, at: Instant) {
+        if self.expiries.range(at..=at + EXPIRY_SLACK).next().is_none() {
+            self.expiries.insert(at + EXPIRY_SLACK);
+        }
+        self.signal.notify_one();
+    }
+
+    /// The next keep-alive end after `now`; past ones were handled by the housekeeping that ran
+    /// before the Machine parks (expired, or protected by the warm floor) and are forgotten.
+    fn next_expiry(&mut self, now: Instant) -> Option<Instant> {
+        while let Some(&first) = self.expiries.first() {
+            if first > now {
+                return Some(first);
+            }
+            self.expiries.pop_first();
+        }
+        None
+    }
 }
 
 /// What a warm-up needs of a service: the limits and knobs of its latest task and its artifact.
@@ -116,6 +147,27 @@ fn target_of(cfg: &DenoExecutorConfig, id: &WarmId) -> usize {
             key: id.key,
         }) as usize
     })
+}
+
+/// The `min_instances` floor of `id` on this P: the published target, capped by the configured
+/// `min_instances` (the target also carries the autoscaler's demand, which keeps nothing at
+/// `min_run_time = 0`).
+fn floor_of(cfg: &DenoExecutorConfig, id: &WarmId, min_instances: u32) -> usize {
+    target_of(cfg, id).min(min_instances as usize)
+}
+
+/// Tasks of `id`'s service waiting in admission (0 without a scheduler).
+fn waiting_of(cfg: &DenoExecutorConfig, id: &WarmId) -> u32 {
+    cfg.warm_targets.as_ref().map_or(0, |t| t.waiting(id.service.service))
+}
+
+/// Count `n` keep-alive events of `outcome` (`rt_instance_keepalive_total{kind="deno"}`).
+fn keepalive(metrics: Option<&Metrics>, outcome: &str, n: usize) {
+    if let (Some(m), true) = (metrics, n > 0) {
+        m.instance_keepalive_total
+            .with_label_values(&["deno", outcome])
+            .inc_by(n as u64);
+    }
 }
 
 /// How many isolates to keep for `id`: the scheduler's warm target when one is published, else
@@ -207,6 +259,14 @@ impl Executor for DenoExecutor {
 
     fn interrupter(&self) -> Arc<dyn Interrupter> {
         self.interrupter.clone()
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.shared.borrow_mut().next_expiry(Instant::now())
+    }
+
+    fn wake_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(self.shared.borrow().signal.clone())
     }
 
     fn on_idle(&mut self, budget: Duration) {
@@ -353,11 +413,13 @@ impl DenoExecutor {
         } else {
             s.warm.shed_to(|id| target_of(&self.cfg, id))
         };
+        keepalive(self.metrics.as_deref(), "shed", kept.len());
         s.dispose.extend(kept);
         pressure
     }
 
-    /// Kept isolates past `reuse_idle_ttl` (those above their service's warm target) or above
+    /// Kept isolates past their keep-alive (`min_run_time` or `reuse_idle_ttl`, a handoff once
+    /// nothing of its service waits; those above their service's warm target) or above
     /// their service's bound go to the dispose queue; templates of services that went quiet are
     /// forgotten; a pool larger than it should be shrinks (cheap when nothing is kept).
     fn trim_warm(&self) {
@@ -373,7 +435,9 @@ impl DenoExecutor {
             ..
         } = &mut *s;
         if !warm.is_empty() {
-            dispose.extend(warm.trim(now, cfg.reuse_idle_ttl, |id| warm_keep(cfg, id)));
+            let out = warm.trim(now, |id| warm_keep(cfg, id), |id| waiting_of(cfg, id) > 0);
+            keepalive(self.metrics.as_deref(), "expired", out.len());
+            dispose.extend(out);
         }
         templates.retain(|_, t| {
             target_of(cfg, &t.id) > 0 || warm.len_of(&t.id) > 0 || now.duration_since(t.seen) < TEMPLATE_IDLE
@@ -464,6 +528,7 @@ impl DenoExecutor {
             slug,
             caller: None,
             object: None,
+            reentrant: false,
         };
         let run = TaskRun {
             cfg: self.cfg.clone(),
@@ -558,6 +623,19 @@ fn header_pairs(h: &http::HeaderMap) -> Vec<Value> {
         .collect()
 }
 
+/// `ctx.invocation` of an async HTTP invocation (`{id, attempt}` from the runtime headers), else
+/// `null`. HTTP trigger only: a service call's headers come from guest code.
+fn invocation_ctx(h: &http::HeaderMap) -> Value {
+    let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok());
+    match (
+        get(rt_types::events::INVOCATION_ID_HEADER),
+        get(rt_types::events::INVOCATION_ATTEMPT_HEADER).and_then(|a| a.parse::<u32>().ok()),
+    ) {
+        (Some(id), Some(attempt)) => json!({ "id": id, "attempt": attempt }),
+        _ => Value::Null,
+    }
+}
+
 /// The dispatch payload for `__rt.start` plus the request body, still streaming (B4.4): the
 /// caller registers it as a resource and sets `request.bodyRid`; and the binary message of a
 /// socket event (read with `op_rt_ws_event_data`).
@@ -577,6 +655,9 @@ fn build_payload(
     let mut req_body: Option<Body> = None;
     let mut invoker = Value::Null;
     let mut client = Value::Null;
+    let mut invocation = Value::Null;
+    let mut pubsub = Value::Null;
+    let mut stream = Value::Null;
 
     match std::mem::take(&mut spec.payload) {
         Payload::Http(mut req) => {
@@ -591,6 +672,7 @@ fn build_payload(
             // strips any client-sent `x-rt-client-ip` first). HTTP trigger only: a call's
             // headers come from the calling guest.
             if matches!(spec.trigger, Trigger::Http) {
+                invocation = invocation_ctx(&req.headers);
                 if let Some(ip) = req
                     .headers
                     .get("x-rt-client-ip")
@@ -679,6 +761,8 @@ fn build_payload(
             }
             socket = out;
         }
+        Payload::Pubsub(m) => pubsub = m.guest_json(),
+        Payload::Stream(b) => stream = b.guest_json(),
         Payload::None => {
             if matches!(spec.trigger, Trigger::Http | Trigger::Call { .. }) {
                 request = json!({ "method": "GET", "url": "http://localhost/", "headers": [], "hasBody": false });
@@ -715,6 +799,7 @@ fn build_payload(
             "invoker": invoker,
             "client": client,
             "caller": caller,
+            "invocation": invocation,
             "deadline": (now_ms + remaining.as_secs_f64() * 1000.0).floor(),
             // The object this task acts for, with its turn (warm objects, see `ObjectRef`).
             "object": spec.object.as_ref().map_or(Value::Null, |o| json!({ "name": &*o.name, "seq": o.seq, "prev": o.prev })),
@@ -723,6 +808,8 @@ fn build_payload(
         "socket": socket,
         "schedule": schedule,
         "queue": queue,
+        "pubsub": pubsub,
+        "stream": stream,
         "warmup": warmup,
     });
     (payload, req_body, event_data)
@@ -752,6 +839,7 @@ fn dispose_later(shared: &Rc<RefCell<Shared>>, backlog: u32, mut iso: Isolate) {
     let overflow = {
         let mut s = shared.borrow_mut();
         s.dispose.push_back(iso);
+        s.signal.notify_one();
         if s.dispose.len() > backlog as usize {
             s.dispose.pop_front()
         } else {
@@ -786,6 +874,7 @@ fn fresh_isolate(
 async fn take_kept(
     cfg: &DenoExecutorConfig,
     shared: &Rc<RefCell<Shared>>,
+    metrics: Option<&Metrics>,
     id: &WarmId,
     handle: &HostHandle,
     limit_bytes: u64,
@@ -794,12 +883,10 @@ async fn take_kept(
         let (kept, expired) = {
             let mut out = Vec::new();
             let protected = target_of(cfg, id);
-            let kept = shared
-                .borrow_mut()
-                .warm
-                .take(id, Instant::now(), cfg.reuse_idle_ttl, protected, &mut out);
+            let kept = shared.borrow_mut().warm.take(id, Instant::now(), protected, &mut out);
             (kept, out)
         };
+        keepalive(metrics, "expired", expired.len());
         for iso in expired {
             dispose_later(shared, cfg.dispose_backlog, iso);
         }
@@ -815,6 +902,7 @@ async fn take_kept(
             // Defensive: a termination request can only come from a kill, and killed isolates
             // are never kept, but a stale one must not fail this task.
             iso.handle.cancel_terminate_execution();
+            keepalive(metrics, "reused", 1);
             return Some(iso);
         }
         dispose_later(shared, cfg.dispose_backlog, iso);
@@ -876,7 +964,7 @@ async fn run_task_as(
     // 2. isolate: one kept for this service version (D-A4), a pooled one, or a new one
     let kept = match &warm_id {
         // A warm-up builds a new isolate: it never takes one that is kept already.
-        Some(id) if !warmup => take_kept(&cfg, &shared, id, &handle, limit_bytes).await,
+        Some(id) if !warmup => take_kept(&cfg, &shared, metrics.as_deref(), id, &handle, limit_bytes).await,
         _ => None,
     };
     let mut iso = match kept {
@@ -985,6 +1073,9 @@ async fn run_task_as(
         task,
         deadline,
         warm_id,
+        min_run_time: spec.knobs.min_run_time,
+        min_instances: spec.knobs.min_instances,
+        queue_timeout: spec.knobs.queue_timeout,
         limit_bytes,
         head_cpu: head_cpu.clone(),
         warmup,
@@ -1072,6 +1163,13 @@ struct Driver {
     deadline: Instant,
     /// Reuse is on for this service (`deno.reuse_isolates`): where a clean finish is kept.
     warm_id: Option<WarmId>,
+    /// The service's `min_run_time` (`None`: inherit `reuse_idle_ttl`), see [`Driver::park`].
+    min_run_time: Option<Duration>,
+    /// The service's `scaling.min_instances`: the only floor a `min_run_time = 0` isolate is
+    /// kept for (the autoscaler's demand target does not keep it).
+    min_instances: u32,
+    /// The service's `queue_timeout`: how long a handoff isolate waits at most.
+    queue_timeout: Duration,
     /// `limits.memory_mb` in bytes.
     limit_bytes: u64,
     /// Guest CPU when the task future returned the head; what the driver uses afterwards (the
@@ -1263,10 +1361,7 @@ impl Driver {
         }
         iso.loader.flush_cache_stats(self.metrics.as_deref());
         let kept = match self.warm_id {
-            Some(id) if reusable && self.keep(&mut iso, &op_state) => {
-                self.park(id, iso);
-                true
-            }
+            Some(id) if reusable && self.keep(&mut iso, &op_state) => self.park(id, iso),
             _ => {
                 dispose_later(&self.shared, self.cfg.dispose_backlog, iso);
                 false
@@ -1353,18 +1448,41 @@ impl Driver {
         true
     }
 
-    fn park(&self, id: WarmId, iso: Isolate) {
-        let bound = warm_keep(&self.cfg, &id).bound;
-        let total = self.cfg.reuse_max_idle_total as usize;
+    /// Keep a reusable isolate per the service's `min_run_time` (`rt_sched::after_answer`): unset,
+    /// for `reuse_idle_ttl` (today's rule); `t > 0`, for `t`; `0` while work of the service waits,
+    /// until that work is gone (at most `queue_timeout`); `0` with nothing waiting, disposed,
+    /// unless the service holds fewer than its warm floor (then kept, protected, expiring now).
+    /// Returns whether it was handed to the store.
+    fn park(&self, id: WarmId, iso: Isolate) -> bool {
         let cfg = &self.cfg;
-        let out = self
-            .shared
-            .borrow_mut()
-            .warm
-            .park(&id, iso, Instant::now(), bound, total, |i| target_of(cfg, i));
+        let metrics = self.metrics.as_deref();
+        let now = Instant::now();
+        let (expires, handoff) = match after_answer(self.min_run_time, waiting_of(cfg, &id), self.queue_timeout) {
+            AfterAnswer::Inherit => (now + cfg.reuse_idle_ttl, false),
+            AfterAnswer::For(t) => (now + t, false),
+            AfterAnswer::Handoff { cap } => (now + cap, true),
+            AfterAnswer::Dispose => {
+                if floor_of(cfg, &id, self.min_instances) <= self.shared.borrow().warm.len_of(&id) {
+                    keepalive(metrics, "disposed", 1);
+                    dispose_later(&self.shared, cfg.dispose_backlog, iso);
+                    return false;
+                }
+                (now, false)
+            }
+        };
+        let bound = warm_keep(cfg, &id).bound;
+        let total = cfg.reuse_max_idle_total as usize;
+        let out = {
+            let mut s = self.shared.borrow_mut();
+            s.note_expiry(expires);
+            s.warm
+                .park(&id, iso, now, expires, handoff, bound, total, |i| target_of(cfg, i))
+        };
+        keepalive(metrics, if handoff { "handoff" } else { "kept" }, 1);
         for i in out {
-            dispose_later(&self.shared, self.cfg.dispose_backlog, i);
+            dispose_later(&self.shared, cfg.dispose_backlog, i);
         }
+        true
     }
 }
 
@@ -1383,5 +1501,138 @@ mod tests {
             abort_reason(&Ended::Killed(KillReason::WallTimeout)).as_deref(),
             Some("WallTimeout")
         );
+    }
+
+    fn prepared() -> DenoPrepared {
+        DenoPrepared {
+            key: PreparedKey {
+                digest: rt_types::Digest::of(b"x"),
+                kind: rt_types::RuntimeKind::Deno,
+                engine_fp: 0,
+            },
+            bundle: rt_build::Bundle {
+                format: "esm".into(),
+                entry: "main.js".into(),
+                handler_form: rt_types::HandlerForm::B,
+                lock_digest: None,
+                modules: Vec::new(),
+            },
+            code_cache: None,
+            handler_form: rt_types::HandlerForm::B,
+            accounted_bytes: 0,
+            reads_env: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn spec(trigger: Trigger, payload: Payload) -> TaskSpec {
+        let svc = ServiceRef {
+            tenant: TenantId::from_u128(1),
+            service: ServiceId::from_u128(2),
+            version: rt_types::VersionNo(1),
+            digest: rt_types::Digest::of(b"x"),
+        };
+        TaskSpec::new(TaskKind::Exec(rt_types::RuntimeKind::Deno), svc, trigger).with_payload(payload)
+    }
+
+    fn payload_of(mut s: TaskSpec) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        build_payload(&mut s, &prepared(), TaskId(1), "svc", deadline, false).0
+    }
+
+    fn invocation_request() -> rt_types::HttpRequest {
+        let mut req = rt_types::HttpRequest::get("/hook");
+        req.headers
+            .insert("x-rt-invocation-id", http::HeaderValue::from_static("inv_01"));
+        req.headers
+            .insert("x-rt-invocation-attempt", http::HeaderValue::from_static("2"));
+        req
+    }
+
+    /// Pub/sub and stream payloads land in `pubsub` / `stream` with the guest JSON shape; an async
+    /// HTTP invocation gets `ctx.invocation` from the runtime headers.
+    #[test]
+    fn build_payload_maps_pubsub_stream_and_invocation() {
+        use rt_types::events::{PubsubMessage, StreamBatch, StreamRecord};
+        let msg = PubsubMessage {
+            id: rt_types::MsgId::from_u128(3),
+            subject: "orders.created".into(),
+            body: bytes::Bytes::from_static(br#"{"n":1}"#),
+            headers: vec![("k".into(), "v".into())],
+            replyable: true,
+            published_at_ms: 42,
+        };
+        let p = payload_of(spec(
+            Trigger::Pubsub {
+                subject: Arc::from("orders.created"),
+                depth: 1,
+                reply: true,
+            },
+            Payload::Pubsub(msg.clone()),
+        ));
+        assert_eq!(p["pubsub"], msg.guest_json());
+        assert_eq!(p["pubsub"]["body"], json!({"n": 1}));
+        assert_eq!(p["pubsub"]["headers"], json!({"k": "v"}));
+        assert_eq!(
+            (p["pubsub"]["replyable"].clone(), p["pubsub"]["publishedAt"].clone()),
+            (json!(true), json!(42))
+        );
+        assert_eq!(p["ctx"]["trigger"], "pubsub");
+        assert!(p["stream"].is_null() && p["request"].is_null() && p["ctx"]["invocation"].is_null());
+
+        let batch = StreamBatch {
+            topic: "orders".into(),
+            group: "default".into(),
+            partition: 1,
+            attempt: 2,
+            records: vec![StreamRecord {
+                partition: 1,
+                offset: 7,
+                key: Some("k".into()),
+                headers: vec![],
+                body: bytes::Bytes::from_static(b"not json"),
+                ts_ms: 5,
+            }],
+        };
+        let p = payload_of(spec(
+            Trigger::Stream {
+                topic: Arc::from("orders"),
+                partition: 1,
+                attempt: 2,
+            },
+            Payload::Stream(batch),
+        ));
+        let s = &p["stream"];
+        assert_eq!(
+            (s["topic"].clone(), s["group"].clone()),
+            (json!("orders"), json!("default"))
+        );
+        assert_eq!((s["partition"].clone(), s["attempt"].clone()), (json!(1), json!(2)));
+        assert_eq!(
+            s["messages"],
+            json!([{"partition": 1, "offset": 7, "key": "k", "body": "not json", "headers": {}, "timestamp": 5}])
+        );
+        assert_eq!(p["ctx"]["trigger"], "stream");
+        assert!(p["pubsub"].is_null());
+
+        let p = payload_of(spec(Trigger::Http, Payload::Http(invocation_request())));
+        assert_eq!(p["ctx"]["invocation"], json!({"id": "inv_01", "attempt": 2}));
+        let p = payload_of(spec(Trigger::Http, Payload::Http(rt_types::HttpRequest::get("/"))));
+        assert!(p["ctx"]["invocation"].is_null());
+    }
+
+    /// `ctx.invocation` is built only for the HTTP trigger: a service call carrying the same
+    /// headers (set by guest code) gets `null`.
+    #[test]
+    fn invocation_ctx_only_for_http_trigger() {
+        let call = Trigger::Call {
+            parent: TaskId(9),
+            depth: 1,
+        };
+        let p = payload_of(spec(call, Payload::Http(invocation_request())));
+        assert!(p["ctx"]["invocation"].is_null());
+        let mut bad = invocation_request();
+        bad.headers
+            .insert("x-rt-invocation-attempt", http::HeaderValue::from_static("x"));
+        assert!(payload_of(spec(Trigger::Http, Payload::Http(bad)))["ctx"]["invocation"].is_null());
     }
 }

@@ -144,3 +144,42 @@ fn ac_sch_21_the_trace_records_the_scheduling_decisions() {
     // Time never goes backwards in the timed trace.
     assert!(a.timed.windows(2).all(|p| p[0].0 <= p[1].0));
 }
+
+/// Two tenants with mixed job sizes behind few node slots, so the fair order (deadline keys,
+/// tenant virtual time, estimator samples) decides every grant.
+fn fair_run(seed: u64) -> (u64, usize) {
+    let mut cfg = SimConfig::default().seed(seed).keep_trace(false).fixed_split(2, 1);
+    cfg.sched.max_inflight = 2;
+    cfg.sched.max_queued = 1_000;
+    let mut sim = SimRuntime::new(cfg);
+    for (service, step) in [(1u128, io(2)), (2, io(40)), (3, cpu(3)), (4, io(300))] {
+        sim.scripts()
+            .set_for_service(rt_testkit::ids::service(service), Script::from(vec![step]));
+    }
+    let mut workload = StdRng::seed_from_u64(9);
+    let mut tasks: Vec<SimTask> = Vec::new();
+    for _ in 0..30 {
+        for _ in 0..6 {
+            let service = workload.gen_range(1..=4u128);
+            let tenant = 1 + service % 2;
+            tasks.push(admitted(
+                sim.submit_existing(d(service).tenant(tenant).queue_timeout_ms(60_000).finish()),
+            ));
+        }
+        sim.run_for(ms(workload.gen_range(1..20)));
+    }
+    sim.run_until_idle();
+    let ok = tasks
+        .iter_mut()
+        .filter_map(|t| sim.outcome(t).filter(|o| o.is_ok()).map(|_| ()))
+        .count();
+    (sim.trace_hash(), ok)
+}
+
+/// SCH-21 with the fair order: mixed sizes, two tenants, the same trace hash twice.
+#[test]
+fn ac_sch_21_fair_order_is_deterministic() {
+    let a = fair_run(13);
+    assert_eq!(a, fair_run(13));
+    assert_eq!(a.1, 180, "every task completes");
+}

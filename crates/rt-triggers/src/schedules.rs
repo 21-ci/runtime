@@ -363,6 +363,11 @@ impl ScheduleEngine {
         Ok(())
     }
 
+    /// A run of this schedule has not finished: its next tick will be skipped.
+    pub fn is_running(&self, id: ScheduleId) -> bool {
+        self.state.lock().running.contains(&id)
+    }
+
     pub fn remove(&self, id: ScheduleId) {
         let mut st = self.state.lock();
         st.entries.remove(&id);

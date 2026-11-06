@@ -706,3 +706,113 @@ async fn a_batch_the_scheduler_refuses_is_retried_and_runs_once_admitted() {
         })
         .await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Throttles are not delivery attempts (Q§2.4)
+// ---------------------------------------------------------------------------------------------
+
+/// QENG-004: a batch the scheduler refuses is released with its attempt refunded, so refusals
+/// never push a message into the DLQ, however often they happen.
+#[tokio::test(flavor = "current_thread")]
+async fn qeng_004_admission_refusal_is_not_an_attempt_and_never_dead_letters() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let cfg = QueueEngineConfig {
+                max_attempts: 2,
+                ..QueueEngineConfig::default()
+            };
+            let Rig {
+                mut sim,
+                store,
+                factory,
+                engine,
+            } = rig(cfg, Some(1), 1_000);
+            sim.scheduler().set_mode(DegradationMode::Drain);
+            store.enqueue(svc(), NewMessage::new("m")).await.expect("enqueue");
+            engine.notify(svc());
+            let run = spawn_engine(&engine);
+            drive(&mut sim, Duration::from_secs(200), Duration::from_millis(100)).await;
+            let releases = store.release_log();
+            assert!(releases.len() >= 8, "refused {} times", releases.len());
+            assert!(releases
+                .iter()
+                .all(|r| r.result == rt_store::RetryResult::Requeued { attempt: 0 }));
+            assert!(store.retry_log().is_empty(), "no counted retry");
+            assert_eq!(store.dlq_len(svc()), 0);
+            sim.scheduler().set_mode(DegradationMode::Normal);
+            drive(&mut sim, Duration::from_secs(70), Duration::from_millis(100)).await;
+            run.abort();
+            let attempts = factory.attempts();
+            assert_eq!(
+                attempts.last(),
+                Some(&1),
+                "the first real run is attempt 1: {attempts:?}"
+            );
+            assert_eq!(store.stored(), 0, "acked once it ran");
+        })
+        .await;
+}
+
+/// QENG-005: a shutdown kill and an admission refusal are not attempts; every other outcome is.
+#[test]
+fn qeng_005_shutdown_kill_is_not_an_attempt() {
+    use rt_triggers::queue_engine::counts_as_attempt;
+    use rt_types::{KillReason, Outcome, RejectReason};
+    assert!(!counts_as_attempt(&Outcome::Killed(KillReason::Shutdown)));
+    assert!(!counts_as_attempt(&Outcome::Rejected(RejectReason::Draining)));
+    assert!(!counts_as_attempt(&Outcome::Rejected(RejectReason::QuotaExceeded)));
+    for r in [KillReason::CpuLimit, KillReason::Oom, KillReason::WallTimeout] {
+        assert!(counts_as_attempt(&Outcome::Killed(r)), "{r:?}");
+    }
+    assert!(counts_as_attempt(&Outcome::GuestError));
+}
+
+/// QENG-006: consecutive throttles back off `1 s × 2^n` (cap 60 s); a counted settle resets it.
+#[tokio::test(flavor = "current_thread")]
+async fn qeng_006_throttle_backoff_grows_and_resets_after_a_counted_settle() {
+    use rt_triggers::queue_engine::throttle_delay;
+    assert_eq!(throttle_delay(0), Duration::from_secs(1));
+    assert_eq!(throttle_delay(3), Duration::from_secs(8));
+    assert_eq!(throttle_delay(6), Duration::from_secs(60));
+    assert_eq!(throttle_delay(u32::MAX), Duration::from_secs(60));
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let Rig {
+                mut sim,
+                store,
+                factory,
+                engine,
+            } = rig(QueueEngineConfig::default(), None, 1_000);
+            sim.scheduler().set_mode(DegradationMode::Drain);
+            store.enqueue(svc(), NewMessage::new("m")).await.expect("enqueue");
+            engine.notify(svc());
+            let run = spawn_engine(&engine);
+            drive(&mut sim, Duration::from_secs(20), Duration::from_millis(50)).await;
+            let delays: Vec<u64> = store.release_log().iter().map(|r| r.delay.as_secs()).collect();
+            assert_eq!(&delays[..4], &[1, 2, 4, 8], "{delays:?}");
+            sim.scheduler().set_mode(DegradationMode::Normal);
+            let mut waited = 0;
+            // Wait for the first counted (failing) settle: it retries with the 2 s backoff.
+            while store.retry_log().is_empty() && waited < 800 {
+                drive(&mut sim, Duration::from_millis(50), Duration::from_millis(50)).await;
+                waited += 1;
+            }
+            assert_eq!(store.retry_log().len(), 1, "one counted settle");
+            assert!(
+                factory.attempts().iter().all(|a| *a == 1),
+                "refusals never spent an attempt"
+            );
+            sim.scheduler().set_mode(DegradationMode::Drain);
+            let before = store.release_log().len();
+            drive(&mut sim, Duration::from_secs(10), Duration::from_millis(50)).await;
+            run.abort();
+            let after: Vec<u64> = store.release_log()[before..]
+                .iter()
+                .map(|r| r.delay.as_secs())
+                .collect();
+            assert_eq!(after.first(), Some(&1), "reset after the counted settle: {after:?}");
+        })
+        .await;
+}

@@ -27,7 +27,7 @@ theme:
   favicon: assets/images/favicon.svg
   font:
     text: Inter
-    code: JetBrains Mono
+    code: IBM Plex Mono
   icon:
     admonition:
       note: material/pencil-circle
@@ -78,12 +78,14 @@ plugins:
 # Not site pages: the repository README for docs/ (GitHub index) and the internal notes that never ship.
 exclude_docs: |
   README.md
+  design/
 
 # Generates docs/assets/openapi.json (cleaned copy of openapi/openapi.json) for the API explorer. Git-ignored.
 hooks:
   - scripts/docs_hooks.py
 
 extra_css:
+  - assets/stylesheets/design.css
   - assets/stylesheets/extra.css
 
 extra_javascript:
@@ -179,6 +181,7 @@ nav:
           - WASM services: guides/wasm.md
           - KV, SQL, blobs and other sub-services: guides/sub-services.md
           - Service calls and queues: guides/calls-and-queues.md
+          - Events, topics and async invocations: guides/events-and-streams.md
           - Use operator SDKs: guides/use-sdks.md
           - Schedules: guides/schedules.md
           - WebSockets and durable objects: guides/websockets.md

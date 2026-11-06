@@ -14,13 +14,14 @@ use common::*;
 use rt_mem::{MemoryGovernor, Pressure};
 use rt_sched::admission::{
     Admission, AdmissionLimits, AdmissionTicket, AdmitContext, AdmitRequest, Admitted, NodeSignals, SlotClass,
+    QUEUED_TASK_OVERHEAD, TENANT_QUANTUM,
 };
 use rt_sched::trace::TraceEvent;
 use rt_sched::TaskState;
 use rt_testkit::{cpu, ids, io, script, MockEvent, Script, SimRuntime, SimTask, SpecBuilder};
 use rt_types::{
-    BuildFailReason, BuildFailure, DegradationMode, Outcome, RejectReason, ScalingKnobs, ServiceKnobs, TaskId,
-    TaskKind, TaskSpec, Trigger,
+    BuildFailReason, BuildFailure, DegradationMode, MsgId, Outcome, Payload, PubsubMessage, RejectReason, ScalingKnobs,
+    ServiceKnobs, StreamBatch, StreamRecord, TaskId, TaskKind, TaskSpec, Trigger,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -75,10 +76,19 @@ impl Adm {
     }
 
     fn admit_cx(&mut self, spec: &TaskSpec, cx: AdmitContext) -> Result<Admitted<u32>, RejectReason> {
+        self.admit_req(&req(spec), cx)
+    }
+
+    /// Admit at scheduler time `now_ns`.
+    fn admit_at(&mut self, spec: &TaskSpec, now_ns: u64) -> Result<Admitted<u32>, RejectReason> {
+        self.admit_req(&req_at(spec, now_ns), NORMAL)
+    }
+
+    fn admit_req(&mut self, r: &AdmitRequest, cx: AdmitContext) -> Result<Admitted<u32>, RejectReason> {
         self.next += 1;
         let n = self.next;
         let mut ticket = None;
-        let r = self.a.admit(&req(spec), cx, |t| {
+        let r = self.a.admit(r, cx, |t| {
             ticket = Some(t.clone());
             n
         });
@@ -101,6 +111,24 @@ impl Adm {
         t.queued = false;
         self.a.release(&t, 1, None)
     }
+
+    /// Item `n` finishes at `now_ns` after holding its slot for `sample`.
+    fn finish_with(&mut self, n: u32, now_ns: u64, sample: Option<Duration>) -> Vec<u32> {
+        let mut t = self.tickets.remove(&n).expect("a ticket for every admitted item");
+        t.queued = false;
+        self.a.release_with(&t, now_ns, sample, sample)
+    }
+
+    /// Run one task of `spec` on the fast path and feed its estimator `sample`.
+    fn learn(&mut self, spec: &TaskSpec, sample: Duration) {
+        let a = self.admit(spec).unwrap();
+        assert!(a.run.is_some(), "learning needs a free slot");
+        assert!(self.finish_with(self.next, 1, Some(sample)).is_empty());
+    }
+}
+
+fn req_at(spec: &TaskSpec, now_ns: u64) -> AdmitRequest {
+    AdmitRequest::from_spec(spec, None, MIB, now_ns)
 }
 
 /// The item may run now: admitted straight to a slot, or queued and granted at once (it found
@@ -339,19 +367,22 @@ fn a_cancelled_waiter_is_never_granted_and_its_room_is_returned() {
     assert_eq!(a.a.queued(), (0, 0));
 }
 
-/// When slots free, tenants take turns, and the services of a tenant take turns, one task each.
+/// When slots free, tenants take turns; the services of one tenant are served by deadline key,
+/// which for equal predictions is arrival order (rule 3.6.5, changed on purpose from per-service
+/// round robin).
 #[test]
-fn freed_slots_are_shared_round_robin_across_tenants_then_services() {
-    let mut a = Adm::new(AdmissionLimits {
-        max_inflight: 1,
-        max_queued: 100,
-        max_queued_bytes: 1 << 30,
-    });
+fn freed_slots_alternate_tenants_and_serve_a_tenants_services_by_deadline() {
+    let mut a = Adm::new(wide(1));
     assert!(runs(&a.admit(&task(9, 9, knobs(BIG, 0, 0))).unwrap()));
     let mut owner: BTreeMap<u32, (u128, u128)> = BTreeMap::new();
     // tenant 1 floods two services, tenant 2 one service; all wait for the single slot
-    for (tenant, service) in [(1, 11), (1, 11), (1, 11), (1, 12), (1, 12), (2, 21), (2, 21), (2, 21)] {
-        assert!(waits(&a.admit(&task(tenant, service, knobs(BIG, 0, 0))).unwrap()));
+    for (i, (tenant, service)) in [(1, 11), (1, 11), (1, 11), (1, 12), (1, 12), (2, 21), (2, 21), (2, 21)]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(waits(
+            &a.admit_at(&task(tenant, service, knobs(BIG, 0, 0)), i as u64).unwrap()
+        ));
         owner.insert(a.next, (tenant, service));
     }
     let mut running = 1;
@@ -367,11 +398,488 @@ fn freed_slots_are_shared_round_robin_across_tenants_then_services() {
     assert_eq!(tenants[..6], [1, 2, 1, 2, 1, 2], "tenants alternate: {order:?}");
     let t1_services: Vec<u128> = order.iter().filter(|(t, _)| *t == 1).map(|(_, s)| *s).collect();
     assert_eq!(
-        t1_services[..4],
-        [11, 12, 11, 12],
-        "services of a tenant alternate: {order:?}"
+        t1_services,
+        [11, 11, 11, 12, 12],
+        "a tenant's services in arrival order: {order:?}"
     );
     assert_eq!((a.a.running(), a.a.queued()), (0, (0, 0)));
+}
+
+const fn nms(n: u64) -> u64 {
+    n * 1_000_000
+}
+
+fn wide(max_inflight: u32) -> AdmissionLimits {
+    AdmissionLimits {
+        max_inflight,
+        max_queued: 100,
+        max_queued_bytes: 1 << 30,
+    }
+}
+
+/// Runs a blocker of tenant 9 on the only slot; returns its item.
+fn block(a: &mut Adm) -> u32 {
+    assert!(runs(&a.admit(&task(9, 9, knobs(BIG, 0, 0))).unwrap()));
+    a.next
+}
+
+/// Admit at `now_ns`, assert it waits; returns the item.
+fn wait_at(a: &mut Adm, spec: &TaskSpec, now_ns: u64) -> u32 {
+    assert!(waits(&a.admit_at(spec, now_ns).unwrap()));
+    a.next
+}
+
+/// Fair-002: with one slot, a tenant's service predicted at 5 ms goes before its service predicted
+/// at 2 s that arrived earlier.
+#[test]
+fn fair_002_a_tenants_short_service_goes_before_its_long_one() {
+    let mut a = Adm::new(wide(1));
+    let short = task(1, 11, knobs(BIG, 0, 0));
+    let long = task(1, 12, knobs(BIG, 0, 0));
+    a.learn(&long, Duration::from_secs(2));
+    a.learn(&short, Duration::from_millis(5));
+    let b = block(&mut a);
+    let l = wait_at(&mut a, &long, nms(0));
+    let s = wait_at(&mut a, &short, nms(1));
+    assert_eq!(a.finish(b), vec![s], "the short job first");
+    assert_eq!(a.finish(s), vec![l]);
+    assert!(a.finish(l).is_empty());
+}
+
+/// Fair-003: a long job (p = 20 s, k = 4, Q = 5 s) gets `Q/2` of delay credit: a short arrival at
+/// +2.4 s goes before it, one at +2.6 s after it.
+#[test]
+fn fair_003_a_long_job_is_overtaken_only_by_arrivals_within_half_the_queue_timeout() {
+    let mut a = Adm::new(wide(1));
+    let short = task(1, 11, knobs(BIG, 0, 0));
+    let long = task(1, 12, knobs(BIG, 0, 0));
+    assert_eq!(short.knobs.queue_timeout, Duration::from_secs(5));
+    a.learn(&long, Duration::from_secs(20));
+    a.learn(&short, Duration::from_millis(5));
+    let b = block(&mut a);
+    let l = wait_at(&mut a, &long, 0);
+    let s1 = wait_at(&mut a, &short, nms(2400));
+    let s2 = wait_at(&mut a, &short, nms(2600));
+    assert_eq!(a.tickets[&l].wait.unwrap().0, nms(2500), "key = arrival + Q/2");
+    assert_eq!(a.finish_with(b, nms(2410), None), vec![s1]);
+    assert_eq!(a.a.aged_grants(), 0, "the short one is granted before its key");
+    assert_eq!(a.finish_with(s1, nms(3000), None), vec![l]);
+    assert_eq!(a.a.aged_grants(), 1, "the long one waited past its key");
+    assert_eq!(a.finish_with(l, nms(3000), None), vec![s2]);
+    assert!(a.finish(s2).is_empty());
+}
+
+/// Fair-004: `aging_factor = 0` serves a tenant in arrival order whatever the predictions.
+#[test]
+fn fair_004_aging_zero_serves_a_tenant_in_arrival_order() {
+    let mut a = Adm::new(wide(1));
+    a.a = Admission::new(wide(1)).with_aging(0);
+    let short = task(1, 11, knobs(BIG, 0, 0));
+    let long = task(1, 12, knobs(BIG, 0, 0));
+    a.learn(&long, Duration::from_secs(2));
+    a.learn(&short, Duration::from_millis(5));
+    let b = block(&mut a);
+    let l = wait_at(&mut a, &long, nms(0));
+    let s = wait_at(&mut a, &short, nms(1));
+    assert_eq!(a.finish(b), vec![l], "arrival order");
+    assert_eq!(a.finish(l), vec![s]);
+}
+
+/// Fair-005: two always-backlogged tenants, one with 5 ms tasks and one with 500 ms tasks, get
+/// equal slot time (within `TENANT_QUANTUM + p_max`), not equal task counts.
+#[test]
+fn fair_005_tenants_share_slot_time_not_task_count() {
+    let mut a = Adm::new(wide(1));
+    let specs = [task(1, 11, knobs(BIG, 0, 0)), task(2, 21, knobs(BIG, 0, 0))];
+    let cost = [Duration::from_millis(5), Duration::from_millis(500)];
+    a.learn(&specs[0], cost[0]);
+    a.learn(&specs[1], cost[1]);
+    let mut running = block(&mut a);
+    let mut owner: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut now = nms(10);
+    for _ in 0..2 {
+        for (t, spec) in specs.iter().enumerate() {
+            owner.insert(wait_at(&mut a, spec, now), t);
+        }
+    }
+    let mut sample = cost[0];
+    let mut slot = [Duration::ZERO; 2];
+    let mut count = [0u32; 2];
+    for _ in 0..1000 {
+        let g = a.finish_with(running, now, Some(sample));
+        assert_eq!(g.len(), 1);
+        running = g[0];
+        let t = owner[&running];
+        sample = cost[t];
+        slot[t] += sample;
+        count[t] += 1;
+        now += dns(sample);
+        owner.insert(wait_at(&mut a, &specs[t], now), t);
+        let diff = slot[0].abs_diff(slot[1]);
+        assert!(
+            diff <= TENANT_QUANTUM + cost[1],
+            "slot time {slot:?} after {count:?} grants"
+        );
+    }
+    assert!(
+        count[0] > 50 * count[1],
+        "the short tenant runs many more tasks: {count:?}"
+    );
+}
+
+fn dns(d: Duration) -> u64 {
+    d.as_nanos() as u64
+}
+
+/// Fair-006: a tenant that was idle while another ran comes back at most `TENANT_QUANTUM` behind:
+/// it gets at most `quantum / p + 1` grants before the busy tenant's next one.
+#[test]
+fn fair_006_an_idle_tenant_comes_back_at_most_one_quantum_behind() {
+    let mut a = Adm::new(wide(1));
+    let p = Duration::from_millis(5);
+    let (fa, fb) = (task(1, 11, knobs(BIG, 0, 0)), task(2, 21, knobs(BIG, 0, 0)));
+    a.learn(&fa, p);
+    a.learn(&fb, p);
+    let mut running = block(&mut a);
+    let mut owner: BTreeMap<u32, u128> = BTreeMap::new();
+    let mut now = nms(1);
+    for _ in 0..3 {
+        owner.insert(wait_at(&mut a, &fa, now), 1);
+    }
+    for _ in 0..100 {
+        let g = a.finish_with(running, now, Some(p));
+        running = g[0];
+        assert_eq!(owner[&running], 1, "only tenant 1 waits");
+        now += dns(p);
+        owner.insert(wait_at(&mut a, &fa, now), 1);
+    }
+    for _ in 0..20 {
+        owner.insert(wait_at(&mut a, &fb, now), 2);
+    }
+    let mut run_b = 0u64;
+    loop {
+        let g = a.finish_with(running, now, Some(p));
+        running = g[0];
+        now += dns(p);
+        if owner[&running] == 1 {
+            break;
+        }
+        run_b += 1;
+    }
+    let bound = dns(TENANT_QUANTUM) / dns(p) + 1;
+    assert!(
+        (1..=bound).contains(&run_b),
+        "{run_b} grants of the returning tenant, bound {bound}"
+    );
+}
+
+/// Fair-007: a tenant's waiting calls go before its waiting requests, FIFO among themselves.
+#[test]
+fn fair_007_calls_go_before_items_of_their_tenant_in_fifo_order() {
+    let mut a = Adm::new(wide(1));
+    assert!(runs(&a.admit(&task(1, 10, knobs(BIG, 0, 0))).unwrap()));
+    let b = a.next;
+    let item = wait_at(&mut a, &task(1, 11, knobs(BIG, 0, 0)), nms(1));
+    let c1 = wait_at(&mut a, &call(1, 12, knobs(BIG, 0, 0)), nms(2));
+    let c2 = wait_at(&mut a, &call(1, 13, knobs(BIG, 0, 0)), nms(3));
+    assert_eq!(a.tickets[&c1].class, SlotClass::Call);
+    assert_eq!(a.finish(b), vec![c1]);
+    assert_eq!(a.finish(c1), vec![c2]);
+    assert_eq!(a.finish(c2), vec![item]);
+}
+
+/// Fair-008: a task predicted at 5 ms that held its slot for 500 ms is charged 500 ms: the other
+/// tenant then gets about 100 grants of 5 ms before the mispredicted tenant's next one.
+#[test]
+fn fair_008_a_mispredicted_task_is_charged_its_actual_time() {
+    let mut a = Adm::new(wide(1));
+    let p = Duration::from_millis(5);
+    let (fa, fb) = (task(1, 11, knobs(BIG, 0, 0)), task(2, 21, knobs(BIG, 0, 0)));
+    a.learn(&fa, p);
+    a.learn(&fb, p);
+    let b = block(&mut a);
+    let mut owner: BTreeMap<u32, u128> = BTreeMap::new();
+    for _ in 0..3 {
+        owner.insert(wait_at(&mut a, &fa, nms(1)), 1);
+        owner.insert(wait_at(&mut a, &fb, nms(1)), 2);
+    }
+    let g = a.finish_with(b, nms(2), Some(p));
+    assert_eq!(owner[&g[0]], 1, "tenant 1 listed first");
+    let mut running = a.finish_with(g[0], nms(502), Some(Duration::from_millis(500)))[0];
+    let mut now = nms(502);
+    let mut run_b = 0;
+    while owner[&running] == 2 {
+        run_b += 1;
+        owner.insert(wait_at(&mut a, &fb, now), 2);
+        now += dns(p);
+        running = a.finish_with(running, now, Some(p))[0];
+    }
+    assert!((95..=101).contains(&run_b), "{run_b} grants of the other tenant");
+}
+
+/// Fair-009: tenants with equal work alternate one grant each.
+#[test]
+fn fair_009_equal_tenants_alternate() {
+    let mut a = Adm::new(wide(1));
+    let mut running = block(&mut a);
+    let mut owner: BTreeMap<u32, u128> = BTreeMap::new();
+    for i in 0..4 {
+        owner.insert(wait_at(&mut a, &task(1, 11, knobs(BIG, 0, 0)), i), 1);
+        owner.insert(wait_at(&mut a, &task(2, 21, knobs(BIG, 0, 0)), i), 2);
+    }
+    let mut order = Vec::new();
+    for _ in 0..8 {
+        running = a.finish(running)[0];
+        order.push(owner[&running]);
+    }
+    assert_eq!(order, [1, 2, 1, 2, 1, 2, 1, 2]);
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+    /// Fair-010: within one tenant, items are granted in deadline-key order: no item is
+    /// overtaken by one with a later key, and each key is `wait_key(arrival, pred, 4, Q)`.
+    #[test]
+    fn fair_010_prop_no_item_is_overtaken_by_a_later_deadline(
+        preds in proptest::collection::vec(1u64..3_000, 3),
+        arrivals in proptest::collection::vec((0usize..3, 0u64..2_000), 1..40),
+    ) {
+        let mut a = Adm::new(wide(1));
+        let specs: Vec<TaskSpec> = (0..3).map(|i| task(1, 11 + i as u128, knobs(BIG, 0, 0))).collect();
+        for (s, p) in specs.iter().zip(&preds) {
+            a.learn(s, Duration::from_millis(*p));
+        }
+        let mut running = block(&mut a);
+        let mut now = 0;
+        let mut keys = BTreeMap::new();
+        for (svc, gap) in &arrivals {
+            now += nms(*gap);
+            let n = wait_at(&mut a, &specs[*svc], now);
+            let want = rt_sched::admission::wait_key(now, nms(preds[*svc]), 4, Duration::from_secs(5));
+            let t = &a.tickets[&n];
+            proptest::prop_assert_eq!(t.wait.unwrap().0, want);
+            keys.insert(n, t.wait.unwrap());
+        }
+        let mut last = (0, 0);
+        for _ in 0..arrivals.len() {
+            running = a.finish(running)[0];
+            proptest::prop_assert!(keys[&running] >= last, "granted out of key order");
+            last = keys[&running];
+        }
+        proptest::prop_assert!(a.finish(running).is_empty());
+    }
+}
+
+fn scaling(a: &Adm, service: u128) -> rt_sched::ServiceScaling {
+    a.a.service_scaling(ids::service(service), 0).expect("state")
+}
+
+/// Pred-001: the estimate is the first sample, then moves 1/8 towards each new one; a new
+/// version of the service starts without an estimate.
+#[test]
+fn pred_001_the_estimate_follows_slot_hold_time_and_resets_on_a_new_version() {
+    let mut a = Adm::new(wide(4));
+    let s = task(1, 11, knobs(BIG, 0, 0));
+    a.learn(&s, Duration::from_millis(10));
+    assert_eq!(scaling(&a, 11).pred, [Some(Duration::from_millis(10)), None]);
+    a.learn(&s, Duration::from_millis(18));
+    assert_eq!(scaling(&a, 11).pred[0], Some(Duration::from_millis(11)));
+    let mut r = s.service;
+    r.version = rt_types::VersionNo(r.version.0 + 1);
+    let v2 = SpecBuilder::deno().service_ref(r).knobs(knobs(BIG, 0, 0)).finish();
+    let x = a.admit(&v2).unwrap();
+    assert!(x.run.is_some());
+    assert_eq!(scaling(&a, 11).pred, [None, None], "a new version resets");
+    // Builds and samples-less releases never move it.
+    a.finish_with(a.next, 1, None);
+    let b = a.admit(&build_of(1, 11)).unwrap();
+    assert!(b.run.is_some());
+    a.finish_with(a.next, 1, Some(Duration::from_secs(1)));
+    assert_eq!(scaling(&a, 11).pred, [None, None]);
+}
+
+/// Pred-002: a wall kill feeds the wall limit as the sample; a queued task's prediction is never
+/// above its wall limit.
+#[test]
+fn pred_002_a_wall_kill_feeds_the_wall_limit() {
+    let mut a = Adm::new(wide(1));
+    let s = SpecBuilder::deno()
+        .tenant(1)
+        .service(11)
+        .knobs(knobs(BIG, 0, 0))
+        .wall_limit(100)
+        .finish();
+    a.learn(&s, Duration::from_millis(100));
+    assert_eq!(scaling(&a, 11).pred[0], Some(Duration::from_millis(100)));
+    a.learn(&s, Duration::from_secs(10));
+    assert!(scaling(&a, 11).pred[0].unwrap() > Duration::from_secs(1));
+    let _b = block(&mut a);
+    let n = wait_at(&mut a, &s, 0);
+    assert_eq!(a.tickets[&n].pred_ns, nms(100), "bounded by the wall limit");
+}
+
+/// Cancel-001: a timed-out waiter leaves the ordered queue (head or not, by its key or found by
+/// search), and the next head moves up.
+#[test]
+fn cancel_001_a_timed_out_waiter_leaves_the_ordered_queue_and_the_next_head_moves_up() {
+    let mut a = Adm::new(wide(1));
+    let b = block(&mut a);
+    let s = task(1, 11, knobs(BIG, 0, 0));
+    let x1 = wait_at(&mut a, &s, 0);
+    let x2 = wait_at(&mut a, &s, 1);
+    let x3 = wait_at(&mut a, &s, 2);
+    let x4 = wait_at(&mut a, &s, 3);
+    let c = wait_at(&mut a, &call(1, 12, knobs(BIG, 0, 0)), 4);
+    assert_eq!(a.a.waiting(ids::service(11)), 4);
+    assert!(a.a.cancel(&a.tickets[&x1].clone(), true, |n| *n == x1), "the head");
+    assert!(a.a.cancel(&a.tickets[&x3].clone(), false, |n| *n == x3), "not the head");
+    let mut keyless = a.tickets[&x4].clone();
+    keyless.wait = None;
+    assert!(a.a.cancel(&keyless, false, |n| *n == x4), "found without its key");
+    assert!(!a.a.cancel(&keyless, false, |n| *n == x4), "only once");
+    let mut keyless_call = a.tickets[&c].clone();
+    keyless_call.wait = None;
+    assert!(
+        a.a.cancel(&keyless_call, false, |n| *n == c),
+        "a call found without its key"
+    );
+    assert!(!a.a.cancel(&a.tickets[&c].clone(), false, |n| *n == c));
+    assert_eq!(a.a.queued().0, 1);
+    assert_eq!(a.a.waiting(ids::service(11)), 1);
+    assert_eq!(a.finish(b), vec![x2]);
+    assert_eq!(a.a.queued(), (0, 0));
+    assert_eq!(a.a.waiting(ids::service(77)), 0, "no state");
+}
+
+/// Fair-011: interactive and background work of one service keep separate estimates.
+#[test]
+fn fair_011_lanes_keep_separate_estimates() {
+    let mut a = Adm::new(wide(1));
+    let http = task(1, 11, knobs(BIG, 0, 0));
+    let queue = SpecBuilder::deno()
+        .tenant(1)
+        .service(11)
+        .knobs(knobs(BIG, 0, 0))
+        .trigger(Trigger::Queue {
+            batch: Vec::new(),
+            attempt: 1,
+        })
+        .finish();
+    assert_eq!(req(&queue).lane, 1);
+    a.learn(&http, Duration::from_millis(5));
+    a.learn(&queue, Duration::from_secs(2));
+    assert_eq!(
+        scaling(&a, 11).pred,
+        [Some(Duration::from_millis(5)), Some(Duration::from_secs(2))]
+    );
+    let _b = block(&mut a);
+    let h = wait_at(&mut a, &http, 0);
+    let q = wait_at(&mut a, &queue, 0);
+    assert_eq!(a.tickets[&h].pred_ns, nms(5));
+    assert_eq!(a.tickets[&q].pred_ns, nms(2000));
+}
+
+/// A pub/sub request (`reply`) is a call: its requester holds a slot.
+#[test]
+fn adm_pubsub_reply_takes_the_call_class() {
+    let t = |reply| Trigger::Pubsub {
+        subject: "a.b".into(),
+        depth: 1,
+        reply,
+    };
+    assert_eq!(SlotClass::of(TaskKind::DENO, &t(true)), SlotClass::Call);
+    assert_eq!(SlotClass::of(TaskKind::DENO, &t(false)), SlotClass::Throttled);
+}
+
+/// Pub/sub and stream payload bytes count toward the queue byte bounds.
+#[test]
+fn adm_stream_and_pubsub_payload_bytes_count_toward_max_queued_mb() {
+    let msg = |len: usize| {
+        SpecBuilder::deno()
+            .tenant(1)
+            .service(11)
+            .knobs(knobs(BIG, 0, 0))
+            .trigger(Trigger::Pubsub {
+                subject: "a".into(),
+                depth: 1,
+                reply: false,
+            })
+            .payload(Payload::Pubsub(PubsubMessage {
+                id: MsgId::new(),
+                subject: "a".into(),
+                body: vec![0u8; len].into(),
+                headers: Vec::new(),
+                replyable: false,
+                published_at_ms: 0,
+            }))
+            .finish()
+    };
+    let rec = |len: usize| StreamRecord {
+        partition: 0,
+        offset: 0,
+        key: None,
+        headers: Vec::new(),
+        body: vec![0u8; len].into(),
+        ts_ms: 0,
+    };
+    let batch = |lens: &[usize]| {
+        SpecBuilder::deno()
+            .tenant(1)
+            .service(12)
+            .knobs(knobs(BIG, 0, 0))
+            .trigger(Trigger::Stream {
+                topic: "t".into(),
+                partition: 0,
+                attempt: 1,
+            })
+            .payload(Payload::Stream(StreamBatch {
+                topic: "t".into(),
+                group: "g".into(),
+                partition: 0,
+                attempt: 1,
+                records: lens.iter().map(|l| rec(*l)).collect(),
+            }))
+            .finish()
+    };
+    assert_eq!(req(&msg(1000)).bytes, QUEUED_TASK_OVERHEAD + 1000);
+    assert_eq!(req(&batch(&[100, 200])).bytes, QUEUED_TASK_OVERHEAD + 300);
+    let mut a = Adm::new(AdmissionLimits {
+        max_inflight: 1,
+        max_queued: 100,
+        max_queued_bytes: 64 * 1024,
+    });
+    let _b = block(&mut a);
+    assert_eq!(a.admit(&msg(40 * 1024)).unwrap_err(), RejectReason::Overloaded);
+    assert_eq!(
+        a.admit(&batch(&[20 * 1024, 20 * 1024])).unwrap_err(),
+        RejectReason::Overloaded
+    );
+    assert!(waits(&a.admit(&msg(1024)).unwrap()));
+    assert_eq!(a.a.queued().1, QUEUED_TASK_OVERHEAD + 1024);
+}
+
+/// A sample on a task that was granted from the wait queue when nothing else waits corrects the
+/// tenant without the waitlist (no dispatch), and a correction can lower the charge.
+#[test]
+fn a_correction_with_nothing_waiting_and_a_shorter_actual_time() {
+    let mut a = Adm::new(wide(1));
+    let fa = task(1, 11, knobs(BIG, 0, 0));
+    let fb = task(2, 21, knobs(BIG, 0, 0));
+    a.learn(&fa, Duration::from_millis(500));
+    a.learn(&fb, Duration::from_millis(5));
+    let b = block(&mut a);
+    let x = wait_at(&mut a, &fa, 0);
+    let y = wait_at(&mut a, &fb, 0);
+    assert_eq!(a.finish(b), vec![x], "tenant 1 listed first");
+    // charged 500 ms, took 1 ms (corrected under the waitlist: y waits)
+    assert_eq!(a.finish_with(x, 1, Some(Duration::from_millis(1))), vec![y]);
+    // charged 5 ms, took 6 ms (corrected with nothing waiting)
+    assert!(a.finish_with(y, 2, Some(Duration::from_millis(6))).is_empty());
+    let b = block(&mut a);
+    let y2 = wait_at(&mut a, &fb, nms(1));
+    let z = wait_at(&mut a, &fa, nms(1));
+    assert_eq!(a.finish(b), vec![z], "tenant 1 was charged only its actual time");
+    assert_eq!(a.finish(z), vec![y2]);
 }
 
 /// Calls are held by the service ceiling and the tenant's call allowance (= the plan cap), not by
@@ -472,6 +980,181 @@ fn a_call_waiting_behind_a_tenant_capped_request_still_gets_its_slot() {
     );
     let b2 = a.next;
     assert_eq!(a.finish(b1), vec![b2], "B's freed slot goes to A2's call");
+}
+
+fn reentrant(mut spec: TaskSpec) -> TaskSpec {
+    spec.reentrant = true;
+    spec
+}
+
+fn reply_of(tenant: u128, service: u128, k: ServiceKnobs, depth: u8) -> TaskSpec {
+    SpecBuilder::deno()
+        .tenant(tenant)
+        .service(service)
+        .knobs(k)
+        .trigger(Trigger::Pubsub {
+            subject: "self.ping".into(),
+            depth,
+            reply: true,
+        })
+        .finish()
+}
+
+/// A re-entrant call (submitted by a task of the same service, which waits for it holding one of
+/// the service's slots) is not held by `max_instances`: at a ceiling of 1 a self-call and a
+/// self-request reply run beside their parent. Requests and calls from other services still wait
+/// on the ceiling.
+#[test]
+fn adm_reentrant_calls_run_past_max_instances_others_wait() {
+    let mut a = Adm::new(limits(100));
+    let k = knobs(1, 0, 0);
+    let parent = a.admit(&task(1, 1, k)).unwrap();
+    assert!(runs(&parent), "the requester takes the only instance");
+    let p = a.next;
+    assert!(
+        waits(&a.admit(&task(1, 1, k)).unwrap()),
+        "a request waits on the ceiling of 1"
+    );
+    let queued_req = a.next;
+    assert!(
+        waits(&a.admit(&call(1, 1, k)).unwrap()),
+        "a call from another service waits on it"
+    );
+    let queued_call = a.next;
+
+    let c = a.admit(&reentrant(call(1, 1, k))).unwrap();
+    assert!(runs(&c), "a self-call runs beside its parent");
+    let self_call = a.next;
+    assert_eq!(c.ticket.class, SlotClass::Call);
+    let r = a.admit(&reentrant(reply_of(1, 1, k, 2))).unwrap();
+    assert!(runs(&r), "a self-request reply (nested deeper) runs too");
+    let self_reply = a.next;
+    assert_eq!(a.a.service(ids::service(1)).map(|s| (s.running, s.max)), Some((3, 1)));
+
+    // the overshoot drains first: the ceiling is free again only once all three are done
+    assert!(a.finish(self_reply).is_empty());
+    assert!(
+        a.finish(self_call).is_empty(),
+        "running 1 = the ceiling: nobody is granted"
+    );
+    assert_eq!(a.finish(p), vec![queued_call], "the waiting call goes first");
+    assert_eq!(a.finish(queued_call), vec![queued_req]);
+    a.finish(queued_req);
+    assert_eq!((a.a.inflight(), a.a.running(), a.a.queued()), (0, 0, (0, 0)));
+}
+
+/// The re-entrant exemption covers the service ceiling only: the flag means nothing on a request
+/// (`Throttled`), and a re-entrant call is still held by the tenant's call allowance at its depth
+/// and by `max_inflight`.
+#[test]
+fn adm_reentrant_calls_stay_within_the_tenant_allowance_and_max_inflight() {
+    let mut a = Adm::new(limits(100));
+    let k = knobs(1, 0, 2);
+    assert!(runs(&a.admit(&task(1, 1, k)).unwrap()));
+    assert!(
+        waits(&a.admit(&reentrant(task(1, 1, k))).unwrap()),
+        "a request is never re-entrant: it waits on the ceiling"
+    );
+    assert!(runs(&a.admit(&reentrant(call_from(1, 1, k, 1))).unwrap()));
+    assert!(
+        runs(&a.admit(&reentrant(call_from(1, 1, k, 2))).unwrap()),
+        "two depth-1 calls (of two parents): the plan cap of 2"
+    );
+    assert!(
+        waits(&a.admit(&reentrant(call_from(1, 1, k, 3))).unwrap()),
+        "the third depth-1 call waits on the tenant's call allowance"
+    );
+    assert!(
+        runs(&a.admit(&reentrant(reply_of(1, 1, k, 2))).unwrap()),
+        "depth 2 has its own allowance"
+    );
+
+    let mut b = Adm::new(limits(2));
+    let k = knobs(1, 0, 0);
+    assert!(runs(&b.admit(&task(2, 2, k)).unwrap()));
+    assert!(
+        runs(&b.admit(&reentrant(call_from(2, 2, k, 1))).unwrap()),
+        "the call reserve"
+    );
+    let blocked = b.admit(&reentrant(call_from(2, 2, k, 2))).unwrap();
+    assert!(waits(&blocked), "max_inflight of 2 holds a re-entrant call");
+    let n = b.next;
+    assert_eq!(
+        b.finish(n - 1),
+        vec![n],
+        "granted past the ceiling once a node slot frees"
+    );
+}
+
+fn call_from(tenant: u128, service: u128, k: ServiceKnobs, parent: u64) -> TaskSpec {
+    SpecBuilder::deno()
+        .tenant(tenant)
+        .service(service)
+        .knobs(k)
+        .trigger(Trigger::Call {
+            parent: TaskId(parent),
+            depth: 1,
+        })
+        .finish()
+}
+
+/// M3: a blocked parent lends one slot, not one per child. A `Promise.all` fan-out of self-calls
+/// from one parent at `max_instances: 1` runs one child past the ceiling at a time; the others
+/// wait for it (no deadlock: one always runs). A child that calls itself again lends its own slot.
+#[test]
+fn adm_reentrant_fan_out_of_one_parent_borrows_one_slot() {
+    let mut a = Adm::new(limits(100));
+    let k = knobs(1, 0, 0);
+    assert!(runs(&a.admit(&task(1, 1, k)).unwrap()));
+    assert!(
+        runs(&a.admit(&reentrant(call_from(1, 1, k, 7))).unwrap()),
+        "the first child borrows the parent's slot"
+    );
+    let first = a.next;
+    let mut queued = Vec::new();
+    for _ in 0..5 {
+        assert!(
+            waits(&a.admit(&reentrant(call_from(1, 1, k, 7))).unwrap()),
+            "a second child of the same parent waits"
+        );
+        queued.push(a.next);
+    }
+    assert_eq!(a.a.service(ids::service(1)).map(|s| s.running), Some(2));
+    // the running child calls itself: its own slot is lent (a chain still makes progress)
+    assert!(
+        runs(&a.admit(&reentrant(call_from(1, 1, k, 99))).unwrap()),
+        "a grandchild runs"
+    );
+    let grand = a.next;
+    assert_eq!(a.a.service(ids::service(1)).map(|s| s.running), Some(3));
+    assert!(a.finish(grand).is_empty());
+    assert_eq!(a.finish(first), vec![queued[0]], "the next sibling takes the lent slot");
+    for w in queued.windows(2) {
+        assert_eq!(a.finish(w[0]), vec![w[1]]);
+    }
+    assert!(a.finish(*queued.last().unwrap()).is_empty());
+}
+
+/// M3: re-entrant tasks with no parent id (pub/sub replies) or many parents never take more than
+/// `MAX_CALL_DEPTH` slots past the ceiling.
+#[test]
+fn adm_reentrant_overshoot_has_a_hard_cap() {
+    let mut a = Adm::new(limits(1000));
+    let k = knobs(1, 0, 0);
+    assert!(runs(&a.admit(&task(1, 1, k)).unwrap()));
+    let cap = u32::from(rt_types::MAX_CALL_DEPTH);
+    for _ in 0..cap {
+        assert!(runs(&a.admit(&reentrant(reply_of(1, 1, k, 2))).unwrap()));
+    }
+    assert!(
+        waits(&a.admit(&reentrant(reply_of(1, 1, k, 2))).unwrap()),
+        "past the hard cap"
+    );
+    assert!(
+        waits(&a.admit(&reentrant(call_from(1, 1, k, 5))).unwrap()),
+        "past the hard cap"
+    );
+    assert_eq!(a.a.service(ids::service(1)).map(|s| s.running), Some(1 + cap));
 }
 
 /// Review 7: a call queued for a service that is already listed, while its tenant is out of the
@@ -2240,34 +2923,54 @@ fn sched_002_an_executor_panic_releases_the_slot_and_the_memory() {
     assert_ok(sim.outcome(&mut next));
 }
 
-/// ADM-005 (pinned limitation): a service with one instance calling itself: the child needs the
-/// slot its parent holds, so it waits its queue timeout and ends `queue_timeout`; nothing hangs.
-#[test]
-fn adm_005_a_self_call_at_one_instance_ends_in_queue_timeout() {
+/// A service with one instance calls itself (the child marked `reentrant` or not) while the
+/// parent stays busy waiting on it longer than the queue timeout; returns the child's outcome.
+fn self_call_at_one_instance(reentrant: bool) -> Outcome {
     let mut sim = SimRuntime::new(fixed(1, 1));
     let sched = sim.scheduler().clone();
     let children: Arc<Mutex<Vec<rt_sched::TaskHandle>>> = Arc::default();
     let sink = children.clone();
     sim.scripts().set_call_hook(move |parent, _slug| {
-        let spec = d(1)
+        let mut spec = d(1)
             .max_concurrency(1, 10)
             .queue_timeout_ms(500)
             .trigger(Trigger::Call { parent, depth: 1 })
             .finish();
-        if let Ok(h) = sched.submit(spec) {
-            sink.lock().unwrap().push(h);
+        spec.reentrant = reentrant;
+        // scripts are per service: the child runs the same script, so only the parent's call counts
+        let mut kids = sink.lock().unwrap();
+        if kids.is_empty() {
+            if let Ok(h) = sched.submit(spec) {
+                kids.push(h);
+            }
         }
     });
-    // The parent calls itself, then stays busy (waiting on the child) longer than the timeout.
     let mut parent = admitted(sim.submit(
         d(1).max_concurrency(1, 10).queue_timeout_ms(500).finish(),
         rt_testkit::Script::from(vec![rt_testkit::call("self"), io(2_000)]),
     ));
     sim.run_until_idle();
     assert_ok(sim.outcome(&mut parent));
+    assert_eq!(sim.scheduler().snapshot().inflight, 0, "every run slot is back");
     let mut kids = children.lock().unwrap();
     assert_eq!(kids.len(), 1);
-    let child = futures_util::FutureExt::now_or_never(&mut kids[0]).expect("the child finished");
+    futures_util::FutureExt::now_or_never(&mut kids[0]).expect("the child finished")
+}
+
+/// ADM-005: a service with one instance calling itself: the child is re-entrant (its parent holds
+/// the only slot and waits for it), so it runs past `max_instances` instead of waiting its queue
+/// timeout.
+#[test]
+fn adm_005_a_self_call_at_one_instance_runs_beside_its_parent() {
+    let child = self_call_at_one_instance(true);
+    assert!(matches!(child, Outcome::Ok(_)), "{child:?}");
+}
+
+/// ADM-005b (pinned limitation): a nested call not marked re-entrant (an indirect cycle, A calls B
+/// calls A) still needs the slot an ancestor holds: it ends `queue_timeout`; nothing hangs.
+#[test]
+fn adm_005b_a_nested_call_that_is_not_reentrant_still_ends_in_queue_timeout() {
+    let child = self_call_at_one_instance(false);
     assert!(
         matches!(child, Outcome::Rejected(RejectReason::QueueTimeout)),
         "{child:?}"
@@ -2299,4 +3002,348 @@ fn fair_001_a_noisy_tenant_cannot_starve_another() {
     for mut t in quiet {
         assert_ok(sim.outcome(&mut t));
     }
+}
+
+/// Slow-path cost of the admission waitlist (run in release with `--ignored --nocapture`):
+/// 10 k items wait over 1 k tenants x 2 services behind one node slot, then are released one at
+/// a time (each release grants the next waiter). Prints ns/op p50/p99 for the enqueue and for
+/// release+dispatch; asserts a generous mean of at most 5 us per op. Public API only, so it
+/// runs unchanged before and after the fair-order change.
+#[test]
+#[ignore = "perf"]
+fn perf_admission_slow_path_10k_waiting_over_1k_tenants() {
+    const TENANTS: u128 = 1_000;
+    const N: usize = 10_000;
+    let a = Admission::<usize>::new(AdmissionLimits {
+        max_inflight: 1,
+        max_queued: 1 << 20,
+        max_queued_bytes: 1 << 40,
+    });
+    let specs: Vec<TaskSpec> = (0..TENANTS)
+        .flat_map(|t| (0..2u128).map(move |s| task(t + 1, (t + 1) * 10 + s, knobs(1 << 10, 1 << 10, 1 << 10))))
+        .collect();
+    let reqs: Vec<AdmitRequest> = specs.iter().map(req).collect();
+    let mut tickets: Vec<Option<AdmissionTicket>> = vec![None; N];
+    let mut enqueue = Vec::with_capacity(N);
+    let mut running = None;
+    for i in 0..N {
+        let r = &reqs[i % reqs.len()];
+        let mut ticket = None;
+        let t0 = Instant::now();
+        let x = a
+            .admit(r, NORMAL, |t| {
+                ticket = Some(t.clone());
+                i
+            })
+            .expect("admitted");
+        enqueue.push(t0.elapsed().as_nanos() as u64);
+        tickets[i] = ticket;
+        if x.run.is_some() {
+            running = Some(i);
+        }
+    }
+    assert_eq!(a.queued().0 as usize, N - 1, "all but one wait");
+    let mut release = Vec::with_capacity(N);
+    let mut done = 0;
+    while let Some(i) = running.take() {
+        let mut t = tickets[i].take().expect("ticket of the running item");
+        t.queued = false;
+        let t0 = Instant::now();
+        let granted = a.release(&t, 0, None);
+        release.push(t0.elapsed().as_nanos() as u64);
+        done += 1;
+        running = granted.first().copied();
+    }
+    assert_eq!(done, N, "every item ran");
+    let report = |label: &str, v: &mut Vec<u64>| -> f64 {
+        v.sort_unstable();
+        let mean = v.iter().sum::<u64>() as f64 / v.len() as f64;
+        println!(
+            "{label}: mean {mean:.0} ns/op, p50 {} ns, p99 {} ns ({} ops)",
+            v[v.len() / 2],
+            v[v.len() * 99 / 100],
+            v.len()
+        );
+        mean
+    };
+    let e = report("enqueue", &mut enqueue);
+    let r = report("release+dispatch", &mut release);
+    assert!(
+        e <= 5_000.0 && r <= 5_000.0,
+        "mean over 5 us/op: enqueue {e:.0}, release {r:.0}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fair order in the simulation (feature 2): the estimator learns from finished tasks
+// ---------------------------------------------------------------------------------------------
+
+/// One node slot, a tenant with a short and a long service, generous queue bounds.
+fn one_slot() -> SimRuntime {
+    SimRuntime::new(fixed(1, 1).sched(|s| {
+        s.max_inflight = 1;
+        s.max_queued = 20_000;
+    }))
+}
+
+/// Run one task of each spec alone so the estimator knows their run times.
+fn warm_up(sim: &mut SimRuntime, specs: &[&dyn Fn() -> TaskSpec]) {
+    for s in specs {
+        let mut t = admitted(sim.submit_existing(s()));
+        sim.run_until_idle();
+        assert_ok(sim.outcome(&mut t));
+    }
+}
+
+/// AC-SCH-40: under contention a tenant's short job starts before its long job that queued
+/// first, once finished tasks taught the estimator their run times.
+#[test]
+fn ac_sch_40_short_jobs_start_first_under_contention() {
+    let mut sim = one_slot();
+    sim.scripts().set_for_service(ids::service(1), script![io(5)]);
+    sim.scripts().set_for_service(ids::service(2), script![io(2000)]);
+    sim.scripts().set_for_service(ids::service(3), script![io(100)]);
+    let short = || d(1).tenant(1).queue_timeout_ms(30_000).finish();
+    let long = || d(2).tenant(1).queue_timeout_ms(30_000).finish();
+    warm_up(&mut sim, &[&short, &long, &short, &long]);
+
+    let mut blocker = admitted(sim.submit_existing(d(3).tenant(1).queue_timeout_ms(30_000).finish()));
+    let mut l = admitted(sim.submit_existing(long()));
+    let mut s = admitted(sim.submit_existing(short()));
+    sim.run_until_idle();
+    for t in [&mut blocker, &mut l, &mut s] {
+        assert_ok(sim.outcome(t));
+    }
+    let (ql, qs) = (l.timings().queue, s.timings().queue);
+    assert!(qs < ql, "the short job waited {qs:?}, the long one {ql:?}");
+    assert!(ql >= ms(100), "the long job waited for the short one: {ql:?}");
+}
+
+/// AC-SCH-41: a long job is overtaken only by short arrivals within half its queue timeout: it
+/// starts by `submit + Q/2 + one short job` under a steady stream of short jobs, and nothing
+/// times out.
+#[test]
+fn ac_sch_41_a_long_job_starts_within_half_the_queue_timeout_under_a_stream_of_short_jobs() {
+    let q = 5_000;
+    let mut sim = one_slot();
+    sim.scripts().set_for_service(ids::service(1), script![io(5)]);
+    sim.scripts().set_for_service(ids::service(2), script![io(2000)]);
+    let short = || d(1).tenant(1).queue_timeout_ms(q).finish();
+    let long = || d(2).tenant(1).queue_timeout_ms(q).finish();
+    warm_up(&mut sim, &[&short, &long, &short, &long]);
+
+    let mut shorts = Vec::new();
+    for _ in 0..4 {
+        shorts.push(admitted(sim.submit_existing(short())));
+    }
+    let mut l = admitted(sim.submit_existing(long()));
+    // a short job every 5 ms for 3 s: the slot never goes idle
+    for _ in 0..600 {
+        shorts.push(admitted(sim.submit_existing(short())));
+        sim.run_for(ms(5));
+    }
+    sim.run_until_idle();
+    assert_ok(sim.outcome(&mut l));
+    let started = l.timings().queue;
+    assert!(
+        started <= ms(q / 2 + 5 + 20),
+        "the long job started {started:?} after it was submitted"
+    );
+    assert!(
+        started >= ms(q / 2 - 100),
+        "short arrivals inside Q/2 went first: {started:?}"
+    );
+    for mut t in shorts {
+        assert_ok(sim.outcome(&mut t));
+    }
+}
+
+/// AC-SCH-42: two busy tenants get equal slot time, not equal task counts (5 ms vs 500 ms jobs).
+#[test]
+fn ac_sch_42_two_busy_tenants_get_equal_slot_time() {
+    let mut sim = one_slot();
+    sim.scripts().set_for_service(ids::service(1), script![io(5)]);
+    sim.scripts().set_for_service(ids::service(2), script![io(500)]);
+    let a = || d(1).tenant(1).queue_timeout_ms(600_000).finish();
+    let b = || d(2).tenant(2).queue_timeout_ms(600_000).finish();
+    warm_up(&mut sim, &[&a, &b]);
+    let mut ta: Vec<SimTask> = (0..4_000).map(|_| admitted(sim.submit_existing(a()))).collect();
+    let mut tb: Vec<SimTask> = (0..40).map(|_| admitted(sim.submit_existing(b()))).collect();
+    sim.run_for(Duration::from_secs(10));
+    let done =
+        |sim: &mut SimRuntime, v: &mut Vec<SimTask>| v.iter_mut().filter_map(|t| sim.outcome(t).map(|_| ())).count();
+    let slot_a = ms(5) * done(&mut sim, &mut ta) as u32;
+    let slot_b = ms(500) * done(&mut sim, &mut tb) as u32;
+    let diff = slot_a.abs_diff(slot_b);
+    assert!(
+        diff <= TENANT_QUANTUM + ms(500) + ms(100),
+        "slot time A {slot_a:?} vs B {slot_b:?}"
+    );
+    assert!(slot_a > Duration::from_secs(3) && slot_b > Duration::from_secs(3));
+    sim.run_until_idle();
+}
+
+/// AC-SCH-43: granted waiters land in the wait-by-size histogram and aged grants are counted
+/// on the node registry.
+#[test]
+fn ac_sch_43_the_wait_by_size_histogram_and_aged_grants_are_reported() {
+    use rt_obs::{Metrics, MetricsOptions};
+    use rt_sched::{Scheduler, SimClock, UnitSource};
+    use rt_testkit::{
+        MockBuildExecutor, MockDenoExecutor, MockPreparedSource, MockWasmExecutor, ScriptBook, TestGovernor,
+        VirtualClock,
+    };
+
+    let metrics = Metrics::new(MetricsOptions::default()).expect("metrics");
+    let clock = Arc::new(VirtualClock::new());
+    let book = ScriptBook::new();
+    book.set_default(script![io(5)]);
+    let source = MockPreparedSource::new();
+    source.set_auto_ready(true);
+    let mut cfg = fixed(1, 1).sched;
+    cfg.max_inflight = 1;
+    cfg.aging_factor = 0;
+    cfg.max_queued = 100;
+    let (b1, b2, b3) = (book.clone(), book.clone(), book.clone());
+    let mut sim = Scheduler::builder(cfg, clock.clone(), TestGovernor::with_mb(4096))
+        .executor(move || MockDenoExecutor::new(b1.clone()), source.clone(), 0)
+        .executor(move || MockWasmExecutor::new(b2.clone()), source.clone(), 0)
+        .executor(move || MockBuildExecutor::new(b3.clone()), Arc::new(UnitSource), 0)
+        .metrics(metrics.clone())
+        .build_sim(clock.clone() as Arc<dyn SimClock>)
+        .expect("sim");
+    // one task alone teaches the estimator a 5 ms run time (before that the prior is the wall limit)
+    let first = sim.scheduler().submit(d(1).tenant(1).queue_timeout_ms(30_000).finish());
+    sim.run_until_idle(100_000);
+    drop(first);
+    let handles: Vec<_> = (0..5)
+        .map(|_| {
+            sim.scheduler()
+                .submit(d(1).tenant(1).queue_timeout_ms(30_000).finish())
+                .expect("admitted")
+        })
+        .collect();
+    sim.run_until_idle(100_000);
+    sim.advance(Duration::from_secs(2));
+    drop(handles);
+    let text = metrics.render();
+    let count = text
+        .lines()
+        .find(|l| l.starts_with("rt_admission_wait_by_size_seconds_count{size=\"short\"}"))
+        .unwrap_or_else(|| panic!("no short series:\n{text}"));
+    assert!(count.ends_with(" 4"), "four waiters were granted: {count}");
+    let aged = text
+        .lines()
+        .find(|l| l.starts_with("rt_admission_aged_grants_total "))
+        .unwrap_or_else(|| panic!("no aged grants:\n{text}"));
+    assert!(
+        aged.ends_with(" 4"),
+        "aging 0: every grant is at or after its key: {aged}"
+    );
+}
+
+/// PRED-002 end to end: a wall kill in the scheduler feeds the estimator about the wall limit
+/// (a censored sample), so the service is not predicted as fast.
+#[test]
+fn pred_003_a_wall_kill_in_the_scheduler_feeds_the_estimator() {
+    let mut sim = sim(1, 1);
+    sim.scripts().set_for_service(ids::service(1), script![io(5_000)]);
+    let mut t = admitted(sim.submit_existing(d(1).wall_limit(200).finish()));
+    sim.run_until_idle();
+    assert_killed(sim.outcome(&mut t), rt_types::KillReason::WallTimeout);
+    let pred = scaling_of(&sim, 1).pred[0].expect("a sample was taken");
+    assert!(pred >= ms(150) && pred <= ms(300), "{pred:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-version inflight counter (branching services, the drain of a switch)
+// ---------------------------------------------------------------------------------------------
+
+fn versioned(limit: u32, version: u32) -> TaskSpec {
+    let mut spec = task(1, 2, knobs(limit, 0, 0));
+    spec.service.version = rt_types::VersionNo(version);
+    spec
+}
+
+fn inflight_of(adm: &Adm, version: u32) -> u32 {
+    adm.a.inflight_of(ids::service(2), version)
+}
+
+/// Two versions interleaved: each finish takes one off its own version only.
+#[test]
+fn two_versions_interleaved_count_apart() {
+    let mut adm = Adm::new(limits(100));
+    let (old, new) = (versioned(10, 1), versioned(10, 2));
+    adm.admit(&old).unwrap();
+    adm.admit(&new).unwrap();
+    adm.admit(&old).unwrap();
+    adm.admit(&new).unwrap();
+    assert_eq!((inflight_of(&adm, 1), inflight_of(&adm, 2)), (2, 2));
+    adm.finish(1);
+    assert_eq!((inflight_of(&adm, 1), inflight_of(&adm, 2)), (1, 2));
+    adm.finish(2);
+    adm.finish(4);
+    assert_eq!((inflight_of(&adm, 1), inflight_of(&adm, 2)), (1, 0));
+    adm.finish(3);
+    assert_eq!((inflight_of(&adm, 1), inflight_of(&adm, 2)), (0, 0));
+}
+
+/// A task of the old version waiting for a slot still has to finish: the drain sees it from
+/// admission on, through its grant, to its release.
+#[test]
+fn a_waiting_task_counts_for_its_version_until_it_finishes() {
+    let mut adm = Adm::new(limits(100));
+    adm.admit(&versioned(1, 1)).unwrap();
+    let waiting = adm.admit(&versioned(1, 1)).unwrap();
+    assert!(waiting.run.is_none());
+    assert_eq!(inflight_of(&adm, 1), 2);
+    assert_eq!(adm.finish(1), vec![2]);
+    assert_eq!(inflight_of(&adm, 1), 1, "granted, still in flight");
+    adm.finish(2);
+    assert_eq!(inflight_of(&adm, 1), 0);
+}
+
+/// A waiting task taken out of its queue no longer counts; a second cancel takes nothing off.
+#[test]
+fn a_cancelled_waiting_task_stops_counting() {
+    let mut adm = Adm::new(limits(100));
+    adm.admit(&versioned(1, 1)).unwrap();
+    adm.admit(&versioned(1, 1)).unwrap();
+    let t = adm.tickets[&2].clone();
+    assert!(adm.a.cancel(&t, false, |n| *n == 2));
+    assert_eq!(inflight_of(&adm, 1), 1);
+    assert!(!adm.a.cancel(&t, false, |n| *n == 2));
+    assert_eq!(inflight_of(&adm, 1), 1);
+}
+
+/// A task refused for lack of room never counted.
+#[test]
+fn a_refused_task_does_not_count() {
+    let mut adm = Adm::new(limits(100));
+    let k = knobs(1, 1, 0);
+    let mut spec = task(1, 2, k);
+    spec.service.version = rt_types::VersionNo(1);
+    adm.admit(&spec).unwrap();
+    adm.admit(&spec).unwrap();
+    assert_eq!(adm.admit(&spec).unwrap_err(), RejectReason::Overloaded);
+    assert_eq!(inflight_of(&adm, 1), 2);
+}
+
+/// Cost of the admit + release pair with the version counter (no contention, the fast path).
+#[test]
+#[ignore = "perf"]
+fn admit_release_with_version_counter_under_200ns() {
+    const N: u32 = 1_000_000;
+    let a: Admission<u32> = Admission::new(limits(1000));
+    let spec = versioned(1000, 1);
+    let r = req(&spec);
+    let start = Instant::now();
+    for _ in 0..N {
+        let t = a.admit(&r, NORMAL, |_| 0).unwrap().ticket;
+        a.release(&t, 1, None);
+    }
+    let per = start.elapsed().as_nanos() / u128::from(N);
+    println!("admit+release with version counter: {per} ns");
+    assert_eq!(a.inflight_of(spec.service.service, 1), 0);
+    assert!(per < 200, "{per} ns per admit+release");
 }
