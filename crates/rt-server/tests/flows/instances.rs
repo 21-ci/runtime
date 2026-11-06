@@ -283,9 +283,15 @@ node_test! {
 /// has been sent, so the next request on an idle service sees fresh module state. The control
 /// service has the same source and `min_run_time_ms` unset: its isolate is kept and the module
 /// counter carries on. Both services reuse isolates (`deno.reuse_isolates`), so only the keep-alive
-/// setting differs.
+/// setting differs. Kept isolates are per Machine and a request goes to a random P of its kind, so
+/// the node has one Deno P: with more, the control's second request may land on a Machine that keeps
+/// nothing and see `n1` although its isolate is still kept.
 async fn mrt_flow_01_zero_min_run_time_gives_fresh_module_state_when_idle() {
-    let node = start_node().await;
+    let node = start_node_with(|c| {
+        c.sched.kinds.deno.min = 1;
+        c.sched.kinds.deno.max = 1;
+    })
+    .await;
     let t = new_tenant(&node, "pro").await;
     let src = r#"
 let n = 0;
@@ -313,15 +319,18 @@ export default function (): Response { n += 1; return new Response("n" + n); }
         let first = invoke(&node, slug, "/").await;
         assert_eq!((first.s(), first.text.as_str()), (200, "n1"), "{slug}: {}", first.text);
     }
-    // wait for the disposal the keep-alive metric reports, not for a fixed delay
+    // wait for what the keep-alive metric reports, not for a fixed delay: both isolates are parked
+    // after the answer is sent
     let (client, metrics) = (node.http().clone(), node.metrics_url("/metrics"));
-    eventually(Duration::from_secs(10), "the zero service is disposed after its answer", || {
+    eventually(Duration::from_secs(10), "the zero service is disposed and the control's isolate kept", || {
         let (client, metrics) = (client.clone(), metrics.clone());
         async move {
             let text = send(client.get(metrics)).await.text;
-            metric_values(&text, "rt_instance_keepalive_total")
-                .iter()
-                .any(|(series, v)| series.contains("kind=\"deno\",outcome=\"disposed\"") && *v >= 1.0)
+            let values = metric_values(&text, "rt_instance_keepalive_total");
+            ["disposed", "kept"].iter().all(|outcome| {
+                let series_of = format!("kind=\"deno\",outcome=\"{outcome}\"");
+                values.iter().any(|(series, v)| series.contains(&series_of) && *v >= 1.0)
+            })
         }
     })
     .await;
