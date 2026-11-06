@@ -201,7 +201,7 @@ async fn an_encrypted_backup_goes_to_s3_and_restores_with_the_identity() {
     assert_eq!(report.id, row.id);
     let to = tempfile::tempdir().expect("to");
     let r = restore_archive_age(got.path(), to.path(), &opts(&keys_), Some(&identity)).expect("restore");
-    assert_eq!((r.services, r.blobs, r.secrets), (1, 1, 1));
+    assert_eq!((r.services, r.blobs, r.sealed_values), (1, 1, 1));
     assert!(to.path().join("meta.db").exists());
 
     let status = m.status().await.expect("status");

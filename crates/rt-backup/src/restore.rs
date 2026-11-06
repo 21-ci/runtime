@@ -308,9 +308,9 @@ pub struct RestoreReport {
     pub revoked_keys: u64,
     pub services: u64,
     pub blobs: u64,
-    pub secrets: u64,
+    pub sealed_values: u64,
     /// `(service, name)` of secrets the supplied master key does not open.
-    pub unopened_secrets: Vec<(String, String)>,
+    pub unopened_entries: Vec<(String, String)>,
     pub authenticated: bool,
 }
 
@@ -513,8 +513,8 @@ fn finish_meta(
         revoked_keys: revoked,
         services: services.max(0) as u64,
         blobs: 0,
-        secrets,
-        unopened_secrets: unopened,
+        sealed_values: secrets,
+        unopened_entries: unopened,
         authenticated,
     })
 }

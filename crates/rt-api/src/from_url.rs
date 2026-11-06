@@ -158,7 +158,7 @@ fn checked_headers(raw: &std::collections::BTreeMap<String, String>) -> Result<V
     if raw.len() > MAX_HEADERS {
         return Err(ApiError::invalid(format!("at most {MAX_HEADERS} headers")));
     }
-    let mut out = Vec::with_capacity(raw.len());
+    let mut out = Vec::new();
     for (name, value) in raw {
         let lower = name.to_ascii_lowercase();
         if HeaderName::from_bytes(lower.as_bytes()).is_err() {

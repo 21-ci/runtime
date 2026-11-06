@@ -226,7 +226,7 @@ fn print_restore(r: &rt_backup::restore::RestoreReport, dir: &Path, opened: bool
         "{} services, {} blobs, {} secrets; snapshot taken at {} ({} hours ago)",
         r.services,
         r.blobs,
-        r.secrets,
+        r.sealed_values,
         time(r.finished_at),
         r.snapshot_age_ms / 3_600_000
     );
@@ -241,7 +241,7 @@ fn print_restore(r: &rt_backup::restore::RestoreReport, dir: &Path, opened: bool
     if !opened {
         println!("warning: no master key given: secrets were not checked");
     }
-    for (service, name) in &r.unopened_secrets {
+    for (service, name) in &r.unopened_entries {
         println!("warning: secret {name} of service {service} does not open with the supplied master key");
     }
     println!("Put the master key in place before starting the node: an archive never holds it.");

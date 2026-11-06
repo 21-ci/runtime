@@ -42,8 +42,8 @@ async fn restore_drill_brings_back_every_store() {
 
     let to = tempfile::tempdir().expect("dir");
     let r = n.restore(&archive, to.path()).expect("restore");
-    assert_eq!((r.services, r.blobs, r.secrets), (1, 1, 1));
-    assert!(r.unopened_secrets.is_empty());
+    assert_eq!((r.services, r.blobs, r.sealed_values), (1, 1, 1));
+    assert!(r.unopened_entries.is_empty());
     assert!(r.authenticated);
     assert!(!to.path().join(".restore-tmp").exists());
 
@@ -146,7 +146,7 @@ async fn secrets_another_key_sealed_are_reported() {
         },
     )
     .expect("restore");
-    assert_eq!(r.unopened_secrets, [(n.service.to_string(), "TOKEN".to_string())]);
+    assert_eq!(r.unopened_entries, [(n.service.to_string(), "TOKEN".to_string())]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
