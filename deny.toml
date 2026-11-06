@@ -27,12 +27,6 @@ ignore = [
   { id = "RUSTSEC-2026-0387", reason = "0.5 is pinned by deno_crypto; no 0.5 fix; guest keys only" },
   # rand 0.8 pinned by deno_crypto; the unsoundness needs `rand::rng()` (0.9+) with a custom logger.
   { id = "RUSTSEC-2026-0097", reason = "pinned by deno_crypto; trigger not reachable on 0.8" },
-  # zip: only `ZipArchive::extract` / `ZipStreamReader::extract` are affected; rt-build reads entries
-  # itself and refuses links, `..` and absolute paths (crates/rt-build/src/extract.rs).
-  { id = "RUSTSEC-2026-0367", reason = "extract() is never called" },
-  { id = "RUSTSEC-2026-0368", reason = "extract() is never called" },
-  { id = "RUSTSEC-2026-0369", reason = "extract() is never called" },
-  { id = "RUSTSEC-2026-0429", reason = "extract() is never called" },
   # basic-toml via age 0.12 -> i18n-embed-fl -> i18n-config: all current releases. Only that proc-macro parses
   # the crate's own i18n.toml at compile time; nothing reaches it at runtime. Revisit when age moves off it.
   { id = "RUSTSEC-2026-0374", reason = "unmaintained, build-time only, parses age's own i18n.toml; no newer path" },

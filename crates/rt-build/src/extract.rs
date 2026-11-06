@@ -271,7 +271,10 @@ fn read_zip<'a>(body: &[u8], limits: &'a UploadLimits, scope: Option<&'a Scope>)
         let mut f = archive
             .by_index(i)
             .map_err(|e| VErr::one("", 1, 1, format!("invalid zip entry #{i}: {e}")))?;
-        let name = f.name().to_string();
+        let name = f
+            .name()
+            .map_err(|e| VErr::one("", 1, 1, format!("invalid zip entry #{i}: {e}")))?
+            .to_string();
         if f.is_dir() || name.ends_with('/') {
             continue;
         }
