@@ -1,4 +1,4 @@
-//! Operator monitoring (`docs/design/platform-plan.md` R2): host status, node series, bulk stats,
+//! Operator monitoring: host status, node series, bulk stats,
 //! service series, node events. Host and bulk data never reach a tenant key.
 
 use std::time::Duration;

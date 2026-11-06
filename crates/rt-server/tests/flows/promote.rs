@@ -1,4 +1,4 @@
-//! What a flip does to work of the service (`docs/design/branching-services-design.md` §1, §5):
+//! What a flip does to work of the service:
 //! durable turns stay one at a time across it, and a stream consumer goes on from its cursor.
 
 use std::time::Duration;

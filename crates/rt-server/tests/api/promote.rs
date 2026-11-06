@@ -1,4 +1,4 @@
-//! `promote()` (`docs/design/branching-services-design.md` §5): every flip is tracked by a
+//! `promote()`: every flip is tracked by a
 //! `version_switches` row, the flip is one transaction, a route refresh that keeps failing still
 //! answers, and a drain ends only in a state that is true.
 

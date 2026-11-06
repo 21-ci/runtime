@@ -1,4 +1,4 @@
-//! Branch services (`docs/design/branching-services-design.md` §4, §6): a service with
+//! Branch services: a service with
 //! `config.scratch`, created from a parent whose config it mirrors under a forced policy.
 //!
 //! A branch starts with no data unless `copy_data` asked otherwise, and never holds the parent's

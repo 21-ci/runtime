@@ -1,4 +1,4 @@
-//! Host sampling (`docs/design/platform-plan.md` R2): parsers, deltas, the 24 h ring, absent sources.
+//! Host sampling: parsers, deltas, the 24 h ring, absent sources.
 
 use std::fs;
 use std::path::Path;

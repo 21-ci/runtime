@@ -1,4 +1,4 @@
-//! Previews (`docs/design/platform-plan.md` R5, `platform-enhancements.md`): a service with
+//! Previews: a service with
 //! `config.scratch.kind = "preview"`, made in one call, from a parent's config or standing alone.
 //!
 //! The isolation is the runtime's: [`rt_types::ServiceConfig::enforce_scratch_policy`] forces the

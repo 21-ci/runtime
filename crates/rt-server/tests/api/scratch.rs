@@ -1,4 +1,4 @@
-//! Previews (`docs/design/platform-plan.md` R5, `platform-enhancements.md`): `POST /v1/scratch` makes
+//! Previews: `POST /v1/scratch` makes
 //! a service with `config.scratch.kind = "preview"`, isolated by the runtime: no calls in or out, no
 //! queue, topics, pub/sub, schedules or SDKs, egress denied unless listed, its own environment label.
 

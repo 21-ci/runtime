@@ -1,4 +1,4 @@
-//! Heap held by a day of stats per service, ring compaction off and on (`docs/design/platform-plan.md` R2).
+//! Heap held by a day of stats per service, ring compaction off and on.
 //! Run: `cargo test -p rt-obs --release --test stats_memory -- --ignored --nocapture`.
 
 use std::alloc::{GlobalAlloc, Layout, System};

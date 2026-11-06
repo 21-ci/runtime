@@ -1,4 +1,4 @@
-//! Branch services (`docs/design/branching-services-design.md` §3, §4, §6, §7): a branch is a service
+//! Branch services: a branch is a service
 //! with `config.scratch`: forced policy, hidden from default lists, its own environment label, empty
 //! unless `copy_data` asked otherwise, and gone with its data on delete or expiry.
 

@@ -1,4 +1,4 @@
-//! `promote()`: the one way a live version changes (`docs/design/branching-services-design.md` §5).
+//! `promote()`: the one way a live version changes.
 //!
 //! Every flip writes a `version_switches` row and commits with it in one transaction. Then the
 //! routes are re-read, and a task per switch watches the admission counter of the previous version

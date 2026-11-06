@@ -1,5 +1,4 @@
-//! `POST /v1/services/{s}/switch` and the switch routes (`docs/design/branching-services-design.md`
-//! §4, §5, §7): a version moves between services by digest, only through keys that may touch both,
+//! `POST /v1/services/{s}/switch` and the switch routes: a version moves between services by digest, only through keys that may touch both,
 //! with stable codes, an audit trail, `dry_run`, `If-Match` and idempotent replay.
 //!
 //! Branch policy (`copy_data`, timed triggers, topics) comes with the branch primitive (T5).

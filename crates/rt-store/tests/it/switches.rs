@@ -1,4 +1,4 @@
-//! Branching services (`docs/design/branching-services-design.md` §3, §5, §7): adopting a tested
+//! Branching services: adopting a tested
 //! version into its parent by digest, the `version_switches` rows, startup recovery and the GC hold
 //! on rollback targets.
 
