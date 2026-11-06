@@ -23,7 +23,7 @@ fn create_posts_and_wait_follows_the_run_to_its_end() {
     assert!(out.stdout.contains(ID));
     post.assert();
     let out = ctx.run(&["backup", "create", "--wait"]).ok();
-    assert!(out.stdout.contains("State:    ok"), "{}", out.stdout);
+    assert!(out.stdout.contains("State:     ok"), "{}", out.stdout);
     get.assert();
 }
 
